@@ -927,6 +927,7 @@ dependencies = [
  "async-trait",
  "axum",
  "libunftp",
+ "regex",
  "serde",
  "suppaftp",
  "tokio",

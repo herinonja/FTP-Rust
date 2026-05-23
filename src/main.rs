@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use unftp_core::auth::UserDetail;
 use unftp_core::storage::{Error, ErrorKind, Fileinfo, StorageBackend};
 use tokio_util::compat::FuturesAsyncReadCompatExt;
+use regex::Regex;
 
 // -------------------------------------------------------------------------
 // 1. DÉFINITION DU STOCKAGE ET DES MÉTADONNÉES
@@ -18,11 +19,9 @@ impl ProxyStorage {
         ProxyStorage {}
     }
 
-    // Découpe le chemin pour extraire l'IP du téléphone et le chemin local sur le téléphone
     async fn resolve_path(&self, path: &Path) -> unftp_core::storage::Result<(String, PathBuf)> {
         let mut components = path.components();
         
-        // On passe la racine absolue si elle est présente
         if path.is_absolute() {
             components.next();
         }
@@ -37,23 +36,21 @@ impl ProxyStorage {
         Ok((ip, target_path))
     }
 
-    // Connexion FTP à la volée vers le smartphone cible
     async fn connect_to_phone(&self, ip: &str) -> unftp_core::storage::Result<suppaftp::AsyncFtpStream> {
         let addr = format!("{}:2121", ip); 
         
         let mut ftp_stream = suppaftp::AsyncFtpStream::connect(addr)
             .await
-            .map_err(|e| Error::new(ErrorKind::ConnectionClosed, format!("Connexion échouée au téléphone {}: {}", ip, e)))?;
+            .map_err(|e| Error::new(ErrorKind::ConnectionClosed, format!("Connexion échouée: {}", e)))?;
         
         ftp_stream.login("anonymous", "anonymous")
             .await
-            .map_err(|e| Error::new(ErrorKind::LocalError, format!("Refus d'authentification anonyme: {}", e)))?;
+            .map_err(|e| Error::new(ErrorKind::LocalError, format!("Refus d'authentification: {}", e)))?;
 
         Ok(ftp_stream)
     }
 }
 
-// Structure réelle pour transporter les métadonnées des fichiers du téléphone
 #[derive(Debug)]
 pub struct ProxyMetadata {
     pub is_dir: bool,
@@ -73,7 +70,7 @@ impl unftp_core::storage::Metadata for ProxyMetadata {
 }
 
 // -------------------------------------------------------------------------
-// 2. IMPLÉMENTATION DES COMMANDES FTP INTERCEPTÉES
+// 2. IMPLÉMENTATION DES COMMANDES FTP
 // -------------------------------------------------------------------------
 
 #[async_trait]
@@ -84,7 +81,6 @@ impl<User: UserDetail + Send + Sync + Debug> StorageBackend<User> for ProxyStora
         "KodiFtpProxy"
     }
 
-    // Téléchargement d'un fichier avec support du Seek
     async fn get<P>(&self, _user: &User, path: P, start_pos: u64) -> unftp_core::storage::Result<Box<dyn tokio::io::AsyncRead + Send + Sync + Unpin>>
     where
         P: AsRef<Path> + Send,
@@ -97,7 +93,7 @@ impl<User: UserDetail + Send + Sync + Debug> StorageBackend<User> for ProxyStora
         if start_pos > 0 {
             client.resume_transfer(start_pos as usize)
                 .await
-                .map_err(|e| Error::new(ErrorKind::LocalError, format!("Erreur Seek (REST) : {}", e)))?;
+                .map_err(|e| Error::new(ErrorKind::LocalError, format!("Erreur Seek : {}", e)))?;
         }
 
         let data_stream = client.retr_as_stream(&path_str)
@@ -107,14 +103,12 @@ impl<User: UserDetail + Send + Sync + Debug> StorageBackend<User> for ProxyStora
         Ok(Box::new(data_stream.compat()))
     }
 
-    // Détermine si un élément demandé est un dossier ou un fichier
     async fn metadata<P>(&self, _user: &User, path: P) -> unftp_core::storage::Result<Self::Metadata>
     where
         P: AsRef<Path> + Send,
     {
         let path = path.as_ref();
         
-        // Si on interroge la racine brute (/) c'est un dossier virtuel
         if path == Path::new("") || path == Path::new("/") {
             return Ok(ProxyMetadata { is_dir: true, size: 0 });
         }
@@ -124,27 +118,25 @@ impl<User: UserDetail + Send + Sync + Debug> StorageBackend<User> for ProxyStora
             Err(_) => return Ok(ProxyMetadata { is_dir: true, size: 0 }),
         };
 
-        // Si le chemin ne contient que l'IP (ex: /192.168.1.50), c'est le dossier racine du téléphone
         if target_path == Path::new("") || target_path == Path::new("/") {
             return Ok(ProxyMetadata { is_dir: true, size: 0 });
         }
 
-        // Sinon, on applique une heuristique rapide basée sur l'extension pour éviter des requêtes réseaux lourdes
+        // Par défaut pour les requêtes individuelles de Kodi
         let has_extension = path.extension().is_some();
         Ok(ProxyMetadata {
             is_dir: !has_extension,
-            size: if has_extension { 1024 * 1024 * 100 } else { 0 }, // Taille fictive pour les fichiers
+            size: if has_extension { 1024 * 1024 * 500 } else { 0 },
         })
     }
 
-    // Liste le contenu d'un répertoire à la demande de FileZilla ou Kodi
+    // LIST corrigé avec décodage Regex du format UNIX standard
     async fn list<P>(&self, _user: &User, path: P) -> unftp_core::storage::Result<Vec<Fileinfo<PathBuf, Self::Metadata>>>
     where
         P: AsRef<Path> + Send,
     {
         let path = path.as_ref();
 
-        // Sécurité pour la racine vide
         if path == Path::new("") || path == Path::new("/") {
             return Ok(vec![]); 
         }
@@ -153,27 +145,32 @@ impl<User: UserDetail + Send + Sync + Debug> StorageBackend<User> for ProxyStora
         let mut client = self.connect_to_phone(&phone_ip).await?;
         let path_str = target_path.to_string_lossy().into_owned();
 
-        // On récupère la liste brute des fichiers (format texte 'ls' standard du FTP)
         let remote_lines = client.list(Some(&path_str))
             .await
-            .map_err(|e| Error::new(ErrorKind::PermanentFileNotAvailable, format!("Erreur LIST depuis le téléphone: {}", e)))?;
+            .map_err(|e| Error::new(ErrorKind::PermanentFileNotAvailable, format!("Erreur LIST : {}", e)))?;
 
         let mut file_infos = Vec::new();
 
+        // Regex UNIX classique: capture les droits, le nombre de liens, l'owner, le group, la TAILLE, la date, et TOUT le reste de la ligne (nom avec espaces)
+        // Exemple de ligne capturée : drwxr-xr-x  4 user group  4096 May 23 21:00 Mon Dossier Avec Espaces
+        let file_regex = Regex::new(r#"^([drwx-]+)\s+\d+\s+\w+\s+\w+\s+(\d+)\s+\w+\s+\d+\s+[\d:]+\s+(.+)$"#).unwrap();
+
         for line in remote_lines {
-            // Un listing FTP classique ressemble à : "-rw-r--r-- 1 user group 12345 Jan 1 2026 video.mp4"
-            // On extrait le dernier élément qui correspond au nom du fichier/dossier
-            if let Some(filename) = line.split_whitespace().last() {
+            if let Some(caps) = file_regex.captures(&line) {
+                let permissions = caps.get(1).unwrap().as_str();
+                let size_str = caps.get(2).unwrap().as_str();
+                let filename = caps.get(3).unwrap().as_str();
+
                 if filename == "." || filename == ".." {
                     continue;
                 }
 
-                // Si la ligne commence par 'd', c'est un répertoire (norme Unix classique)
-                let is_dir = line.starts_with('d');
+                let is_dir = permissions.starts_with('d');
+                let size = size_str.parse::<u64>().unwrap_or(0);
 
                 let info = Fileinfo {
                     path: PathBuf::from(filename),
-                    metadata: ProxyMetadata { is_dir, size: 0 },
+                    metadata: ProxyMetadata { is_dir, size },
                 };
                 file_infos.push(info);
             }
@@ -182,27 +179,12 @@ impl<User: UserDetail + Send + Sync + Debug> StorageBackend<User> for ProxyStora
         Ok(file_infos)
     }
 
-    async fn cwd<P>(&self, _user: &User, _path: P) -> unftp_core::storage::Result<()>
-    where P: AsRef<Path> + Send {
-        Ok(()) // Autorise FileZilla à changer de répertoire virtuellement
-    }
-
-    // -- METHODES EN ECRITURE BLOQUEES --
-    async fn rename<P>(&self, _user: &User, _from: P, _to: P) -> unftp_core::storage::Result<()> where P: AsRef<Path> + Send {
-        Err(Error::new(ErrorKind::PermissionDenied, "Lecture seule"))
-    }
-    async fn put<P, R>(&self, _user: &User, _input: R, _path: P, _start_pos: u64) -> unftp_core::storage::Result<u64> where P: AsRef<Path> + Send, R: tokio::io::AsyncRead + Send + Sync + Unpin {
-        Err(Error::new(ErrorKind::PermissionDenied, "Lecture seule"))
-    }
-    async fn del<P>(&self, _user: &User, _path: P) -> unftp_core::storage::Result<()> where P: AsRef<Path> + Send {
-        Err(Error::new(ErrorKind::PermissionDenied, "Lecture seule"))
-    }
-    async fn mkd<P>(&self, _user: &User, _path: P) -> unftp_core::storage::Result<()> where P: AsRef<Path> + Send {
-        Err(Error::new(ErrorKind::PermissionDenied, "Lecture seule"))
-    }
-    async fn rmd<P>(&self, _user: &User, _path: P) -> unftp_core::storage::Result<()> where P: AsRef<Path> + Send {
-        Err(Error::new(ErrorKind::PermissionDenied, "Lecture seule"))
-    }
+    async fn cwd<P>(&self, _user: &User, _path: P) -> unftp_core::storage::Result<()> where P: AsRef<Path> + Send { Ok(()) }
+    async fn rename<P>(&self, _user: &User, _from: P, _to: P) -> unftp_core::storage::Result<()> where P: AsRef<Path> + Send { Err(Error::new(ErrorKind::PermissionDenied, "Lecture seule")) }
+    async fn put<P, R>(&self, _user: &User, _input: R, _path: P, _start_pos: u64) -> unftp_core::storage::Result<u64> where P: AsRef<Path> + Send, R: tokio::io::AsyncRead + Send + Sync + Unpin { Err(Error::new(ErrorKind::PermissionDenied, "Lecture seule")) }
+    async fn del<P>(&self, _user: &User, _path: P) -> unftp_core::storage::Result<()> where P: AsRef<Path> + Send { Err(Error::new(ErrorKind::PermissionDenied, "Lecture seule")) }
+    async fn mkd<P>(&self, _user: &User, _path: P) -> unftp_core::storage::Result<()> where P: AsRef<Path> + Send { Err(Error::new(ErrorKind::PermissionDenied, "Lecture seule")) }
+    async fn rmd<P>(&self, _user: &User, _path: P) -> unftp_core::storage::Result<()> where P: AsRef<Path> + Send { Err(Error::new(ErrorKind::PermissionDenied, "Lecture seule")) }
 }
 
 // -------------------------------------------------------------------------
