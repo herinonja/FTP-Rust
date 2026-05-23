@@ -109,17 +109,17 @@ impl VirtualStorage {
     }
 
     // Ouvre une connexion FTP à la volée vers le téléphone cible
-    async fn connect_to_phone(&self, ip: &str) -> Result<suppftp::AsyncFtpStream, Error> {
-        // Port sur lequel votre application mobile fait tourner son serveur FTP (ici configuré sur 2121)
+    async fn connect_to_phone(&self, ip: &str) -> Result<suppaftp::AsyncFtpStream, Error> {
+        // Port sur lequel votre application mobile fait tourner son serveur FTP
         let addr = format!("{}:2121", ip); 
-        let mut ftp_stream = suppftp::AsyncFtpStream::connect(addr)
+        let mut ftp_stream = suppaftp::AsyncFtpStream::connect(addr)
             .await
             .map_err(|e| Error::new(ErrorKind::ConnectionClosed, e.to_string()))?;
         
         // Connexion anonyme par défaut vers le téléphone
         ftp_stream.login("anonymous", "anonymous")
             .await
-            .map_err(|e| Error::new(ErrorKind::BadCommandSequence, e.to_string()))?;
+            .map_err(|e| Error::new(ErrorKind::LocalError, e.to_string()))?;
 
         Ok(ftp_stream)
     }
