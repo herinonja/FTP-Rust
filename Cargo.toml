@@ -1,0 +1,18 @@
+[package]
+name = "kodi-ftp-proxy"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Le moteur asynchrone indispensable
+tokio = { version = "1.40", features = ["full"] }
+
+# Pour le serveur d'enregistrement HTTP (cr par l'quipe de Tokio)
+axum = "0.7"
+serde = { version = "1.0", features = ["derive"] } # Pour dcoder le JSON de Flutter
+
+# Outils de synchronisation et de logs
+tower-http = { version = "0.5", features = ["trace"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+anyhow = "1.0"
