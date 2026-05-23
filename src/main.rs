@@ -66,7 +66,7 @@ async fn register_phone(
 }
 
 // -----------------------------------------------------------------
-// SYSTÈME DE FICHIERS VIRTUEL FIXÉ
+// SYSTÈME DE FICHIERS VIRTUEL PROXY DYNAMIQUE
 // -----------------------------------------------------------------
 use unftp_core::storage::{StorageBackend, Fileinfo, Metadata, Error, ErrorKind};
 
@@ -78,6 +78,50 @@ struct VirtualStorage {
 impl VirtualStorage {
     fn new(registry: PhoneRegistry) -> Self {
         Self { registry }
+    }
+
+    // Extrait l'ID du téléphone et cherche son IP associée
+    // Exemple: "/Tel_Alex/DCIM/video.mp4" -> IP du téléphone, et chemin: "DCIM/video.mp4"
+    async fn resolve_path(&self, path: &std::path::Path) -> Result<(String, std::path::PathBuf), Error> {
+        let mut components = path.components();
+        
+        // On passe le premier slash "/" si présent
+        if path.is_absolute() {
+            components.next();
+        }
+
+        // Le premier dossier réel correspond à notre ID de téléphone
+        let phone_id = match components.next() {
+            Some(std::path::Component::Normal(name)) => name.to_string_lossy().into_owned(),
+            _ => return Err(Error::new(ErrorKind::PermanentFileNotAvailable, "ID de téléphone manquant")),
+        };
+
+        // On reconstruit le reste du chemin destiné au stockage du téléphone
+        let remaining_path: std::path::PathBuf = components.collect();
+
+        // On cherche l'IP dans le registre
+        let table = self.registry.read().await;
+        if let Some(ip) = table.get(&phone_id) {
+            Ok((ip.clone(), remaining_path))
+        } else {
+            Err(Error::new(ErrorKind::PermanentFileNotAvailable, "Téléphone non connecté ou introuvable"))
+        }
+    }
+
+    // Ouvre une connexion FTP à la volée vers le téléphone cible
+    async fn connect_to_phone(&self, ip: &str) -> Result<suppftp::AsyncFtpStream, Error> {
+        // Port sur lequel votre application mobile fait tourner son serveur FTP (ici configuré sur 2121)
+        let addr = format!("{}:2121", ip); 
+        let mut ftp_stream = suppftp::AsyncFtpStream::connect(addr)
+            .await
+            .map_err(|e| Error::new(ErrorKind::ConnectionClosed, e.to_string()))?;
+        
+        // Connexion anonyme par défaut vers le téléphone
+        ftp_stream.login("anonymous", "anonymous")
+            .await
+            .map_err(|e| Error::new(ErrorKind::BadCommandSequence, e.to_string()))?;
+
+        Ok(ftp_stream)
     }
 }
 
@@ -108,6 +152,7 @@ impl<User: unftp_core::auth::UserDetail> StorageBackend<User> for VirtualStorage
     {
         let path = path.as_ref();
         
+        // CAS 1 : Kodi explore la racine absolue -> on liste les smartphones connectés
         if path == std::path::Path::new("") || path == std::path::Path::new("/") {
             let table = self.registry.read().await;
             let mut list = Vec::new();
@@ -122,7 +167,28 @@ impl<User: unftp_core::auth::UserDetail> StorageBackend<User> for VirtualStorage
             return Ok(list);
         }
 
-        Ok(vec![])
+        // CAS 2 : Kodi accède à un répertoire à l'intérieur d'un téléphone particulier
+        let (phone_ip, target_path) = self.resolve_path(path).await?;
+        let mut client = self.connect_to_phone(&phone_ip).await?;
+
+        let path_str = target_path.to_string_lossy().into_owned();
+        let remote_files = client.list(Some(&path_str))
+            .await
+            .map_err(|e| Error::new(ErrorKind::PermanentFileNotAvailable, e.to_string()))?;
+
+        let mut list = Vec::new();
+        for file_line in remote_files {
+            // Extraction basique du nom du fichier en bout de ligne d'une réponse de type 'ls'
+            let filename = file_line.split_whitespace().last().unwrap_or("fichier").to_string();
+            
+            list.push(Fileinfo {
+                path: std::path::PathBuf::from(filename),
+                // Détection rudimentaire : si la ligne commence par 'd' c'est un répertoire Unix standard
+                metadata: VirtualMetadata { is_dir: file_line.starts_with('d') },
+            });
+        }
+
+        Ok(list)
     }
 
     async fn metadata<P>(&self, _user: &User, path: P) -> unftp_core::storage::Result<Self::Metadata>
@@ -131,22 +197,52 @@ impl<User: unftp_core::auth::UserDetail> StorageBackend<User> for VirtualStorage
         if path == std::path::Path::new("") || path == std::path::Path::new("/") {
             return Ok(VirtualMetadata { is_dir: true });
         }
-        Ok(VirtualMetadata { is_dir: true })
+
+        // Si on demande la racine exacte d'un téléphone (/Tel_Alex), c'est obligatoirement un dossier
+        let mut components = path.components();
+        if path.is_absolute() { components.next(); }
+        components.next(); 
+        
+        if components.next().is_none() {
+            return Ok(VirtualMetadata { is_dir: true });
+        }
+
+        // Pour éviter d'introduire des latences réseaux sur l'analyse de chaque métadonnée demandée par Kodi,
+        // on trie pragmatiquement selon l'extension de fichier connue.
+        let is_video = path.extension()
+            .map(|ext| ext == "mp4" || ext == "mkv" || ext == "avi" || ext == "mov")
+            .unwrap_or(false);
+
+        Ok(VirtualMetadata { is_dir: !is_video })
     }
 
-    // AJOUT DE LA MÉTHODE MANQUANTE CWD
-    // Permet à Kodi de naviguer dans le chemin virtuel
     async fn cwd<P>(&self, _user: &User, _path: P) -> unftp_core::storage::Result<()> 
     where P: AsRef<std::path::Path> + Send {
-        // On autorise la navigation pour l'instant
+        // Navigation virtuelle validée d'office pour autoriser le parcours
         Ok(())
     }
 
-    // CORRECTION DE LA SIGNATURE DE GET
-    // En retournant un flux de lecture dynamique mis dans une Box, on satisfait le compilateur
-    async fn get<P>(&self, _user: &User, _path: P, _start_pos: u64) -> unftp_core::storage::Result<Box<dyn tokio::io::AsyncRead + Send + Sync + Unpin>> 
+    async fn get<P>(&self, _user: &User, path: P, start_pos: u64) -> unftp_core::storage::Result<Box<dyn tokio::io::AsyncRead + Send + Sync + Unpin>> 
     where P: AsRef<std::path::Path> + Send { 
-        Err(Error::new(ErrorKind::PermanentFileNotAvailable, "En cours de développement")) 
+        let path = path.as_ref();
+        let (phone_ip, target_path) = self.resolve_path(path).await?;
+        let mut client = self.connect_to_phone(&phone_ip).await?;
+
+        let path_str = target_path.to_string_lossy().into_owned();
+        
+        // Prise en charge native du Seek (Avancer/Reculer dans le temps sur Kodi)
+        if start_pos > 0 {
+            client.restart_from(start_pos)
+                .await
+                .map_err(|e| Error::new(ErrorKind::PermanentFileNotAvailable, e.to_string()))?;
+        }
+
+        // Extraction directe du flux de données
+        let data_stream = client.retr_as_stream(&path_str)
+            .await
+            .map_err(|e| Error::new(ErrorKind::PermanentFileNotAvailable, e.to_string()))?;
+
+        Ok(Box::new(data_stream))
     }
     
     async fn put<P, R>(&self, _user: &User, _bytes: R, _path: P, _start_pos: u64) -> unftp_core::storage::Result<u64> where P: AsRef<std::path::Path> + Send, R: tokio::io::AsyncRead + Send + Sync + Unpin + 'static { Ok(0) }
