@@ -6,7 +6,6 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{info, error};
 
-// Définition de la table de routage partagée (ID du téléphone -> Adresse IP)
 type PhoneRegistry = Arc<RwLock<HashMap<String, String>>>;
 
 #[derive(Deserialize, Debug)]
@@ -19,11 +18,10 @@ struct RegisterPayload {
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
-    // L'état de notre application : la table de routage en mémoire
     let registry: PhoneRegistry = Arc::new(RwLock::new(HashMap::new()));
 
     // -----------------------------------------------------------------
-    // TÂCHE 1 : Démarrer le Serveur HTTP d'Enregistrement (Port 3000)
+    // TÂCHE 1 : Serveur HTTP d'Enregistrement (Port 3000)
     // -----------------------------------------------------------------
     let http_registry = registry.clone();
     let http_app = Router::new()
@@ -38,25 +36,27 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // -----------------------------------------------------------------
-    // TÂCHE 2 : Démarrer le Serveur FTP Virtuel pour Kodi (Port 2121)
+    // TÂCHE 2 : Serveur FTP Virtuel pour Kodi (Port 2121)
     // -----------------------------------------------------------------
     let ftp_registry = registry.clone();
     
-    // On instancie le serveur unftp en lui injectant notre système de fichier personnalisé
-    let ftp_server = unftp_server::Server::new(move || {
+    // Correction de l'initialisation pour libunftp
+    let ftp_server = libunftp::ServerBuilder::new(Box::new(move || {
         VirtualStorage::new(ftp_registry.clone())
-    });
+    }))
+    .greeting("Bienvenue sur le Proxy FTP de votre Radxa Zero 3W")
+    .passive_ports(50000..=50100) // Définit une plage de ports passifs
+    .build()?;
 
     let ftp_addr = "0.0.0.0:2121";
-    info!("Serveur FTP virtuel actif sur {}", ftp_addr);
+    info!("Serveur FTP virtuel prêt sur {}", ftp_addr);
     
-    // Lance le serveur FTP au premier plan (bloquant)
+    // Lance l'écoute
     ftp_server.listen(ftp_addr).await?;
 
     Ok(())
 }
 
-// Handler HTTP pour enregistrer les téléphones
 async fn register_phone(
     Extension(registry): Extension<PhoneRegistry>,
     Json(payload): Json<RegisterPayload>,
@@ -68,12 +68,9 @@ async fn register_phone(
 }
 
 // -----------------------------------------------------------------
-// SYSTÈME DE FICHIERS VIRTUEL POUR KODI
+// SYSTÈME DE FICHIERS VIRTUEL AMÉLIORÉ (unftp-core)
 // -----------------------------------------------------------------
-// Cette structure implémente les fonctions que le serveur FTP appelle
-// lorsque Kodi explore les dossiers.
-// -----------------------------------------------------------------
-use unftp_server::storage::{StorageBackend, Fileinfo, Metadata};
+use unftp_core::storage::{StorageBackend, Fileinfo, Metadata};
 
 #[derive(Debug)]
 struct VirtualStorage {
@@ -90,12 +87,13 @@ impl VirtualStorage {
 struct VirtualMetadata {
     is_dir: bool,
 }
+
 impl Metadata for VirtualMetadata {
     fn len(&self) -> u64 { 0 }
     fn is_dir(&self) -> bool { self.is_dir }
     fn is_file(&self) -> bool { !self.is_dir }
     fn is_symlink(&self) -> bool { false }
-    fn modified(&self) -> unftp_server::storage::Result<std::time::SystemTime> {
+    fn modified(&self) -> unftp_core::storage::Result<std::time::SystemTime> {
         Ok(std::time::SystemTime::now())
     }
     fn gid(&self) -> u32 { 0 }
@@ -106,19 +104,17 @@ impl Metadata for VirtualMetadata {
 impl<User> StorageBackend<User> for VirtualStorage {
     type Metadata = VirtualMetadata;
 
-    // Quand Kodi liste le contenu d'un dossier (Commande FTP: LIST)
-    async fn list<P>(&self, _user: &User, path: P) -> unftp_server::storage::Result<Vec<Fileinfo<std::path::PathBuf, Self::Metadata>>>
+    async fn list<P>(&self, _user: &User, path: P) -> unftp_core::storage::Result<Vec<Fileinfo<std::path::PathBuf, Self::Metadata>>>
     where
         P: AsRef<std::path::Path> + Send + Sync,
     {
         let path = path.as_ref();
         
-        // Si Kodi est à la racine "/" du FTP
+        // Si Kodi liste la racine du FTP
         if path == std::path::Path::new("") || path == std::path::Path::new("/") {
             let table = self.registry.read().await;
             let mut list = Vec::new();
 
-            // Pour chaque téléphone connecté, on crée un "faux" dossier
             for phone_id in table.keys() {
                 let file_info = Fileinfo {
                     path: std::path::PathBuf::from(phone_id),
@@ -129,30 +125,25 @@ impl<User> StorageBackend<User> for VirtualStorage {
             return Ok(list);
         }
 
-        // Étape 4 (prochaine étape) : Gérer l'exploration à l'intérieur d'un dossier de téléphone
         Ok(vec![])
     }
 
-    // Fonctions obligatoires minimales pour le compilateur
-    async fn metadata<P>(&self, _user: &User, path: P) -> unftp_server::storage::Result<Self::Metadata>
+    async fn metadata<P>(&self, _user: &User, path: P) -> unftp_core::storage::Result<Self::Metadata>
     where P: AsRef<std::path::Path> + Send + Sync {
         let path = path.as_ref();
-        // La racine est toujours un dossier
         if path == std::path::Path::new("") || path == std::path::Path::new("/") {
             return Ok(VirtualMetadata { is_dir: true });
         }
-        // Par défaut pour l'instant on dit que c'est un dossier
         Ok(VirtualMetadata { is_dir: true })
     }
 
-    // Les méthodes ci-dessous seront implémentées à l'étape 4 pour le streaming de fichiers.
-    // On met des implémentations vides pour que le code compile à l'étape 3.
-    async fn get<P>(&self, _user: &User, _path: P, _start_pos: u64) -> unftp_server::storage::Result<unftp_server::storage::GetResult> where P: AsRef<std::path::Path> + Send + Sync { 
-        Err(unftp_server::storage::StorageError::new(unftp_server::storage::StorageErrorKind::FileNotFound, "Non implémenté")) 
+    // Implémentations obligatoires vides pour la conformité du Trait
+    async fn get<P>(&self, _user: &User, _path: P, _start_pos: u64) -> unftp_core::storage::Result<unftp_core::storage::GetResult> where P: AsRef<std::path::Path> + Send + Sync { 
+        Err(unftp_core::storage::StorageError::new(unftp_core::storage::StorageErrorKind::FileNotFound, "En cours de développement")) 
     }
-    async fn put<P, R>(&self, _user: &User, _bytes: R, _path: P, _start_pos: u64) -> unftp_server::storage::Result<u64> where P: AsRef<std::path::Path> + Send + Sync, R: tokio::io::AsyncRead + Send + Sync + Unpin + 'static { Ok(0) }
-    async fn del<P>(&self, _user: &User, _path: P) -> unftp_server::storage::Result<()> where P: AsRef<std::path::Path> + Send + Sync { Ok(()) }
-    async fn mkd<P>(&self, _user: &User, _path: P) -> unftp_server::storage::Result<()> where P: AsRef<std::path::Path> + Send + Sync { Ok(()) }
-    async fn rmd<P>(&self, _user: &User, _path: P) -> unftp_server::storage::Result<()> where P: AsRef<std::path::Path> + Send + Sync { Ok(()) }
-    async fn rename<P>(&self, _user: &User, _from: P, _to: P) -> unftp_server::storage::Result<()> where P: AsRef<std::path::Path> + Send + Sync { Ok(()) }
+    async fn put<P, R>(&self, _user: &User, _bytes: R, _path: P, _start_pos: u64) -> unftp_core::storage::Result<u64> where P: AsRef<std::path::Path> + Send + Sync, R: tokio::io::AsyncRead + Send + Sync + Unpin + 'static { Ok(0) }
+    async fn del<P>(&self, _user: &User, _path: P) -> unftp_core::storage::Result<()> where P: AsRef<std::path::Path> + Send + Sync { Ok(()) }
+    async fn mkd<P>(&self, _user: &User, _path: P) -> unftp_core::storage::Result<()> where P: AsRef<std::path::Path> + Send + Sync { Ok(()) }
+    async fn rmd<P>(&self, _user: &User, _path: P) -> unftp_core::storage::Result<()> where P: AsRef<std::path::Path> + Send + Sync { Ok(()) }
+    async fn rename<P>(&self, _user: &User, _from: P, _to: P) -> unftp_core::storage::Result<()> where P: AsRef<std::path::Path> + Send + Sync { Ok(()) }
 }
