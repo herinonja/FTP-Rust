@@ -148,10 +148,12 @@ impl<User: UserDetail + Send + Sync + Debug> StorageBackend<User> for ProxyStora
     {
         let path = path.as_ref();
         
+        // 1. Racine du proxy
         if path == Path::new("") || path == Path::new("/") {
             return Ok(ProxyMetadata { is_dir: true, size: 0 });
         }
 
+        // 2. Racine d'un téléphone (ex: /10.42.0.226)
         let (phone_ip, target_path) = match self.resolve_path(path).await {
             Ok(res) => res,
             Err(_) => return Ok(ProxyMetadata { is_dir: true, size: 0 }),
@@ -161,11 +163,28 @@ impl<User: UserDetail + Send + Sync + Debug> StorageBackend<User> for ProxyStora
             return Ok(ProxyMetadata { is_dir: true, size: 0 });
         }
 
-        let has_extension = path.extension().is_some();
-        Ok(ProxyMetadata {
-            is_dir: !has_extension,
-            size: if has_extension { 1024 * 1024 * 500 } else { 0 },
-        })
+        // 3. Vrai fichier ou dossier sur le téléphone : on interroge le smartphone
+        let mut client = self.connect_to_phone(&phone_ip).await?;
+        let path_str = target_path.to_string_lossy().into_owned();
+
+        // On tente de récupérer la vraie taille avec la commande SIZE
+        match client.size(&path_str).await {
+            Ok(exact_size) => {
+                // Si SIZE fonctionne, c'est obligatoirement un fichier
+                Ok(ProxyMetadata {
+                    is_dir: false,
+                    size: exact_size as u64,
+                })
+            }
+            Err(_) => {
+                // Si SIZE échoue, c'est très probablement un dossier (ou un fichier inexistant)
+                // Dans le doute des requêtes complexes de Kodi, on valide si c'est un dossier
+                Ok(ProxyMetadata {
+                    is_dir: true,
+                    size: 0,
+                })
+            }
+        }
     }
 
     async fn list<P>(&self, _user: &User, path: P) -> unftp_core::storage::Result<Vec<Fileinfo<PathBuf, Self::Metadata>>>
