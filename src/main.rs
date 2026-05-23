@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use libunftp::{Server, ServerBuilder};
+use libunftp::ServerBuilder;
 use std::fmt::Debug;
 use std::path::{Path, PathBuf};
 use unftp_core::auth::UserDetail;
@@ -178,9 +178,10 @@ async fn main() {
     
     println!("Démarrage du Kodi FTP Proxy sur ftp://{}", addr);
 
-    // CORRECTION : L'API moderne exige de passer par ServerBuilder
+    // L'ajout de .unwrap() extrait le serveur du Result généré par build()
     let server = ServerBuilder::new(Box::new(move || ProxyStorage::new()))
-        .build();
+        .build()
+        .unwrap();
 
     if let Err(e) = server.listen(&addr).await {
         eprintln!("Erreur critique du serveur : {}", e);
