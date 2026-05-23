@@ -17,3 +17,4 @@ unftp-core = "0.1"
 suppaftp = { version = "5.3", features = ["async"] }
 tokio-util = { version = "0.7.18", features = ["compat"] }
 regex = "1.12.3"
+local-ip-address = "0.6.13"

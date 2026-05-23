@@ -2,10 +2,12 @@ use async_trait::async_trait;
 use libunftp::ServerBuilder;
 use std::fmt::Debug;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use unftp_core::auth::UserDetail;
 use unftp_core::storage::{Error, ErrorKind, Fileinfo, StorageBackend};
 use tokio_util::compat::FuturesAsyncReadCompatExt;
 use regex::Regex;
+use tokio::net::TcpStream;
 
 // -------------------------------------------------------------------------
 // 1. DÉFINITION DU STOCKAGE ET DES MÉTADONNÉES
@@ -49,6 +51,45 @@ impl ProxyStorage {
 
         Ok(ftp_stream)
     }
+
+    // Fonction de découverte automatique par balayage TCP asynchrone
+    async fn discover_phones(&self) -> Vec<String> {
+        let mut active_phones = Vec::new();
+
+        // 1. Récupérer l'IP locale du Radxa
+        if let Ok(local_ip) = local_ip_address::local_ip() {
+            if let std::net::IpAddr::V4(ipv4) = local_ip {
+                let octets = ipv4.octets();
+                let mut tasks = Vec::new();
+
+                // 2. Créer 254 requêtes de connexion simultanées (pour toute la plage 1 à 254)
+                for i in 1..=254 {
+                    // Ignorer notre propre IP
+                    if i == octets[3] { continue; }
+
+                    let target_ip = format!("{}.{}.{}.{}", octets[0], octets[1], octets[2], i);
+                    
+                    // On lance la vérification en arrière-plan (Green thread Tokio)
+                    tasks.push(tokio::spawn(async move {
+                        let addr = format!("{}:2121", target_ip);
+                        // Timeout très court (150ms) suffisant sur un réseau Wi-Fi/Filaire local
+                        match tokio::time::timeout(Duration::from_millis(150), TcpStream::connect(&addr)).await {
+                            Ok(Ok(_)) => Some(target_ip), // Un serveur FTP écoute ici !
+                            _ => None,
+                        }
+                    }));
+                }
+
+                // 3. Attendre que toutes les vérifications se terminent en même temps
+                for task in tasks {
+                    if let Ok(Some(ip)) = task.await {
+                        active_phones.push(ip);
+                    }
+                }
+            }
+        }
+        active_phones
+    }
 }
 
 #[derive(Debug)]
@@ -82,8 +123,7 @@ impl<User: UserDetail + Send + Sync + Debug> StorageBackend<User> for ProxyStora
     }
 
     async fn get<P>(&self, _user: &User, path: P, start_pos: u64) -> unftp_core::storage::Result<Box<dyn tokio::io::AsyncRead + Send + Sync + Unpin>>
-    where
-        P: AsRef<Path> + Send,
+    where P: AsRef<Path> + Send,
     {
         let path = path.as_ref();
         let (phone_ip, target_path) = self.resolve_path(path).await?;
@@ -104,8 +144,7 @@ impl<User: UserDetail + Send + Sync + Debug> StorageBackend<User> for ProxyStora
     }
 
     async fn metadata<P>(&self, _user: &User, path: P) -> unftp_core::storage::Result<Self::Metadata>
-    where
-        P: AsRef<Path> + Send,
+    where P: AsRef<Path> + Send,
     {
         let path = path.as_ref();
         
@@ -122,7 +161,6 @@ impl<User: UserDetail + Send + Sync + Debug> StorageBackend<User> for ProxyStora
             return Ok(ProxyMetadata { is_dir: true, size: 0 });
         }
 
-        // Par défaut pour les requêtes individuelles de Kodi
         let has_extension = path.extension().is_some();
         Ok(ProxyMetadata {
             is_dir: !has_extension,
@@ -130,17 +168,28 @@ impl<User: UserDetail + Send + Sync + Debug> StorageBackend<User> for ProxyStora
         })
     }
 
-    // LIST corrigé avec décodage Regex du format UNIX standard
     async fn list<P>(&self, _user: &User, path: P) -> unftp_core::storage::Result<Vec<Fileinfo<PathBuf, Self::Metadata>>>
-    where
-        P: AsRef<Path> + Send,
+    where P: AsRef<Path> + Send,
     {
         let path = path.as_ref();
 
+        // -----------------------------------------------------------------
+        // DYNAMISME À LA RACINE : Si l'utilisateur est sur /, on liste les téléphones vivants
+        // -----------------------------------------------------------------
         if path == Path::new("") || path == Path::new("/") {
-            return Ok(vec![]); 
+            let online_ips = self.discover_phones().await;
+            let mut devices = Vec::new();
+            
+            for ip in online_ips {
+                devices.push(Fileinfo {
+                    path: PathBuf::from(ip),
+                    metadata: ProxyMetadata { is_dir: true, size: 0 },
+                });
+            }
+            return Ok(devices);
         }
 
+        // --- Logique standard si on est déjà INSIDE un téléphone ---
         let (phone_ip, target_path) = self.resolve_path(path).await?;
         let mut client = self.connect_to_phone(&phone_ip).await?;
         let path_str = target_path.to_string_lossy().into_owned();
@@ -150,9 +199,6 @@ impl<User: UserDetail + Send + Sync + Debug> StorageBackend<User> for ProxyStora
             .map_err(|e| Error::new(ErrorKind::PermanentFileNotAvailable, format!("Erreur LIST : {}", e)))?;
 
         let mut file_infos = Vec::new();
-
-        // Regex UNIX classique: capture les droits, le nombre de liens, l'owner, le group, la TAILLE, la date, et TOUT le reste de la ligne (nom avec espaces)
-        // Exemple de ligne capturée : drwxr-xr-x  4 user group  4096 May 23 21:00 Mon Dossier Avec Espaces
         let file_regex = Regex::new(r#"^([drwx-]+)\s+\d+\s+\w+\s+\w+\s+(\d+)\s+\w+\s+\d+\s+[\d:]+\s+(.+)$"#).unwrap();
 
         for line in remote_lines {
@@ -196,7 +242,7 @@ async fn main() {
     let port = 2120;
     let addr = format!("0.0.0.0:{}", port);
     
-    println!("Démarrage du Kodi FTP Proxy sur ftp://{}", addr);
+    println!("Démarrage du Kodi FTP Proxy avec scan dynamique sur ftp://{}", addr);
 
     let server = ServerBuilder::new(Box::new(move || ProxyStorage::new()))
         .build()
