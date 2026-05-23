@@ -14,4 +14,4 @@ anyhow = "1.0"
 async-trait = "0.1"
 libunftp = "0.23"
 unftp-core = "0.1"
-suppftp = { version = "6.0", default-features = false, features = ["async", "async-secure"] }
+suppaftp = { version = "8.0.3", features = ["tokio"] }
