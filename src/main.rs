@@ -66,7 +66,7 @@ async fn register_phone(
 }
 
 // -----------------------------------------------------------------
-// SYSTÈME DE FICHIERS VIRTUEL AMÉLIORÉ (unftp-core)
+// SYSTÈME DE FICHIERS VIRTUEL FIXÉ
 // -----------------------------------------------------------------
 use unftp_core::storage::{StorageBackend, Fileinfo, Metadata, Error, ErrorKind};
 
@@ -134,8 +134,17 @@ impl<User: unftp_core::auth::UserDetail> StorageBackend<User> for VirtualStorage
         Ok(VirtualMetadata { is_dir: true })
     }
 
-    // Gestion des erreurs et signatures corrigées
-    async fn get<P>(&self, _user: &User, _path: P, _start_pos: u64) -> unftp_core::storage::Result<unftp_core::storage::GetResult> 
+    // AJOUT DE LA MÉTHODE MANQUANTE CWD
+    // Permet à Kodi de naviguer dans le chemin virtuel
+    async fn cwd<P>(&self, _user: &User, _path: P) -> unftp_core::storage::Result<()> 
+    where P: AsRef<std::path::Path> + Send {
+        // On autorise la navigation pour l'instant
+        Ok(())
+    }
+
+    // CORRECTION DE LA SIGNATURE DE GET
+    // En retournant un flux de lecture dynamique mis dans une Box, on satisfait le compilateur
+    async fn get<P>(&self, _user: &User, _path: P, _start_pos: u64) -> unftp_core::storage::Result<Box<dyn tokio::io::AsyncRead + Send + Sync + Unpin>> 
     where P: AsRef<std::path::Path> + Send { 
         Err(Error::new(ErrorKind::PermanentFileNotAvailable, "En cours de développement")) 
     }
