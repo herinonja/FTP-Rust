@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{info, error};
+use tracing::info;
 
 type PhoneRegistry = Arc<RwLock<HashMap<String, String>>>;
 
@@ -40,18 +40,16 @@ async fn main() -> anyhow::Result<()> {
     // -----------------------------------------------------------------
     let ftp_registry = registry.clone();
     
-    // Correction de l'initialisation pour libunftp
     let ftp_server = libunftp::ServerBuilder::new(Box::new(move || {
         VirtualStorage::new(ftp_registry.clone())
     }))
     .greeting("Bienvenue sur le Proxy FTP de votre Radxa Zero 3W")
-    .passive_ports(50000..=50100) // Définit une plage de ports passifs
+    .passive_ports(50000..=50100)
     .build()?;
 
     let ftp_addr = "0.0.0.0:2121";
     info!("Serveur FTP virtuel prêt sur {}", ftp_addr);
     
-    // Lance l'écoute
     ftp_server.listen(ftp_addr).await?;
 
     Ok(())
@@ -70,7 +68,7 @@ async fn register_phone(
 // -----------------------------------------------------------------
 // SYSTÈME DE FICHIERS VIRTUEL AMÉLIORÉ (unftp-core)
 // -----------------------------------------------------------------
-use unftp_core::storage::{StorageBackend, Fileinfo, Metadata};
+use unftp_core::storage::{StorageBackend, Fileinfo, Metadata, Error, ErrorKind};
 
 #[derive(Debug)]
 struct VirtualStorage {
@@ -101,16 +99,15 @@ impl Metadata for VirtualMetadata {
 }
 
 #[async_trait::async_trait]
-impl<User> StorageBackend<User> for VirtualStorage {
+impl<User: unftp_core::auth::UserDetail> StorageBackend<User> for VirtualStorage {
     type Metadata = VirtualMetadata;
 
     async fn list<P>(&self, _user: &User, path: P) -> unftp_core::storage::Result<Vec<Fileinfo<std::path::PathBuf, Self::Metadata>>>
     where
-        P: AsRef<std::path::Path> + Send + Sync,
+        P: AsRef<std::path::Path> + Send,
     {
         let path = path.as_ref();
         
-        // Si Kodi liste la racine du FTP
         if path == std::path::Path::new("") || path == std::path::Path::new("/") {
             let table = self.registry.read().await;
             let mut list = Vec::new();
@@ -129,7 +126,7 @@ impl<User> StorageBackend<User> for VirtualStorage {
     }
 
     async fn metadata<P>(&self, _user: &User, path: P) -> unftp_core::storage::Result<Self::Metadata>
-    where P: AsRef<std::path::Path> + Send + Sync {
+    where P: AsRef<std::path::Path> + Send {
         let path = path.as_ref();
         if path == std::path::Path::new("") || path == std::path::Path::new("/") {
             return Ok(VirtualMetadata { is_dir: true });
@@ -137,13 +134,15 @@ impl<User> StorageBackend<User> for VirtualStorage {
         Ok(VirtualMetadata { is_dir: true })
     }
 
-    // Implémentations obligatoires vides pour la conformité du Trait
-    async fn get<P>(&self, _user: &User, _path: P, _start_pos: u64) -> unftp_core::storage::Result<unftp_core::storage::GetResult> where P: AsRef<std::path::Path> + Send + Sync { 
-        Err(unftp_core::storage::StorageError::new(unftp_core::storage::StorageErrorKind::FileNotFound, "En cours de développement")) 
+    // Gestion des erreurs et signatures corrigées
+    async fn get<P>(&self, _user: &User, _path: P, _start_pos: u64) -> unftp_core::storage::Result<unftp_core::storage::GetResult> 
+    where P: AsRef<std::path::Path> + Send { 
+        Err(Error::new(ErrorKind::PermanentFileNotAvailable, "En cours de développement")) 
     }
-    async fn put<P, R>(&self, _user: &User, _bytes: R, _path: P, _start_pos: u64) -> unftp_core::storage::Result<u64> where P: AsRef<std::path::Path> + Send + Sync, R: tokio::io::AsyncRead + Send + Sync + Unpin + 'static { Ok(0) }
-    async fn del<P>(&self, _user: &User, _path: P) -> unftp_core::storage::Result<()> where P: AsRef<std::path::Path> + Send + Sync { Ok(()) }
-    async fn mkd<P>(&self, _user: &User, _path: P) -> unftp_core::storage::Result<()> where P: AsRef<std::path::Path> + Send + Sync { Ok(()) }
-    async fn rmd<P>(&self, _user: &User, _path: P) -> unftp_core::storage::Result<()> where P: AsRef<std::path::Path> + Send + Sync { Ok(()) }
-    async fn rename<P>(&self, _user: &User, _from: P, _to: P) -> unftp_core::storage::Result<()> where P: AsRef<std::path::Path> + Send + Sync { Ok(()) }
+    
+    async fn put<P, R>(&self, _user: &User, _bytes: R, _path: P, _start_pos: u64) -> unftp_core::storage::Result<u64> where P: AsRef<std::path::Path> + Send, R: tokio::io::AsyncRead + Send + Sync + Unpin + 'static { Ok(0) }
+    async fn del<P>(&self, _user: &User, _path: P) -> unftp_core::storage::Result<()> where P: AsRef<std::path::Path> + Send { Ok(()) }
+    async fn mkd<P>(&self, _user: &User, _path: P) -> unftp_core::storage::Result<()> where P: AsRef<std::path::Path> + Send { Ok(()) }
+    async fn rmd<P>(&self, _user: &User, _path: P) -> unftp_core::storage::Result<()> where P: AsRef<std::path::Path> + Send { Ok(()) }
+    async fn rename<P>(&self, _user: &User, _from: P, _to: P) -> unftp_core::storage::Result<()> where P: AsRef<std::path::Path> + Send { Ok(()) }
 }
