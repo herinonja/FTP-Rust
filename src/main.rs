@@ -23,7 +23,6 @@ impl ProxyStorage {
         components.next(); // Ignorer la racine (/)
         
         let ip_component = components.next().ok_or_else(|| {
-            // CORRECTION: FileNameNotAllowedError au lieu de FileNameNotAllowed
             Error::new(ErrorKind::FileNameNotAllowedError, "Format de chemin invalide (IP du téléphone manquante)")
         })?;
         
@@ -48,8 +47,6 @@ impl ProxyStorage {
     }
 }
 
-// CORRECTION: Création d'une structure Metadata factice pour satisfaire le contrat.
-// Kodi ne l'utilise généralement pas pour simplement lire un flux.
 #[derive(Debug)]
 pub struct ProxyMetadata;
 
@@ -69,17 +66,14 @@ impl unftp_core::storage::Metadata for ProxyMetadata {
 // 2. IMPLÉMENTATION DU SERVEUR FTP
 // -------------------------------------------------------------------------
 
-// CORRECTION: Ajout du trait UserDetail dans les contraintes de User
 #[async_trait]
 impl<User: UserDetail + Send + Sync + Debug> StorageBackend<User> for ProxyStorage {
-    // CORRECTION: Association de notre type Metadata au backend
     type Metadata = ProxyMetadata;
 
     fn name(&self) -> &str {
         "KodiFtpProxy"
     }
 
-    // CORRECTION: P: AsRef<Path> + Send (suppression du + Sync qui était de trop)
     async fn get<P>(&self, _user: &User, path: P, start_pos: u64) -> unftp_core::storage::Result<Box<dyn tokio::io::AsyncRead + Send + Sync + Unpin>>
     where
         P: AsRef<Path> + Send,
@@ -91,7 +85,10 @@ impl<User: UserDetail + Send + Sync + Debug> StorageBackend<User> for ProxyStora
         let path_str = target_path.to_string_lossy().into_owned();
         
         if start_pos > 0 {
-            client.resume_transfer(start_pos as usize);
+            // CORRECTION PRO : Ajout du .await et de la gestion d'erreur pour exécuter le positionnement (REST)
+            client.resume_transfer(start_pos as usize)
+                .await
+                .map_err(|e| Error::new(ErrorKind::LocalError, format!("Le téléphone a refusé le positionnement (Seek) : {}", e)))?;
         }
 
         let data_stream = client.retr_as_stream(&path_str)
@@ -106,7 +103,6 @@ impl<User: UserDetail + Send + Sync + Debug> StorageBackend<User> for ProxyStora
         Ok(Box::new(tokio_stream))
     }
     
-    // CORRECTION: Utilisation de Self::Metadata
     async fn metadata<P>(&self, _user: &User, _path: P) -> unftp_core::storage::Result<Self::Metadata>
     where
         P: AsRef<Path> + Send,
@@ -114,7 +110,6 @@ impl<User: UserDetail + Send + Sync + Debug> StorageBackend<User> for ProxyStora
         Err(Error::new(ErrorKind::CommandNotImplemented, "metadata non implémenté"))
     }
 
-    // CORRECTION: Utilisation de Self::Metadata
     async fn list<P>(&self, _user: &User, _path: P) -> unftp_core::storage::Result<Vec<Fileinfo<PathBuf, Self::Metadata>>>
     where
         P: AsRef<Path> + Send,
@@ -129,7 +124,6 @@ impl<User: UserDetail + Send + Sync + Debug> StorageBackend<User> for ProxyStora
         Ok(())
     }
 
-    // CORRECTION: Ajout de la méthode rename obligatoire
     async fn rename<P>(&self, _user: &User, _from: P, _to: P) -> unftp_core::storage::Result<()>
     where
         P: AsRef<Path> + Send,
@@ -178,7 +172,6 @@ async fn main() {
     
     println!("Démarrage du Kodi FTP Proxy sur ftp://{}", addr);
 
-    // L'ajout de .unwrap() extrait le serveur du Result généré par build()
     let server = ServerBuilder::new(Box::new(move || ProxyStorage::new()))
         .build()
         .unwrap();
