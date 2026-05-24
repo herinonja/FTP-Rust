@@ -1,4 +1,4 @@
-# Flutter-Radxa Proxy
+# Flutter App - Radxa Proxy
 
 Single Rust proxy for the Radxa.
 
