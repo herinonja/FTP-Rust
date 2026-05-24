@@ -12,7 +12,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::RwLock;
 use unftp_core::auth::UserDetail;
-use unftp_core::storage::{Error, ErrorKind, Fileinfo, StorageBackend};
+use unftp_core::storage::{Error, ErrorKind, Fileinfo, StorageBackend, FEATURE_RESTART};
 use wtransport::tls::Sha256DigestFmt;
 use wtransport::{Connection, Endpoint, Identity, ServerConfig};
 
@@ -229,6 +229,10 @@ impl<User: UserDetail + Send + Sync + Debug> StorageBackend<User> for ProxyStora
 
     fn name(&self) -> &str {
         "TrooznWebTransportProxy"
+    }
+
+    fn supported_features(&self) -> u32 {
+        FEATURE_RESTART
     }
 
     async fn get<P>(
