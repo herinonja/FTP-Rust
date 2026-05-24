@@ -10,13 +10,13 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::RwLock;
 use unftp_core::auth::UserDetail;
 use unftp_core::storage::{Error, ErrorKind, Fileinfo, StorageBackend};
 use wtransport::tls::Sha256DigestFmt;
 use wtransport::{Connection, Endpoint, Identity, ServerConfig};
 
-const DEFAULT_FTP_BIND: &str = "0.0.0.0:2120";
+const DEFAULT_FTP_BIND: &str = "127.0.0.1:2021";
 const DEFAULT_WEBTRANSPORT_BIND: &str = "0.0.0.0:4433";
 const DEFAULT_KODI_HOST: &str = "127.0.0.1";
 const DEFAULT_KODI_PORT: u16 = 8080;
@@ -34,8 +34,8 @@ struct KodiConfig {
 struct PhoneSession {
     id: String,
     display_name: String,
+    folder_name: String,
     connection: Arc<Connection>,
-    request_lock: Mutex<()>,
 }
 
 #[derive(Debug, Default)]
@@ -50,15 +50,17 @@ impl PhoneRegistry {
             .display_name
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| id.clone());
+        let mut phones = self.phones.write().await;
+        let folder_name = unique_folder_name(&display_name, &id, &phones);
 
         let session = Arc::new(PhoneSession {
             id: id.clone(),
             display_name,
+            folder_name,
             connection,
-            request_lock: Mutex::new(()),
         });
 
-        self.phones.write().await.insert(id, session);
+        phones.insert(id, session);
     }
 
     async fn unregister_connection(&self, connection: &Arc<Connection>) {
@@ -74,8 +76,13 @@ impl PhoneRegistry {
         phones
     }
 
-    async fn get(&self, id: &str) -> Option<Arc<PhoneSession>> {
-        self.phones.read().await.get(id).cloned()
+    async fn get_by_folder(&self, folder_name: &str) -> Option<Arc<PhoneSession>> {
+        let phones = self.phones.read().await;
+        phones
+            .values()
+            .find(|phone| phone.folder_name == folder_name)
+            .cloned()
+            .or_else(|| phones.get(folder_name).cloned())
     }
 }
 
@@ -171,7 +178,7 @@ impl ProxyStorage {
     }
 
     async fn phone(&self, id: &str) -> unftp_core::storage::Result<Arc<PhoneSession>> {
-        self.registry.get(id).await.ok_or_else(|| {
+        self.registry.get_by_folder(id).await.ok_or_else(|| {
             Error::new(
                 ErrorKind::ConnectionClosed,
                 format!("telephone WebTransport indisponible: {id}"),
@@ -239,7 +246,6 @@ impl<User: UserDetail + Send + Sync + Debug> StorageBackend<User> for ProxyStora
 
         tokio::spawn(async move {
             let result = async {
-                let _guard = phone.request_lock.lock().await;
                 let (mut tx, mut rx) = phone
                     .connection
                     .open_bi()
@@ -330,7 +336,7 @@ impl<User: UserDetail + Send + Sync + Debug> StorageBackend<User> for ProxyStora
                 .await
                 .into_iter()
                 .map(|phone| Fileinfo {
-                    path: PathBuf::from(phone.id.clone()),
+                    path: PathBuf::from(phone.folder_name.clone()),
                     metadata: ProxyMetadata {
                         is_dir: true,
                         size: 0,
@@ -443,9 +449,14 @@ async fn main() -> anyhow::Result<()> {
     let wt_cert_dir = webtransport_cert_dir.clone();
     let wt_status_path = proxy_status_path.clone();
     tokio::spawn(async move {
-        if let Err(error) =
-            run_webtransport_server(&wt_bind, &wt_cert_dir, &wt_status_path, wt_registry, wt_kodi)
-                .await
+        if let Err(error) = run_webtransport_server(
+            &wt_bind,
+            &wt_cert_dir,
+            &wt_status_path,
+            wt_registry,
+            wt_kodi,
+        )
+        .await
         {
             eprintln!("Erreur serveur WebTransport TROOZN: {error:?}");
         }
@@ -455,7 +466,10 @@ async fn main() -> anyhow::Result<()> {
     println!(" TROOZN RADXA PROXY");
     println!(" Kodi lit: ftp://{ftp_bind}/");
     println!(" Telephones: WebTransport sur https://{webtransport_bind}/");
-    println!(" Certificat WebTransport: {}", webtransport_cert_dir.display());
+    println!(
+        " Certificat WebTransport: {}",
+        webtransport_cert_dir.display()
+    );
     println!(" Status proxy: {}", proxy_status_path.display());
     println!(" Kodi JSON-RPC local: {}:{}", kodi.host, kodi.port);
     println!("=============================================================");
@@ -561,7 +575,8 @@ async fn identity_is_stale(metadata_path: &Path) -> bool {
         .get("createdAt")
         .and_then(Value::as_u64)
         .unwrap_or_default();
-    created_at == 0 || unix_timestamp().saturating_sub(created_at) >= WEBTRANSPORT_CERT_MAX_AGE_SECONDS
+    created_at == 0
+        || unix_timestamp().saturating_sub(created_at) >= WEBTRANSPORT_CERT_MAX_AGE_SECONDS
 }
 
 async fn restrict_private_key_permissions(key_path: &Path) {
@@ -576,11 +591,7 @@ async fn restrict_private_key_permissions(key_path: &Path) {
     }
 }
 
-async fn write_proxy_status(
-    status_path: &Path,
-    bind: &str,
-    cert_hash: &str,
-) -> anyhow::Result<()> {
+async fn write_proxy_status(status_path: &Path, bind: &str, cert_hash: &str) -> anyhow::Result<()> {
     if let Some(parent) = status_path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
@@ -673,7 +684,6 @@ async fn phone_json_request(
     request: &PhoneRequest<'_>,
     timeout: Duration,
 ) -> anyhow::Result<PhoneResponse> {
-    let _guard = phone.request_lock.lock().await;
     let (mut tx, mut rx) = tokio::time::timeout(timeout, phone.connection.open_bi())
         .await
         .context("timeout ouverture flux telephone")??
@@ -789,6 +799,53 @@ fn safe_device_id(value: &str) -> String {
         "phone".into()
     } else {
         safe
+    }
+}
+
+fn safe_folder_name(value: &str) -> String {
+    let trimmed = value.trim();
+    let safe = trimmed
+        .chars()
+        .map(|ch| {
+            if ch == '/' || ch == '\\' || ch.is_control() {
+                '_'
+            } else {
+                ch
+            }
+        })
+        .collect::<String>()
+        .trim()
+        .trim_matches('.')
+        .to_string();
+    if safe.is_empty() {
+        "Telephone".into()
+    } else {
+        safe
+    }
+}
+
+fn unique_folder_name(
+    display_name: &str,
+    device_id: &str,
+    phones: &HashMap<String, Arc<PhoneSession>>,
+) -> String {
+    let base = safe_folder_name(display_name);
+    let collides = phones
+        .values()
+        .any(|phone| phone.id != device_id && phone.folder_name == base);
+    if !collides {
+        return base;
+    }
+
+    let suffix = safe_device_id(device_id);
+    let candidate = format!("{base} ({suffix})");
+    if phones
+        .values()
+        .any(|phone| phone.id != device_id && phone.folder_name == candidate)
+    {
+        format!("{base} ({})", unix_timestamp())
+    } else {
+        candidate
     }
 }
 
