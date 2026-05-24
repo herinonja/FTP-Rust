@@ -119,11 +119,7 @@ enum PhoneRequest<'a> {
     #[serde(rename = "media.stat")]
     MediaStat { path: &'a str },
     #[serde(rename = "media.get")]
-    MediaGet {
-        path: &'a str,
-        #[serde(rename = "start")]
-        start_pos: u64,
-    },
+    MediaGet { path: &'a str, start_pos: u64 },
 }
 
 #[derive(Debug, Deserialize)]
