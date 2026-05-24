@@ -16,7 +16,7 @@ use unftp_core::storage::{Error, ErrorKind, Fileinfo, StorageBackend, FEATURE_RE
 use wtransport::tls::Sha256DigestFmt;
 use wtransport::{Connection, Endpoint, Identity, ServerConfig};
 
-const DEFAULT_FTP_BIND: &str = "127.0.0.1:2021";
+const DEFAULT_FTP_BIND: &str = "127.0.0.1:2120";
 const DEFAULT_WEBTRANSPORT_BIND: &str = "0.0.0.0:4433";
 const DEFAULT_KODI_HOST: &str = "127.0.0.1";
 const DEFAULT_KODI_PORT: u16 = 8080;
