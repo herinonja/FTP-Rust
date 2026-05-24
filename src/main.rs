@@ -7,18 +7,20 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, RwLock};
 use unftp_core::auth::UserDetail;
 use unftp_core::storage::{Error, ErrorKind, Fileinfo, StorageBackend};
+use wtransport::tls::Sha256DigestFmt;
 use wtransport::{Connection, Endpoint, Identity, ServerConfig};
 
 const DEFAULT_FTP_BIND: &str = "0.0.0.0:2120";
 const DEFAULT_WEBTRANSPORT_BIND: &str = "0.0.0.0:4433";
 const DEFAULT_KODI_HOST: &str = "127.0.0.1";
 const DEFAULT_KODI_PORT: u16 = 8080;
+const WEBTRANSPORT_CERT_MAX_AGE_SECONDS: u64 = 13 * 24 * 60 * 60;
 
 type Registry = Arc<PhoneRegistry>;
 
@@ -419,6 +421,13 @@ async fn main() -> anyhow::Result<()> {
     let ftp_bind = std::env::var("TROOZN_FTP_BIND").unwrap_or_else(|_| DEFAULT_FTP_BIND.into());
     let webtransport_bind = std::env::var("TROOZN_WEBTRANSPORT_BIND")
         .unwrap_or_else(|_| DEFAULT_WEBTRANSPORT_BIND.into());
+    let state_dir = troozn_state_dir();
+    let webtransport_cert_dir = std::env::var("TROOZN_WEBTRANSPORT_CERT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| state_dir.join("webtransport"));
+    let proxy_status_path = std::env::var("TROOZN_PROXY_STATUS_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| state_dir.join("proxy-status.json"));
     let kodi = KodiConfig {
         host: std::env::var("TROOZN_KODI_HOST").unwrap_or_else(|_| DEFAULT_KODI_HOST.into()),
         port: std::env::var("TROOZN_KODI_PORT")
@@ -431,8 +440,13 @@ async fn main() -> anyhow::Result<()> {
     let wt_registry = registry.clone();
     let wt_kodi = kodi.clone();
     let wt_bind = webtransport_bind.clone();
+    let wt_cert_dir = webtransport_cert_dir.clone();
+    let wt_status_path = proxy_status_path.clone();
     tokio::spawn(async move {
-        if let Err(error) = run_webtransport_server(&wt_bind, wt_registry, wt_kodi).await {
+        if let Err(error) =
+            run_webtransport_server(&wt_bind, &wt_cert_dir, &wt_status_path, wt_registry, wt_kodi)
+                .await
+        {
             eprintln!("Erreur serveur WebTransport TROOZN: {error:?}");
         }
     });
@@ -441,6 +455,8 @@ async fn main() -> anyhow::Result<()> {
     println!(" TROOZN RADXA PROXY");
     println!(" Kodi lit: ftp://{ftp_bind}/");
     println!(" Telephones: WebTransport sur https://{webtransport_bind}/");
+    println!(" Certificat WebTransport: {}", webtransport_cert_dir.display());
+    println!(" Status proxy: {}", proxy_status_path.display());
     println!(" Kodi JSON-RPC local: {}:{}", kodi.host, kodi.port);
     println!("=============================================================");
 
@@ -457,19 +473,23 @@ async fn main() -> anyhow::Result<()> {
 
 async fn run_webtransport_server(
     bind: &str,
+    cert_dir: &Path,
+    status_path: &Path,
     registry: Registry,
     kodi: KodiConfig,
 ) -> anyhow::Result<()> {
-    let identity = Identity::self_signed(["localhost", "127.0.0.1", "0.0.0.0"])?;
+    let identity = load_or_create_webtransport_identity(cert_dir).await?;
     let cert_hash = identity
         .certificate_chain()
         .as_slice()
         .first()
         .ok_or_else(|| anyhow!("certificat WebTransport manquant"))?
         .hash();
+    let cert_hash_text = cert_hash.fmt(Sha256DigestFmt::DottedHex);
 
-    println!("Empreinte WebTransport TROOZN a copier dans les telephones:");
-    println!("{cert_hash}");
+    println!("Empreinte WebTransport TROOZN:");
+    println!("{cert_hash_text}");
+    write_proxy_status(status_path, bind, &cert_hash_text).await?;
 
     let config = ServerConfig::builder()
         .with_bind_address(bind.parse()?)
@@ -487,6 +507,94 @@ async fn run_webtransport_server(
             }
         });
     }
+}
+
+async fn load_or_create_webtransport_identity(cert_dir: &Path) -> anyhow::Result<Identity> {
+    let cert_path = cert_dir.join("cert.pem");
+    let key_path = cert_dir.join("key.pem");
+    let metadata_path = cert_dir.join("identity.json");
+
+    if cert_path.exists() && key_path.exists() && !identity_is_stale(&metadata_path).await {
+        return Identity::load_pemfiles(&cert_path, &key_path)
+            .await
+            .context("chargement identite WebTransport persistante");
+    }
+
+    tokio::fs::create_dir_all(cert_dir)
+        .await
+        .with_context(|| format!("creation du repertoire {}", cert_dir.display()))?;
+
+    let identity = Identity::self_signed(["localhost", "127.0.0.1", "0.0.0.0"])?;
+    identity
+        .certificate_chain()
+        .store_pemfile(&cert_path)
+        .await
+        .with_context(|| format!("ecriture du certificat {}", cert_path.display()))?;
+    identity
+        .private_key()
+        .store_secret_pemfile(&key_path)
+        .await
+        .with_context(|| format!("ecriture de la cle {}", key_path.display()))?;
+    restrict_private_key_permissions(&key_path).await;
+
+    let created_at = unix_timestamp();
+    let metadata = json!({
+        "createdAt": created_at,
+        "expiresAfter": created_at + (14 * 24 * 60 * 60),
+        "rotateAfter": created_at + WEBTRANSPORT_CERT_MAX_AGE_SECONDS,
+    });
+    tokio::fs::write(&metadata_path, metadata.to_string())
+        .await
+        .with_context(|| format!("ecriture metadata {}", metadata_path.display()))?;
+
+    Ok(identity)
+}
+
+async fn identity_is_stale(metadata_path: &Path) -> bool {
+    let Ok(raw) = tokio::fs::read_to_string(metadata_path).await else {
+        return true;
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&raw) else {
+        return true;
+    };
+    let created_at = value
+        .get("createdAt")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    created_at == 0 || unix_timestamp().saturating_sub(created_at) >= WEBTRANSPORT_CERT_MAX_AGE_SECONDS
+}
+
+async fn restrict_private_key_permissions(key_path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(metadata) = tokio::fs::metadata(key_path).await {
+            let mut permissions = metadata.permissions();
+            permissions.set_mode(0o600);
+            let _ = tokio::fs::set_permissions(key_path, permissions).await;
+        }
+    }
+}
+
+async fn write_proxy_status(
+    status_path: &Path,
+    bind: &str,
+    cert_hash: &str,
+) -> anyhow::Result<()> {
+    if let Some(parent) = status_path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let status = json!({
+        "state": "running",
+        "transport": "webtransport",
+        "ftpBind": std::env::var("TROOZN_FTP_BIND").unwrap_or_else(|_| DEFAULT_FTP_BIND.into()),
+        "webTransportBind": bind,
+        "webTransportPort": bind.rsplit(':').next().and_then(|value| value.parse::<u16>().ok()).unwrap_or(4433),
+        "webTransportCertHash": cert_hash,
+        "updatedAt": unix_timestamp(),
+    });
+    tokio::fs::write(status_path, format!("{status}\n")).await?;
+    Ok(())
 }
 
 async fn handle_webtransport_client(
@@ -682,6 +790,19 @@ fn safe_device_id(value: &str) -> String {
     } else {
         safe
     }
+}
+
+fn troozn_state_dir() -> PathBuf {
+    std::env::var("TROOZN_STATE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("./troozn-state"))
+}
+
+fn unix_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 fn storage_error(error: anyhow::Error) -> Error {
