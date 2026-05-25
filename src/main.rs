@@ -4,7 +4,7 @@ use axum::body::Body;
 use axum::extract::{Path as AxumPath, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::Router;
 use libunftp::ServerBuilder;
 use serde::{Deserialize, Serialize};
@@ -12,13 +12,14 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::hash::Hasher;
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket as StdUdpSocket};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{Mutex, RwLock};
 use tokio_util::io::ReaderStream;
 use unftp_core::auth::UserDetail;
@@ -28,6 +29,7 @@ use wtransport::{Connection, Endpoint, Identity, ServerConfig};
 
 const DEFAULT_FTP_BIND: &str = "127.0.0.1:2120";
 const DEFAULT_HTTP_BIND: &str = "127.0.0.1:8787";
+const DEFAULT_UPNP_BIND: &str = "0.0.0.0:8788";
 const DEFAULT_WEBTRANSPORT_BIND: &str = "0.0.0.0:4433";
 const DEFAULT_KODI_HOST: &str = "127.0.0.1";
 const DEFAULT_KODI_PORT: u16 = 8080;
@@ -42,6 +44,12 @@ const MIN_HEAD_CACHE_BYTES: u64 = 10 * 1024 * 1024;
 const DEFAULT_HEAD_CACHE_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_HEAD_CACHE_BYTES: u64 = 50 * 1024 * 1024;
 const DEFAULT_HEAD_CACHE_MAX_BYTES: u64 = 256 * 1024 * 1024;
+const UPNP_ROOT_UUID: &str = "fdab0000-7472-6f6f-7a6e-000000000001";
+const UPNP_BOOT_ID: u32 = 1;
+const UPNP_CONFIG_ID: u32 = 1;
+const UPNP_ADVERTISE_INTERVAL: Duration = Duration::from_secs(30);
+const UPNP_MULTICAST_ADDR: Ipv4Addr = Ipv4Addr::new(239, 255, 255, 250);
+const UPNP_MULTICAST_PORT: u16 = 1900;
 
 type Registry = Arc<PhoneRegistry>;
 
@@ -58,6 +66,34 @@ struct HeadCache {
 struct HttpGatewayState {
     registry: Registry,
     cache: Arc<HeadCache>,
+}
+
+#[derive(Debug, Clone)]
+struct UpnpState {
+    registry: Registry,
+    upnp_base_url: String,
+    media_base_url: String,
+}
+
+#[derive(Debug, Clone)]
+struct UpnpDeviceInfo {
+    key: String,
+    uuid: String,
+    friendly_name: String,
+    phone_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct UpnpDidlItem {
+    id: String,
+    parent_id: String,
+    title: String,
+    upnp_class: String,
+    is_container: bool,
+    child_count: usize,
+    protocol_info: Option<String>,
+    url: Option<String>,
+    size: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -140,6 +176,12 @@ impl PhoneRegistry {
             .find(|phone| phone.folder_name == folder_name)
             .cloned()
             .or_else(|| phones.get(folder_name).filter(|phone| phone_is_visible(phone)).cloned())
+    }
+
+    async fn get_by_id(&self, id: &str) -> Option<Arc<PhoneSession>> {
+        let mut phones = self.phones.write().await;
+        prune_stale_phones(&mut phones);
+        phones.get(id).filter(|phone| phone_is_visible(phone)).cloned()
     }
 }
 
@@ -505,6 +547,8 @@ async fn main() -> anyhow::Result<()> {
 
     let ftp_bind = std::env::var("TROOZN_FTP_BIND").unwrap_or_else(|_| DEFAULT_FTP_BIND.into());
     let http_bind = std::env::var("TROOZN_HTTP_BIND").unwrap_or_else(|_| DEFAULT_HTTP_BIND.into());
+    let upnp_bind =
+        std::env::var("TROOZN_UPNP_BIND").unwrap_or_else(|_| DEFAULT_UPNP_BIND.into());
     let webtransport_bind = std::env::var("TROOZN_WEBTRANSPORT_BIND")
         .unwrap_or_else(|_| DEFAULT_WEBTRANSPORT_BIND.into());
     let state_dir = troozn_state_dir();
@@ -573,10 +617,22 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    let upnp_registry = registry.clone();
+    let upnp_bind_for_task = upnp_bind.clone();
+    let http_bind_for_upnp = http_bind.clone();
+    tokio::spawn(async move {
+        if let Err(error) =
+            run_upnp_server(&upnp_bind_for_task, &http_bind_for_upnp, upnp_registry).await
+        {
+            eprintln!("Erreur serveur UPnP TROOZN: {error:?}");
+        }
+    });
+
     println!("=============================================================");
     println!(" TROOZN RADXA PROXY");
     println!(" Kodi lit legacy: ftp://{ftp_bind}/");
     println!(" Kodi lit media: http://{http_bind}/media/<telephone>/<chemin>");
+    println!(" Kodi decouvre UPnP/DLNA: http://{upnp_bind}/upnp/root/device.xml");
     println!(" Telephones: WebTransport sur https://{webtransport_bind}/");
     println!(
         " Certificat WebTransport: {}",
@@ -664,6 +720,230 @@ async fn run_http_media_gateway(
 
 async fn http_health() -> impl IntoResponse {
     (StatusCode::OK, "ok")
+}
+
+async fn run_upnp_server(bind: &str, http_bind: &str, registry: Registry) -> anyhow::Result<()> {
+    let upnp_port = bind_port(bind, 8788);
+    let upnp_host = std::env::var("TROOZN_UPNP_PUBLIC_HOST")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(guess_local_ipv4);
+    let state = UpnpState {
+        registry,
+        upnp_base_url: format!("http://{upnp_host}:{upnp_port}"),
+        media_base_url: loopback_base_url(http_bind, 8787),
+    };
+
+    let ssdp_state = state.clone();
+    tokio::spawn(async move {
+        if let Err(error) = run_upnp_ssdp(ssdp_state).await {
+            eprintln!("Erreur SSDP UPnP TROOZN: {error:?}");
+        }
+    });
+
+    let app = Router::new()
+        .route("/", get(upnp_root_page))
+        .route("/upnp/:device/device.xml", get(upnp_device_description))
+        .route(
+            "/upnp/:device/ContentDirectory.xml",
+            get(upnp_content_directory_scpd),
+        )
+        .route(
+            "/upnp/:device/ConnectionManager.xml",
+            get(upnp_connection_manager_scpd),
+        )
+        .route(
+            "/upnp/:device/control/ContentDirectory",
+            post(upnp_content_directory_control),
+        )
+        .route(
+            "/upnp/:device/control/ConnectionManager",
+            post(upnp_connection_manager_control),
+        )
+        .with_state(state.clone());
+
+    let listener = TcpListener::bind(bind)
+        .await
+        .with_context(|| format!("ecoute UPnP {bind}"))?;
+    println!("Serveur UPnP TROOZN: {}/upnp/root/device.xml", state.upnp_base_url);
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+async fn upnp_root_page() -> impl IntoResponse {
+    (StatusCode::OK, "TROOZN UPnP/DLNA")
+}
+
+async fn upnp_device_description(
+    State(state): State<UpnpState>,
+    AxumPath(device_key): AxumPath<String>,
+) -> Response {
+    let Some(device) = upnp_device_for_key(&state, &device_key).await else {
+        return simple_response(StatusCode::NOT_FOUND, "device UPnP introuvable");
+    };
+    xml_response(upnp_device_description_xml(&state, &device))
+}
+
+async fn upnp_content_directory_scpd() -> Response {
+    xml_response(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+        <scpd xmlns=\"urn:schemas-upnp-org:service-1-0\">\
+        <specVersion><major>1</major><minor>0</minor></specVersion>\
+        <actionList>\
+        <action><name>GetSearchCapabilities</name><argumentList><argument><name>SearchCaps</name><direction>out</direction><relatedStateVariable>SearchCapabilities</relatedStateVariable></argument></argumentList></action>\
+        <action><name>GetSortCapabilities</name><argumentList><argument><name>SortCaps</name><direction>out</direction><relatedStateVariable>SortCapabilities</relatedStateVariable></argument></argumentList></action>\
+        <action><name>GetSystemUpdateID</name><argumentList><argument><name>Id</name><direction>out</direction><relatedStateVariable>SystemUpdateID</relatedStateVariable></argument></argumentList></action>\
+        <action><name>Browse</name><argumentList>\
+        <argument><name>ObjectID</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_ObjectID</relatedStateVariable></argument>\
+        <argument><name>BrowseFlag</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_BrowseFlag</relatedStateVariable></argument>\
+        <argument><name>Filter</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_Filter</relatedStateVariable></argument>\
+        <argument><name>StartingIndex</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_Index</relatedStateVariable></argument>\
+        <argument><name>RequestedCount</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_Count</relatedStateVariable></argument>\
+        <argument><name>SortCriteria</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_SortCriteria</relatedStateVariable></argument>\
+        <argument><name>Result</name><direction>out</direction><relatedStateVariable>A_ARG_TYPE_Result</relatedStateVariable></argument>\
+        <argument><name>NumberReturned</name><direction>out</direction><relatedStateVariable>A_ARG_TYPE_Count</relatedStateVariable></argument>\
+        <argument><name>TotalMatches</name><direction>out</direction><relatedStateVariable>A_ARG_TYPE_Count</relatedStateVariable></argument>\
+        <argument><name>UpdateID</name><direction>out</direction><relatedStateVariable>A_ARG_TYPE_UpdateID</relatedStateVariable></argument>\
+        </argumentList></action>\
+        <action><name>UpdateObject</name><argumentList>\
+        <argument><name>ObjectID</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_ObjectID</relatedStateVariable></argument>\
+        <argument><name>CurrentTagValue</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_TagValueList</relatedStateVariable></argument>\
+        <argument><name>NewTagValue</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_TagValueList</relatedStateVariable></argument>\
+        </argumentList></action>\
+        </actionList>\
+        <serviceStateTable>\
+        <stateVariable sendEvents=\"no\"><name>A_ARG_TYPE_ObjectID</name><dataType>string</dataType></stateVariable>\
+        <stateVariable sendEvents=\"no\"><name>A_ARG_TYPE_BrowseFlag</name><dataType>string</dataType></stateVariable>\
+        <stateVariable sendEvents=\"no\"><name>A_ARG_TYPE_Filter</name><dataType>string</dataType></stateVariable>\
+        <stateVariable sendEvents=\"no\"><name>A_ARG_TYPE_Index</name><dataType>ui4</dataType></stateVariable>\
+        <stateVariable sendEvents=\"no\"><name>A_ARG_TYPE_Count</name><dataType>ui4</dataType></stateVariable>\
+        <stateVariable sendEvents=\"no\"><name>A_ARG_TYPE_SortCriteria</name><dataType>string</dataType></stateVariable>\
+        <stateVariable sendEvents=\"no\"><name>A_ARG_TYPE_Result</name><dataType>string</dataType></stateVariable>\
+        <stateVariable sendEvents=\"no\"><name>A_ARG_TYPE_UpdateID</name><dataType>ui4</dataType></stateVariable>\
+        <stateVariable sendEvents=\"no\"><name>A_ARG_TYPE_TagValueList</name><dataType>string</dataType></stateVariable>\
+        <stateVariable sendEvents=\"no\"><name>SearchCapabilities</name><dataType>string</dataType></stateVariable>\
+        <stateVariable sendEvents=\"no\"><name>SortCapabilities</name><dataType>string</dataType></stateVariable>\
+        <stateVariable sendEvents=\"yes\"><name>SystemUpdateID</name><dataType>ui4</dataType></stateVariable>\
+        </serviceStateTable>\
+        </scpd>"
+            .to_string(),
+    )
+}
+
+async fn upnp_connection_manager_scpd() -> Response {
+    xml_response(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+        <scpd xmlns=\"urn:schemas-upnp-org:service-1-0\">\
+        <specVersion><major>1</major><minor>0</minor></specVersion>\
+        <actionList>\
+        <action><name>GetProtocolInfo</name><argumentList>\
+        <argument><name>Source</name><direction>out</direction><relatedStateVariable>SourceProtocolInfo</relatedStateVariable></argument>\
+        <argument><name>Sink</name><direction>out</direction><relatedStateVariable>SinkProtocolInfo</relatedStateVariable></argument>\
+        </argumentList></action>\
+        <action><name>GetCurrentConnectionIDs</name><argumentList><argument><name>ConnectionIDs</name><direction>out</direction><relatedStateVariable>CurrentConnectionIDs</relatedStateVariable></argument></argumentList></action>\
+        </actionList>\
+        <serviceStateTable>\
+        <stateVariable sendEvents=\"no\"><name>SourceProtocolInfo</name><dataType>string</dataType></stateVariable>\
+        <stateVariable sendEvents=\"no\"><name>SinkProtocolInfo</name><dataType>string</dataType></stateVariable>\
+        <stateVariable sendEvents=\"no\"><name>CurrentConnectionIDs</name><dataType>string</dataType></stateVariable>\
+        </serviceStateTable>\
+        </scpd>"
+            .to_string(),
+    )
+}
+
+async fn upnp_content_directory_control(
+    State(state): State<UpnpState>,
+    AxumPath(device_key): AxumPath<String>,
+    body: String,
+) -> Response {
+    let Some(device) = upnp_device_for_key(&state, &device_key).await else {
+        return simple_response(StatusCode::NOT_FOUND, "device UPnP introuvable");
+    };
+
+    if body.contains("GetSearchCapabilities") {
+        return soap_response(
+            "ContentDirectory",
+            "GetSearchCapabilitiesResponse",
+            "<SearchCaps></SearchCaps>",
+        );
+    }
+    if body.contains("GetSortCapabilities") {
+        return soap_response(
+            "ContentDirectory",
+            "GetSortCapabilitiesResponse",
+            "<SortCaps>dc:title</SortCaps>",
+        );
+    }
+    if body.contains("GetSystemUpdateID") {
+        return soap_response(
+            "ContentDirectory",
+            "GetSystemUpdateIDResponse",
+            "<Id>1</Id>",
+        );
+    }
+    if body.contains("UpdateObject") {
+        return soap_response("ContentDirectory", "UpdateObjectResponse", "");
+    }
+
+    let object_id = normalize_upnp_object_id(&soap_tag(&body, "ObjectID").unwrap_or_else(|| "0".into()));
+    let browse_flag =
+        soap_tag(&body, "BrowseFlag").unwrap_or_else(|| "BrowseDirectChildren".into());
+    let starting_index = soap_tag(&body, "StartingIndex")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0);
+    let requested_count = soap_tag(&body, "RequestedCount")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0);
+
+    let items = match upnp_browse(&state, &device, &object_id, &browse_flag).await {
+        Ok(items) => items,
+        Err(error) => {
+            eprintln!(
+                "UPnP Browse failed device={} object={}: {error:?}",
+                device.key, object_id
+            );
+            Vec::new()
+        }
+    };
+    let total = items.len();
+    let selected = slice_upnp_items(items, starting_index, requested_count);
+    let didl = upnp_didl(&selected);
+    soap_response(
+        "ContentDirectory",
+        "BrowseResponse",
+        &format!(
+            "<Result>{}</Result><NumberReturned>{}</NumberReturned><TotalMatches>{}</TotalMatches><UpdateID>1</UpdateID>",
+            xml_text(&didl),
+            selected.len(),
+            total
+        ),
+    )
+}
+
+async fn upnp_connection_manager_control(body: String) -> Response {
+    if body.contains("GetProtocolInfo") {
+        return soap_response(
+            "ConnectionManager",
+            "GetProtocolInfoResponse",
+            &format!(
+                "<Source>{}</Source><Sink></Sink>",
+                xml_text(&upnp_source_protocol_info())
+            ),
+        );
+    }
+    if body.contains("GetCurrentConnectionIDs") {
+        return soap_response(
+            "ConnectionManager",
+            "GetCurrentConnectionIDsResponse",
+            "<ConnectionIDs>0</ConnectionIDs>",
+        );
+    }
+    soap_response(
+        "ConnectionManager",
+        "GetCurrentConnectionInfoResponse",
+        "<RcsID>-1</RcsID><AVTransportID>-1</AVTransportID><ProtocolInfo></ProtocolInfo><PeerConnectionManager></PeerConnectionManager><PeerConnectionID>-1</PeerConnectionID><Direction>Output</Direction><Status>OK</Status>",
+    )
 }
 
 async fn http_head_media(
@@ -886,6 +1166,355 @@ fn media_headers_response(size: u64, start: u64, end: u64, partial: bool, body: 
 
 fn simple_response(status: StatusCode, message: &str) -> Response {
     (status, message.to_string()).into_response()
+}
+
+fn xml_response(xml: String) -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/xml; charset=utf-8")
+        .header("EXT", "")
+        .header("SERVER", upnp_server_header())
+        .body(Body::from(xml))
+        .unwrap_or_else(|_| simple_response(StatusCode::INTERNAL_SERVER_ERROR, "XML invalide"))
+}
+
+fn soap_response(service: &str, action: &str, inner_xml: &str) -> Response {
+    let xml = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+        <s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" \
+        s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">\
+        <s:Body><u:{action} xmlns:u=\"urn:schemas-upnp-org:service:{service}:1\">\
+        {inner_xml}\
+        </u:{action}></s:Body></s:Envelope>"
+    );
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/xml; charset=utf-8")
+        .header("EXT", "")
+        .header("SERVER", upnp_server_header())
+        .body(Body::from(xml))
+        .unwrap_or_else(|_| simple_response(StatusCode::INTERNAL_SERVER_ERROR, "SOAP invalide"))
+}
+
+fn upnp_device_description_xml(state: &UpnpState, device: &UpnpDeviceInfo) -> String {
+    let key = percent_encode_component(&device.key);
+    let base = &state.upnp_base_url;
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+        <root xmlns=\"urn:schemas-upnp-org:device-1-0\">\
+        <specVersion><major>1</major><minor>0</minor></specVersion>\
+        <URLBase>{base}/upnp/{key}/</URLBase>\
+        <device>\
+        <deviceType>urn:schemas-upnp-org:device:MediaServer:1</deviceType>\
+        <friendlyName>{}</friendlyName>\
+        <manufacturer>TROOZN</manufacturer>\
+        <modelDescription>TROOZN Radxa WebTransport UPnP/DLNA bridge</modelDescription>\
+        <modelName>TROOZN Radxa Media Bridge</modelName>\
+        <modelNumber>1</modelNumber>\
+        <serialNumber>{}</serialNumber>\
+        <UDN>uuid:{}</UDN>\
+        <presentationURL>{base}/</presentationURL>\
+        <serviceList>\
+        <service>\
+        <serviceType>urn:schemas-upnp-org:service:ContentDirectory:1</serviceType>\
+        <serviceId>urn:upnp-org:serviceId:ContentDirectory</serviceId>\
+        <SCPDURL>/upnp/{key}/ContentDirectory.xml</SCPDURL>\
+        <controlURL>/upnp/{key}/control/ContentDirectory</controlURL>\
+        <eventSubURL>/upnp/{key}/event/ContentDirectory</eventSubURL>\
+        </service>\
+        <service>\
+        <serviceType>urn:schemas-upnp-org:service:ConnectionManager:1</serviceType>\
+        <serviceId>urn:upnp-org:serviceId:ConnectionManager</serviceId>\
+        <SCPDURL>/upnp/{key}/ConnectionManager.xml</SCPDURL>\
+        <controlURL>/upnp/{key}/control/ConnectionManager</controlURL>\
+        <eventSubURL>/upnp/{key}/event/ConnectionManager</eventSubURL>\
+        </service>\
+        </serviceList>\
+        </device>\
+        </root>",
+        xml_text(&device.friendly_name),
+        xml_text(&device.key),
+        xml_text(&device.uuid),
+    )
+}
+
+async fn upnp_browse(
+    state: &UpnpState,
+    device: &UpnpDeviceInfo,
+    object_id: &str,
+    browse_flag: &str,
+) -> anyhow::Result<Vec<UpnpDidlItem>> {
+    if browse_flag == "BrowseMetadata" {
+        return Ok(upnp_metadata(state, device, object_id).await?.into_iter().collect());
+    }
+
+    if object_id == "0" {
+        if let Some(phone_id) = &device.phone_id {
+            let phone = state
+                .registry
+                .get_by_id(phone_id)
+                .await
+                .ok_or_else(|| anyhow!("telephone UPnP indisponible: {phone_id}"))?;
+            return upnp_list_phone_directory(state, &phone, "/", "0").await;
+        }
+
+        let phones = state.registry.list().await;
+        return Ok(phones
+            .into_iter()
+            .map(|phone| UpnpDidlItem {
+                id: phone_container_id(&phone),
+                parent_id: "0".into(),
+                title: phone.display_name.clone(),
+                upnp_class: "object.container.storageFolder".into(),
+                is_container: true,
+                child_count: 0,
+                protocol_info: None,
+                url: None,
+                size: None,
+            })
+            .collect());
+    }
+
+    if let Some(phone_id) = parse_phone_container_id(object_id) {
+        let phone = state
+            .registry
+            .get_by_id(&phone_id)
+            .await
+            .ok_or_else(|| anyhow!("telephone UPnP indisponible: {phone_id}"))?;
+        return upnp_list_phone_directory(state, &phone, "/", object_id).await;
+    }
+
+    if let Some((phone_id, path)) = parse_path_object_id(object_id, "folder") {
+        let phone = state
+            .registry
+            .get_by_id(&phone_id)
+            .await
+            .ok_or_else(|| anyhow!("telephone UPnP indisponible: {phone_id}"))?;
+        return upnp_list_phone_directory(state, &phone, &path, object_id).await;
+    }
+
+    Ok(Vec::new())
+}
+
+async fn upnp_metadata(
+    state: &UpnpState,
+    device: &UpnpDeviceInfo,
+    object_id: &str,
+) -> anyhow::Result<Option<UpnpDidlItem>> {
+    if object_id == "0" {
+        return Ok(Some(UpnpDidlItem {
+            id: "0".into(),
+            parent_id: "-1".into(),
+            title: device.friendly_name.clone(),
+            upnp_class: "object.container.storageFolder".into(),
+            is_container: true,
+            child_count: 0,
+            protocol_info: None,
+            url: None,
+            size: None,
+        }));
+    }
+
+    if let Some(phone_id) = parse_phone_container_id(object_id) {
+        let Some(phone) = state.registry.get_by_id(&phone_id).await else {
+            return Ok(None);
+        };
+        return Ok(Some(UpnpDidlItem {
+            id: object_id.into(),
+            parent_id: "0".into(),
+            title: phone.display_name.clone(),
+            upnp_class: "object.container.storageFolder".into(),
+            is_container: true,
+            child_count: 0,
+            protocol_info: None,
+            url: None,
+            size: None,
+        }));
+    }
+
+    if let Some((phone_id, path)) = parse_path_object_id(object_id, "folder") {
+        let Some(phone) = state.registry.get_by_id(&phone_id).await else {
+            return Ok(None);
+        };
+        return Ok(Some(UpnpDidlItem {
+            id: object_id.into(),
+            parent_id: parent_id_for_phone_path(device, &phone, &parent_media_path(&path)),
+            title: media_basename(&path).unwrap_or_else(|| phone.display_name.clone()),
+            upnp_class: "object.container.storageFolder".into(),
+            is_container: true,
+            child_count: 0,
+            protocol_info: None,
+            url: None,
+            size: None,
+        }));
+    }
+
+    if let Some((phone_id, path)) = parse_path_object_id(object_id, "item") {
+        let Some(phone) = state.registry.get_by_id(&phone_id).await else {
+            return Ok(None);
+        };
+        let stat = phone_json_request(
+            &phone,
+            &PhoneRequest::MediaStat {
+                protocol_version: TROOZN_PROTOCOL_VERSION,
+                path: &path,
+            },
+            MEDIA_STAT_TIMEOUT,
+        )
+        .await?;
+        return Ok(Some(upnp_file_item(
+            state,
+            device,
+            &phone,
+            &path,
+            stat.size.unwrap_or(0),
+        )));
+    }
+
+    Ok(None)
+}
+
+async fn upnp_list_phone_directory(
+    state: &UpnpState,
+    phone: &Arc<PhoneSession>,
+    path: &str,
+    parent_id: &str,
+) -> anyhow::Result<Vec<UpnpDidlItem>> {
+    let response = phone_json_request(
+        phone,
+        &PhoneRequest::MediaList {
+            protocol_version: TROOZN_PROTOCOL_VERSION,
+            path,
+        },
+        MEDIA_LIST_TIMEOUT,
+    )
+    .await?;
+
+    let mut entries = response
+        .entries
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|entry| entry.name != "." && entry.name != "..")
+        .collect::<Vec<_>>();
+    entries.sort_by(|a, b| {
+        b.is_directory
+            .cmp(&a.is_directory)
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+
+    Ok(entries
+        .into_iter()
+        .map(|entry| {
+            let child_path = join_media_path(path, &entry.name);
+            if entry.is_directory {
+                UpnpDidlItem {
+                    id: folder_object_id(phone, &child_path),
+                    parent_id: parent_id.into(),
+                    title: entry.name,
+                    upnp_class: "object.container.storageFolder".into(),
+                    is_container: true,
+                    child_count: 0,
+                    protocol_info: None,
+                    url: None,
+                    size: None,
+                }
+            } else {
+                upnp_file_item_for_parent(state, phone, &child_path, entry.size, parent_id)
+            }
+        })
+        .collect())
+}
+
+fn upnp_file_item(
+    state: &UpnpState,
+    device: &UpnpDeviceInfo,
+    phone: &Arc<PhoneSession>,
+    path: &str,
+    size: u64,
+) -> UpnpDidlItem {
+    let parent_id = parent_id_for_phone_path(device, phone, &parent_media_path(path));
+    upnp_file_item_for_parent(state, phone, path, size, &parent_id)
+}
+
+fn upnp_file_item_for_parent(
+    state: &UpnpState,
+    phone: &Arc<PhoneSession>,
+    path: &str,
+    size: u64,
+    parent_id: &str,
+) -> UpnpDidlItem {
+    let mime = mime_type_for_path(path);
+    UpnpDidlItem {
+        id: item_object_id(phone, path),
+        parent_id: parent_id.into(),
+        title: media_basename(path).unwrap_or_else(|| "media".into()),
+        upnp_class: upnp_class_for_mime(mime).into(),
+        is_container: false,
+        child_count: 0,
+        protocol_info: Some(protocol_info_for_mime(mime)),
+        url: Some(upnp_media_url(state, phone, path)),
+        size: Some(size),
+    }
+}
+
+fn upnp_didl(items: &[UpnpDidlItem]) -> String {
+    let mut buffer = String::from(
+        "<DIDL-Lite xmlns=\"urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/\" \
+        xmlns:dc=\"http://purl.org/dc/elements/1.1/\" \
+        xmlns:upnp=\"urn:schemas-upnp-org:metadata-1-0/upnp/\">",
+    );
+    for item in items {
+        if item.is_container {
+            buffer.push_str(&format!(
+                "<container id=\"{}\" parentID=\"{}\" restricted=\"1\" searchable=\"0\" childCount=\"{}\">\
+                <dc:title>{}</dc:title><upnp:class>{}</upnp:class></container>",
+                xml_text(&item.id),
+                xml_text(&item.parent_id),
+                item.child_count,
+                xml_text(&item.title),
+                xml_text(&item.upnp_class),
+            ));
+        } else {
+            let protocol_info = item
+                .protocol_info
+                .as_deref()
+                .unwrap_or("http-get:*:application/octet-stream:*");
+            let size_attr = item
+                .size
+                .filter(|size| *size > 0)
+                .map(|size| format!(" size=\"{size}\""))
+                .unwrap_or_default();
+            buffer.push_str(&format!(
+                "<item id=\"{}\" parentID=\"{}\" restricted=\"1\">\
+                <dc:title>{}</dc:title><upnp:class>{}</upnp:class>\
+                <res protocolInfo=\"{}\"{}>{}</res></item>",
+                xml_text(&item.id),
+                xml_text(&item.parent_id),
+                xml_text(&item.title),
+                xml_text(&item.upnp_class),
+                xml_text(protocol_info),
+                size_attr,
+                xml_text(item.url.as_deref().unwrap_or_default()),
+            ));
+        }
+    }
+    buffer.push_str("</DIDL-Lite>");
+    buffer
+}
+
+fn slice_upnp_items(
+    items: Vec<UpnpDidlItem>,
+    starting_index: usize,
+    requested_count: usize,
+) -> Vec<UpnpDidlItem> {
+    if starting_index >= items.len() {
+        return Vec::new();
+    }
+    if requested_count == 0 {
+        return items[starting_index..].to_vec();
+    }
+    let end = items.len().min(starting_index + requested_count);
+    items[starting_index..end].to_vec()
 }
 
 async fn cached_file_body(cache_path: &Path, start: u64, length: u64) -> anyhow::Result<Body> {
@@ -1114,6 +1743,506 @@ fn cache_key(phone_folder: &str, target_path: &str) -> String {
     format!("{:016x}", hasher.finish())
 }
 
+async fn run_upnp_ssdp(state: UpnpState) -> anyhow::Result<()> {
+    let socket = Arc::new(create_ssdp_socket()?);
+    send_full_upnp_advertisement(&state, &socket).await;
+
+    let advertise_state = state.clone();
+    let advertise_socket = socket.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(UPNP_ADVERTISE_INTERVAL);
+        loop {
+            interval.tick().await;
+            send_full_upnp_advertisement(&advertise_state, &advertise_socket).await;
+        }
+    });
+
+    let mut buffer = vec![0u8; 4096];
+    loop {
+        let (len, sender) = socket.recv_from(&mut buffer).await?;
+        let packet = String::from_utf8_lossy(&buffer[..len]).to_ascii_uppercase();
+        if packet.contains("M-SEARCH") && packet.contains("SSDP:DISCOVER") {
+            send_upnp_search_responses(&state, &socket, sender).await;
+        }
+    }
+}
+
+fn create_ssdp_socket() -> anyhow::Result<UdpSocket> {
+    let std_socket = match StdUdpSocket::bind(SocketAddrV4::new(
+        Ipv4Addr::UNSPECIFIED,
+        UPNP_MULTICAST_PORT,
+    )) {
+        Ok(socket) => socket,
+        Err(error) => {
+            eprintln!(
+                "SSDP port {} indisponible ({error}); annonces NOTIFY seulement.",
+                UPNP_MULTICAST_PORT
+            );
+            StdUdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))?
+        }
+    };
+    std_socket.set_nonblocking(true)?;
+    let _ = std_socket.set_multicast_loop_v4(true);
+    let _ = std_socket.set_multicast_ttl_v4(4);
+    let _ = std_socket.join_multicast_v4(&UPNP_MULTICAST_ADDR, &Ipv4Addr::UNSPECIFIED);
+    Ok(UdpSocket::from_std(std_socket)?)
+}
+
+async fn send_full_upnp_advertisement(state: &UpnpState, socket: &UdpSocket) {
+    for device in upnp_devices(state).await {
+        for target in upnp_targets(&device) {
+            let packet = ssdp_packet(&[
+                "NOTIFY * HTTP/1.1".into(),
+                format!("HOST: {UPNP_MULTICAST_ADDR}:{UPNP_MULTICAST_PORT}"),
+                format!("CACHE-CONTROL: max-age={}", UPNP_ADVERTISE_INTERVAL.as_secs() * 4),
+                format!("LOCATION: {}", upnp_device_location(state, &device)),
+                format!("NT: {}", target.0),
+                "NTS: ssdp:alive".into(),
+                format!("SERVER: {}", upnp_server_header()),
+                format!("USN: {}", target.1),
+                format!("BOOTID.UPNP.ORG: {UPNP_BOOT_ID}"),
+                format!("CONFIGID.UPNP.ORG: {UPNP_CONFIG_ID}"),
+            ]);
+            let _ = socket
+                .send_to(
+                    packet.as_bytes(),
+                    SocketAddrV4::new(UPNP_MULTICAST_ADDR, UPNP_MULTICAST_PORT),
+                )
+                .await;
+        }
+    }
+}
+
+async fn send_upnp_search_responses(state: &UpnpState, socket: &UdpSocket, sender: SocketAddr) {
+    for device in upnp_devices(state).await {
+        for target in upnp_targets(&device) {
+            let packet = ssdp_packet(&[
+                "HTTP/1.1 200 OK".into(),
+                format!("CACHE-CONTROL: max-age={}", UPNP_ADVERTISE_INTERVAL.as_secs() * 4),
+                "EXT:".into(),
+                format!("LOCATION: {}", upnp_device_location(state, &device)),
+                format!("SERVER: {}", upnp_server_header()),
+                format!("ST: {}", target.0),
+                format!("USN: {}", target.1),
+                format!("BOOTID.UPNP.ORG: {UPNP_BOOT_ID}"),
+                format!("CONFIGID.UPNP.ORG: {UPNP_CONFIG_ID}"),
+            ]);
+            let _ = socket.send_to(packet.as_bytes(), sender).await;
+        }
+    }
+}
+
+fn ssdp_packet(lines: &[String]) -> String {
+    format!("{}\r\n\r\n", lines.join("\r\n"))
+}
+
+async fn upnp_devices(state: &UpnpState) -> Vec<UpnpDeviceInfo> {
+    let mut devices = vec![UpnpDeviceInfo {
+        key: "root".into(),
+        uuid: UPNP_ROOT_UUID.into(),
+        friendly_name: "TROOZN".into(),
+        phone_id: None,
+    }];
+    devices.extend(
+        state
+            .registry
+            .list()
+            .await
+            .into_iter()
+            .map(|phone| UpnpDeviceInfo {
+                key: phone.id.clone(),
+                uuid: deterministic_uuid(&format!("troozn-phone:{}", phone.id)),
+                friendly_name: format!("TROOZN - {}", phone.display_name),
+                phone_id: Some(phone.id.clone()),
+            }),
+    );
+    devices
+}
+
+async fn upnp_device_for_key(state: &UpnpState, key: &str) -> Option<UpnpDeviceInfo> {
+    if key == "root" {
+        return Some(UpnpDeviceInfo {
+            key: "root".into(),
+            uuid: UPNP_ROOT_UUID.into(),
+            friendly_name: "TROOZN".into(),
+            phone_id: None,
+        });
+    }
+    state.registry.get_by_id(key).await.map(|phone| UpnpDeviceInfo {
+        key: phone.id.clone(),
+        uuid: deterministic_uuid(&format!("troozn-phone:{}", phone.id)),
+        friendly_name: format!("TROOZN - {}", phone.display_name),
+        phone_id: Some(phone.id.clone()),
+    })
+}
+
+fn upnp_targets(device: &UpnpDeviceInfo) -> Vec<(String, String)> {
+    let uuid = format!("uuid:{}", device.uuid);
+    vec![
+        ("upnp:rootdevice".into(), format!("{uuid}::upnp:rootdevice")),
+        (uuid.clone(), uuid.clone()),
+        (
+            "urn:schemas-upnp-org:device:MediaServer:1".into(),
+            format!("{uuid}::urn:schemas-upnp-org:device:MediaServer:1"),
+        ),
+        (
+            "urn:schemas-upnp-org:service:ContentDirectory:1".into(),
+            format!("{uuid}::urn:schemas-upnp-org:service:ContentDirectory:1"),
+        ),
+        (
+            "urn:schemas-upnp-org:service:ConnectionManager:1".into(),
+            format!("{uuid}::urn:schemas-upnp-org:service:ConnectionManager:1"),
+        ),
+    ]
+}
+
+fn upnp_device_location(state: &UpnpState, device: &UpnpDeviceInfo) -> String {
+    format!(
+        "{}/upnp/{}/device.xml",
+        state.upnp_base_url,
+        percent_encode_component(&device.key)
+    )
+}
+
+fn upnp_server_header() -> &'static str {
+    "Linux UPnP/1.1 TROOZN-Radxa/1.0"
+}
+
+fn phone_container_id(phone: &PhoneSession) -> String {
+    format!("phone:{}", percent_encode_component(&phone.id))
+}
+
+fn folder_object_id(phone: &PhoneSession, path: &str) -> String {
+    format!(
+        "folder:{}:{}",
+        percent_encode_component(&phone.id),
+        percent_encode_component(&normalize_media_path(path))
+    )
+}
+
+fn item_object_id(phone: &PhoneSession, path: &str) -> String {
+    format!(
+        "item:{}:{}",
+        percent_encode_component(&phone.id),
+        percent_encode_component(&normalize_media_path(path))
+    )
+}
+
+fn parse_phone_container_id(object_id: &str) -> Option<String> {
+    object_id
+        .strip_prefix("phone:")
+        .map(percent_decode_path)
+        .filter(|value| !value.is_empty())
+}
+
+fn parse_path_object_id(object_id: &str, prefix: &str) -> Option<(String, String)> {
+    let raw = object_id.strip_prefix(&format!("{prefix}:"))?;
+    let (phone_id, path) = raw.split_once(':')?;
+    let phone_id = percent_decode_path(phone_id);
+    let path = normalize_media_path(&percent_decode_path(path));
+    Some((phone_id, path))
+}
+
+fn parent_id_for_phone_path(
+    device: &UpnpDeviceInfo,
+    phone: &PhoneSession,
+    parent_path: &str,
+) -> String {
+    if parent_path == "/" {
+        if device.phone_id.is_some() {
+            "0".into()
+        } else {
+            phone_container_id(phone)
+        }
+    } else {
+        folder_object_id(phone, parent_path)
+    }
+}
+
+fn parent_media_path(path: &str) -> String {
+    let normalized = normalize_media_path(path);
+    if normalized == "/" {
+        return "/".into();
+    }
+    let trimmed = normalized.trim_end_matches('/');
+    let Some(index) = trimmed.rfind('/') else {
+        return "/".into();
+    };
+    if index == 0 {
+        "/".into()
+    } else {
+        trimmed[..index].to_string()
+    }
+}
+
+fn join_media_path(parent: &str, name: &str) -> String {
+    let parent = normalize_media_path(parent);
+    let clean_name = name.trim_matches('/');
+    if parent == "/" {
+        format!("/{clean_name}")
+    } else {
+        format!("{}/{}", parent.trim_end_matches('/'), clean_name)
+    }
+}
+
+fn normalize_media_path(path: &str) -> String {
+    let normalized = path
+        .replace('\\', "/")
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .collect::<Vec<_>>()
+        .join("/");
+    if normalized.is_empty() {
+        "/".into()
+    } else {
+        format!("/{normalized}")
+    }
+}
+
+fn media_basename(path: &str) -> Option<String> {
+    normalize_media_path(path)
+        .trim_matches('/')
+        .rsplit('/')
+        .next()
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string())
+}
+
+fn upnp_media_url(state: &UpnpState, phone: &PhoneSession, path: &str) -> String {
+    format!(
+        "{}/media/{}/{}",
+        state.media_base_url,
+        percent_encode_component(&phone.folder_name),
+        percent_encode_media_path(path)
+    )
+}
+
+fn percent_encode_media_path(path: &str) -> String {
+    normalize_media_path(path)
+        .trim_start_matches('/')
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .map(percent_encode_component)
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn mime_type_for_path(path: &str) -> &'static str {
+    let extension = path
+        .rsplit('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match extension.as_str() {
+        "mp3" => "audio/mpeg",
+        "m4a" | "aac" => "audio/aac",
+        "flac" => "audio/flac",
+        "wav" => "audio/wav",
+        "ogg" | "oga" => "audio/ogg",
+        "mp4" | "m4v" => "video/mp4",
+        "mkv" => "video/x-matroska",
+        "avi" => "video/x-msvideo",
+        "mov" => "video/quicktime",
+        "webm" => "video/webm",
+        "jpg" | "jpeg" => "image/jpeg",
+        "png" => "image/png",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        "bmp" => "image/bmp",
+        "heic" => "image/heic",
+        "heif" => "image/heif",
+        _ => "application/octet-stream",
+    }
+}
+
+fn upnp_class_for_mime(mime: &str) -> &'static str {
+    if mime.starts_with("audio/") {
+        "object.item.audioItem.musicTrack"
+    } else if mime.starts_with("video/") {
+        "object.item.videoItem"
+    } else if mime.starts_with("image/") {
+        "object.item.imageItem.photo"
+    } else {
+        "object.item"
+    }
+}
+
+fn protocol_info_for_mime(mime: &str) -> String {
+    format!("http-get:*:{mime}:DLNA.ORG_OP=01;DLNA.ORG_CI=0")
+}
+
+fn upnp_source_protocol_info() -> String {
+    [
+        "audio/mpeg",
+        "audio/aac",
+        "audio/flac",
+        "audio/wav",
+        "audio/ogg",
+        "video/mp4",
+        "video/x-matroska",
+        "video/x-msvideo",
+        "video/quicktime",
+        "video/webm",
+        "image/jpeg",
+        "image/png",
+        "image/webp",
+        "image/gif",
+        "image/bmp",
+        "image/heic",
+        "image/heif",
+        "application/octet-stream",
+    ]
+    .into_iter()
+    .map(protocol_info_for_mime)
+    .collect::<Vec<_>>()
+    .join(",")
+}
+
+fn soap_tag(xml: &str, tag: &str) -> Option<String> {
+    let lower = xml.to_ascii_lowercase();
+    let tag = tag.to_ascii_lowercase();
+    let mut search = 0usize;
+
+    while let Some(start_rel) = lower[search..].find('<') {
+        let start = search + start_rel;
+        if lower[start + 1..].starts_with('/') {
+            search = start + 1;
+            continue;
+        }
+        let Some(gt_rel) = lower[start..].find('>') else {
+            return None;
+        };
+        let gt = start + gt_rel;
+        let name = lower[start + 1..gt]
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .trim_end_matches('/');
+        let local = name.rsplit(':').next().unwrap_or(name);
+        if local == tag {
+            let body_start = gt + 1;
+            let mut close_search = body_start;
+            while let Some(close_rel) = lower[close_search..].find("</") {
+                let close_start = close_search + close_rel;
+                let Some(close_gt_rel) = lower[close_start..].find('>') else {
+                    return None;
+                };
+                let close_gt = close_start + close_gt_rel;
+                let close_name = lower[close_start + 2..close_gt].trim();
+                let close_local = close_name.rsplit(':').next().unwrap_or(close_name);
+                if close_local == tag {
+                    return Some(xml[body_start..close_start].trim().to_string());
+                }
+                close_search = close_gt + 1;
+            }
+        }
+        search = gt + 1;
+    }
+
+    None
+}
+
+fn normalize_upnp_object_id(object_id: &str) -> String {
+    let mut normalized = object_id.trim().to_string();
+    if normalized.is_empty() {
+        return "0".into();
+    }
+    if normalized.starts_with("upnp://") {
+        if let Some(last) = normalized
+            .split('/')
+            .filter(|part| !part.trim().is_empty())
+            .last()
+        {
+            normalized = last.to_string();
+        }
+    }
+    for _ in 0..2 {
+        if !normalized.contains('%') {
+            break;
+        }
+        let decoded = percent_decode_path(&normalized);
+        if decoded == normalized {
+            break;
+        }
+        normalized = decoded;
+    }
+    while normalized.ends_with('/') {
+        normalized.pop();
+    }
+    if normalized.is_empty() {
+        "0".into()
+    } else {
+        normalized
+    }
+}
+
+fn percent_encode_component(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(*byte as char)
+            }
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    encoded
+}
+
+fn xml_text(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn deterministic_uuid(value: &str) -> String {
+    let mut first = std::collections::hash_map::DefaultHasher::new();
+    first.write(value.as_bytes());
+    let a = first.finish();
+
+    let mut second = std::collections::hash_map::DefaultHasher::new();
+    second.write(b"troozn-upnp");
+    second.write(value.as_bytes());
+    let b = second.finish();
+
+    format!(
+        "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
+        (a >> 32) as u32,
+        ((a >> 16) & 0xffff) as u16,
+        (a & 0xffff) as u16,
+        (b >> 48) as u16,
+        b & 0x0000ffffffffffff,
+    )
+}
+
+fn bind_port(bind: &str, default_port: u16) -> u16 {
+    bind.rsplit(':')
+        .next()
+        .and_then(|value| value.parse::<u16>().ok())
+        .unwrap_or(default_port)
+}
+
+fn loopback_base_url(bind: &str, default_port: u16) -> String {
+    format!("http://127.0.0.1:{}", bind_port(bind, default_port))
+}
+
+fn guess_local_ipv4() -> String {
+    StdUdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))
+        .and_then(|socket| {
+            socket.connect(SocketAddrV4::new(Ipv4Addr::new(8, 8, 8, 8), 80))?;
+            socket.local_addr()
+        })
+        .ok()
+        .and_then(|addr| match addr {
+            SocketAddr::V4(addr) if !addr.ip().is_loopback() => Some(addr.ip().to_string()),
+            _ => None,
+        })
+        .unwrap_or_else(|| "127.0.0.1".into())
+}
+
 fn configured_cache_bytes(name: &str, default: u64, clamp: Option<(u64, u64)>) -> u64 {
     let value = std::env::var(name)
         .ok()
@@ -1205,6 +2334,7 @@ async fn write_proxy_status(status_path: &Path, bind: &str, cert_hash: &str) -> 
         "transport": "webtransport",
         "ftpBind": std::env::var("TROOZN_FTP_BIND").unwrap_or_else(|_| DEFAULT_FTP_BIND.into()),
         "httpBind": std::env::var("TROOZN_HTTP_BIND").unwrap_or_else(|_| DEFAULT_HTTP_BIND.into()),
+        "upnpBind": std::env::var("TROOZN_UPNP_BIND").unwrap_or_else(|_| DEFAULT_UPNP_BIND.into()),
         "webTransportBind": bind,
         "webTransportPort": bind.rsplit(':').next().and_then(|value| value.parse::<u16>().ok()).unwrap_or(4433),
         "webTransportCertHash": cert_hash,
