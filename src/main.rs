@@ -1502,12 +1502,117 @@ async fn kodi_json_rpc(kodi: &KodiConfig, method: &str, params: Value) -> anyhow
 
     let mut response = Vec::new();
     stream.read_to_end(&mut response).await?;
-    let text = String::from_utf8_lossy(&response);
-    let (_, body) = text
-        .split_once("\r\n\r\n")
-        .ok_or_else(|| anyhow!("reponse HTTP Kodi invalide"))?;
-    let value: Value = serde_json::from_str(body).context("JSON-RPC Kodi invalide")?;
+    let body = parse_http_response_body(&response).context("reponse HTTP Kodi invalide")?;
+    let body = std::str::from_utf8(&body).context("reponse Kodi non UTF-8")?;
+    let value: Value = serde_json::from_str(body.trim())
+        .with_context(|| format!("JSON-RPC Kodi invalide: {}", preview_text(body, 160)))?;
     Ok(json!({"ok": true, "kodi": value}))
+}
+
+fn parse_http_response_body(response: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let header_end = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .ok_or_else(|| anyhow!("en-tetes HTTP absents"))?;
+    let headers =
+        std::str::from_utf8(&response[..header_end]).context("en-tetes HTTP non UTF-8")?;
+    let body = &response[header_end + 4..];
+
+    let status_code = http_status_code(headers)
+        .ok_or_else(|| anyhow!("ligne de statut HTTP Kodi absente"))?;
+    if !(200..300).contains(&status_code) {
+        let body_text = String::from_utf8_lossy(body);
+        return Err(anyhow!(
+            "Kodi HTTP {status_code}: {}",
+            preview_text(&body_text, 160)
+        ));
+    }
+
+    if header_value(headers, "transfer-encoding")
+        .map(|value| value.to_ascii_lowercase().contains("chunked"))
+        .unwrap_or(false)
+    {
+        return decode_chunked_body(body);
+    }
+
+    if let Some(length) = header_value(headers, "content-length")
+        .and_then(|value| value.parse::<usize>().ok())
+    {
+        if body.len() < length {
+            return Err(anyhow!(
+                "corps HTTP incomplet: {} octets recus sur {length}",
+                body.len()
+            ));
+        }
+        return Ok(body[..length].to_vec());
+    }
+
+    Ok(body.to_vec())
+}
+
+fn http_status_code(headers: &str) -> Option<u16> {
+    let status = headers.lines().next()?;
+    let mut parts = status.split_whitespace();
+    parts.next()?;
+    parts.next()?.parse().ok()
+}
+
+fn header_value<'a>(headers: &'a str, name: &str) -> Option<&'a str> {
+    headers.lines().find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        if key.trim().eq_ignore_ascii_case(name) {
+            Some(value.trim())
+        } else {
+            None
+        }
+    })
+}
+
+fn decode_chunked_body(body: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let mut decoded = Vec::with_capacity(body.len());
+    let mut offset = 0usize;
+
+    loop {
+        let line_end = find_crlf(&body[offset..])
+            .ok_or_else(|| anyhow!("taille de chunk HTTP absente"))?
+            + offset;
+        let size_line = std::str::from_utf8(&body[offset..line_end])
+            .context("taille de chunk HTTP non UTF-8")?;
+        let size_hex = size_line.split(';').next().unwrap_or("").trim();
+        let size = usize::from_str_radix(size_hex, 16)
+            .with_context(|| format!("taille de chunk HTTP invalide: {size_hex}"))?;
+        offset = line_end + 2;
+
+        if size == 0 {
+            break;
+        }
+
+        let chunk_end = offset
+            .checked_add(size)
+            .ok_or_else(|| anyhow!("taille de chunk HTTP trop grande"))?;
+        if body.len() < chunk_end + 2 {
+            return Err(anyhow!("chunk HTTP incomplet"));
+        }
+        decoded.extend_from_slice(&body[offset..chunk_end]);
+        if &body[chunk_end..chunk_end + 2] != b"\r\n" {
+            return Err(anyhow!("terminateur de chunk HTTP invalide"));
+        }
+        offset = chunk_end + 2;
+    }
+
+    Ok(decoded)
+}
+
+fn find_crlf(value: &[u8]) -> Option<usize> {
+    value.windows(2).position(|window| window == b"\r\n")
+}
+
+fn preview_text(value: &str, max_chars: usize) -> String {
+    let mut preview = value.chars().take(max_chars).collect::<String>();
+    if value.chars().count() > max_chars {
+        preview.push_str("...");
+    }
+    preview
 }
 
 fn is_root(path: &Path) -> bool {
