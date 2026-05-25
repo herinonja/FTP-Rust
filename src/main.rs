@@ -21,6 +21,11 @@ const DEFAULT_WEBTRANSPORT_BIND: &str = "0.0.0.0:4433";
 const DEFAULT_KODI_HOST: &str = "127.0.0.1";
 const DEFAULT_KODI_PORT: u16 = 8080;
 const WEBTRANSPORT_CERT_MAX_AGE_SECONDS: u64 = 13 * 24 * 60 * 60;
+const TROOZN_PROTOCOL_VERSION: u8 = 1;
+const MEDIA_STREAM_BUFFER_BYTES: usize = 2 * 1024 * 1024;
+const MEDIA_COPY_BUFFER_BYTES: usize = 512 * 1024;
+const MEDIA_STAT_TIMEOUT: Duration = Duration::from_secs(5);
+const MEDIA_LIST_TIMEOUT: Duration = Duration::from_secs(10);
 
 type Registry = Arc<PhoneRegistry>;
 
@@ -115,11 +120,24 @@ struct PhoneRegister {
 #[serde(tag = "type", rename_all = "kebab-case")]
 enum PhoneRequest<'a> {
     #[serde(rename = "media.list")]
-    MediaList { path: &'a str },
+    MediaList {
+        #[serde(rename = "protocolVersion")]
+        protocol_version: u8,
+        path: &'a str,
+    },
     #[serde(rename = "media.stat")]
-    MediaStat { path: &'a str },
+    MediaStat {
+        #[serde(rename = "protocolVersion")]
+        protocol_version: u8,
+        path: &'a str,
+    },
     #[serde(rename = "media.get")]
-    MediaGet { path: &'a str, start_pos: u64 },
+    MediaGet {
+        #[serde(rename = "protocolVersion")]
+        protocol_version: u8,
+        path: &'a str,
+        start_pos: u64,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -242,7 +260,7 @@ impl<User: UserDetail + Send + Sync + Debug> StorageBackend<User> for ProxyStora
     {
         let (phone_id, target_path) = self.resolve_path(path.as_ref()).await?;
         let phone = self.phone(&phone_id).await?;
-        let (reader, mut writer) = tokio::io::duplex(1024 * 1024);
+        let (reader, mut writer) = tokio::io::duplex(MEDIA_STREAM_BUFFER_BYTES);
 
         tokio::spawn(async move {
             let result = async {
@@ -256,13 +274,14 @@ impl<User: UserDetail + Send + Sync + Debug> StorageBackend<User> for ProxyStora
                 write_json(
                     &mut tx,
                     &PhoneRequest::MediaGet {
+                        protocol_version: TROOZN_PROTOCOL_VERSION,
                         path: &target_path,
                         start_pos,
                     },
                 )
                 .await?;
 
-                let mut buffer = vec![0u8; 128 * 1024];
+                let mut buffer = vec![0u8; MEDIA_COPY_BUFFER_BYTES];
                 loop {
                     match rx.read(&mut buffer).await? {
                         Some(0) | None => break,
@@ -308,8 +327,11 @@ impl<User: UserDetail + Send + Sync + Debug> StorageBackend<User> for ProxyStora
         let phone = self.phone(&phone_id).await?;
         let stat = phone_json_request(
             &phone,
-            &PhoneRequest::MediaStat { path: &target_path },
-            Duration::from_secs(8),
+            &PhoneRequest::MediaStat {
+                protocol_version: TROOZN_PROTOCOL_VERSION,
+                path: &target_path,
+            },
+            MEDIA_STAT_TIMEOUT,
         )
         .await
         .map_err(storage_error)?;
@@ -349,8 +371,11 @@ impl<User: UserDetail + Send + Sync + Debug> StorageBackend<User> for ProxyStora
         let phone = self.phone(&phone_id).await?;
         let response = phone_json_request(
             &phone,
-            &PhoneRequest::MediaList { path: &target_path },
-            Duration::from_secs(12),
+            &PhoneRequest::MediaList {
+                protocol_version: TROOZN_PROTOCOL_VERSION,
+                path: &target_path,
+            },
+            MEDIA_LIST_TIMEOUT,
         )
         .await
         .map_err(storage_error)?;
