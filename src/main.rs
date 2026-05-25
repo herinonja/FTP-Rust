@@ -6,6 +6,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -26,6 +27,7 @@ const MEDIA_STREAM_BUFFER_BYTES: usize = 2 * 1024 * 1024;
 const MEDIA_COPY_BUFFER_BYTES: usize = 512 * 1024;
 const MEDIA_STAT_TIMEOUT: Duration = Duration::from_secs(5);
 const MEDIA_LIST_TIMEOUT: Duration = Duration::from_secs(10);
+const PHONE_DISCONNECT_GRACE_SECONDS: u64 = 30;
 
 type Registry = Arc<PhoneRegistry>;
 
@@ -41,6 +43,7 @@ struct PhoneSession {
     display_name: String,
     folder_name: String,
     connection: Arc<Connection>,
+    disconnected_at: AtomicU64,
 }
 
 #[derive(Debug, Default)]
@@ -63,31 +66,51 @@ impl PhoneRegistry {
             display_name,
             folder_name,
             connection,
+            disconnected_at: AtomicU64::new(0),
         });
 
+        println!(
+            "Telephone WebTransport enregistre: {} -> {}",
+            session.display_name, session.folder_name
+        );
         phones.insert(id, session);
     }
 
     async fn unregister_connection(&self, connection: &Arc<Connection>) {
-        self.phones
-            .write()
-            .await
-            .retain(|_, phone| !Arc::ptr_eq(&phone.connection, connection));
+        let now = unix_timestamp();
+        let phones = self.phones.read().await;
+        for phone in phones.values() {
+            if Arc::ptr_eq(&phone.connection, connection) {
+                phone.disconnected_at.store(now, Ordering::Relaxed);
+                println!(
+                    "Telephone WebTransport marque deconnecte: {} (grace {}s)",
+                    phone.folder_name, PHONE_DISCONNECT_GRACE_SECONDS
+                );
+            }
+        }
     }
 
     async fn list(&self) -> Vec<Arc<PhoneSession>> {
-        let mut phones: Vec<_> = self.phones.read().await.values().cloned().collect();
+        let mut phones = self.phones.write().await;
+        prune_stale_phones(&mut phones);
+        let mut phones: Vec<_> = phones
+            .values()
+            .filter(|phone| phone_is_visible(phone))
+            .cloned()
+            .collect();
         phones.sort_by(|a, b| a.display_name.cmp(&b.display_name));
         phones
     }
 
     async fn get_by_folder(&self, folder_name: &str) -> Option<Arc<PhoneSession>> {
-        let phones = self.phones.read().await;
+        let mut phones = self.phones.write().await;
+        prune_stale_phones(&mut phones);
         phones
             .values()
+            .filter(|phone| phone_is_visible(phone))
             .find(|phone| phone.folder_name == folder_name)
             .cloned()
-            .or_else(|| phones.get(folder_name).cloned())
+            .or_else(|| phones.get(folder_name).filter(|phone| phone_is_visible(phone)).cloned())
     }
 }
 
@@ -761,17 +784,57 @@ async fn run_kodi_command(kodi: &KodiConfig, command: &str) -> anyhow::Result<Va
         "CMD_SELECT" => kodi_json_rpc(kodi, "Input.Select", Value::Null).await,
         "CMD_BACK" => kodi_json_rpc(kodi, "Input.Back", Value::Null).await,
         "CMD_HOME" => kodi_json_rpc(kodi, "Input.Home", Value::Null).await,
-        "CMD_PLAY_PAUSE" | "CMD_PLAYPAUSE" => {
-            kodi_json_rpc(
-                kodi,
-                "Player.PlayPause",
-                json!({"playerid": 0, "play": "toggle"}),
-            )
-            .await
+        "CMD_PLAY_PAUSE" | "CMD_PLAYPAUSE" => match active_player_id(kodi).await? {
+            Some(player_id) => {
+                kodi_json_rpc(
+                    kodi,
+                    "Player.PlayPause",
+                    json!({"playerid": player_id, "play": "toggle"}),
+                )
+                .await
+            }
+            None => {
+                kodi_json_rpc(kodi, "Player.Open", json!({"item": {"partymode": "music"}})).await
+            }
+        },
+        "CMD_STOP" => player_command(kodi, "Player.Stop", json!({})).await,
+        "CMD_NEXT" => player_command(kodi, "Player.GoTo", json!({"to": "next"})).await,
+        "CMD_PREVIOUS" | "CMD_PREV" => {
+            player_command(kodi, "Player.GoTo", json!({"to": "previous"})).await
         }
-        "CMD_STOP" => kodi_json_rpc(kodi, "Player.Stop", json!({"playerid": 0})).await,
+        "CMD_SEEK_FORWARD" | "CMD_FORWARD" => {
+            player_command(kodi, "Player.Seek", json!({"value": {"step": "smallforward"}})).await
+        }
+        "CMD_SEEK_BACKWARD" | "CMD_REWIND" | "CMD_BACKWARD" => {
+            player_command(kodi, "Player.Seek", json!({"value": {"step": "smallbackward"}})).await
+        }
         other => Err(anyhow!("commande inconnue: {other}")),
     }
+}
+
+async fn player_command(kodi: &KodiConfig, method: &str, mut params: Value) -> anyhow::Result<Value> {
+    let player_id = active_player_id(kodi)
+        .await?
+        .ok_or_else(|| anyhow!("aucune lecture active"))?;
+    if let Some(object) = params.as_object_mut() {
+        object.insert("playerid".to_string(), json!(player_id));
+    }
+    kodi_json_rpc(kodi, method, params).await
+}
+
+async fn active_player_id(kodi: &KodiConfig) -> anyhow::Result<Option<i64>> {
+    let response = kodi_json_rpc(kodi, "Player.GetActivePlayers", Value::Null).await?;
+    let Some(players) = response
+        .get("kodi")
+        .and_then(|value| value.get("result"))
+        .and_then(Value::as_array)
+    else {
+        return Ok(None);
+    };
+    Ok(players
+        .first()
+        .and_then(|player| player.get("playerid"))
+        .and_then(Value::as_i64))
 }
 
 async fn kodi_json_rpc(kodi: &KodiConfig, method: &str, params: Value) -> anyhow::Result<Value> {
@@ -872,6 +935,21 @@ fn unique_folder_name(
     } else {
         candidate
     }
+}
+
+fn phone_is_visible(phone: &PhoneSession) -> bool {
+    let disconnected_at = phone.disconnected_at.load(Ordering::Relaxed);
+    disconnected_at == 0
+        || unix_timestamp().saturating_sub(disconnected_at) <= PHONE_DISCONNECT_GRACE_SECONDS
+}
+
+fn prune_stale_phones(phones: &mut HashMap<String, Arc<PhoneSession>>) {
+    let now = unix_timestamp();
+    phones.retain(|_, phone| {
+        let disconnected_at = phone.disconnected_at.load(Ordering::Relaxed);
+        disconnected_at == 0
+            || now.saturating_sub(disconnected_at) <= PHONE_DISCONNECT_GRACE_SECONDS
+    });
 }
 
 fn troozn_state_dir() -> PathBuf {
