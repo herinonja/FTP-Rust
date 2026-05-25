@@ -2623,13 +2623,15 @@ async fn active_player_id(kodi: &KodiConfig) -> anyhow::Result<Option<i64>> {
 }
 
 async fn kodi_json_rpc(kodi: &KodiConfig, method: &str, params: Value) -> anyhow::Result<Value> {
-    let body = json!({
+    let mut payload = json!({
         "jsonrpc": "2.0",
         "id": "troozn-webtransport",
         "method": method,
-        "params": params,
-    })
-    .to_string();
+    });
+    if !params.is_null() {
+        payload["params"] = params;
+    }
+    let body = payload.to_string();
 
     let mut stream = TcpStream::connect((kodi.host.as_str(), kodi.port))
         .await
@@ -2760,7 +2762,7 @@ fn kodi_authorization_header(kodi: &KodiConfig) -> Option<String> {
 
 fn base64_encode(value: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut output = String::with_capacity(value.len().div_ceil(3) * 4);
+    let mut output = String::with_capacity(((value.len() + 2) / 3) * 4);
     for chunk in value.chunks(3) {
         let b0 = chunk[0];
         let b1 = *chunk.get(1).unwrap_or(&0);
