@@ -100,6 +100,8 @@ struct UpnpDidlItem {
 struct KodiConfig {
     host: String,
     port: u16,
+    username: Option<String>,
+    password: String,
 }
 
 #[derive(Debug)]
@@ -577,6 +579,11 @@ async fn main() -> anyhow::Result<()> {
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or(DEFAULT_KODI_PORT),
+        username: std::env::var("TROOZN_KODI_USERNAME")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+        password: std::env::var("TROOZN_KODI_PASSWORD").unwrap_or_default(),
     };
     let registry: Registry = Arc::new(PhoneRegistry::default());
     let head_cache = Arc::new(HeadCache {
@@ -645,7 +652,12 @@ async fn main() -> anyhow::Result<()> {
         head_cache_dir.display()
     );
     println!(" Status proxy: {}", proxy_status_path.display());
-    println!(" Kodi JSON-RPC local: {}:{}", kodi.host, kodi.port);
+    println!(
+        " Kodi JSON-RPC local: {}:{} auth={}",
+        kodi.host,
+        kodi.port,
+        if kodi.username.is_some() { "oui" } else { "non" }
+    );
     println!("=============================================================");
 
     let server = ServerBuilder::new(Box::new(move || ProxyStorage::new(registry.clone())))
@@ -2338,6 +2350,7 @@ async fn write_proxy_status(status_path: &Path, bind: &str, cert_hash: &str) -> 
         "webTransportBind": bind,
         "webTransportPort": bind.rsplit(':').next().and_then(|value| value.parse::<u16>().ok()).unwrap_or(4433),
         "webTransportCertHash": cert_hash,
+        "kodiAuthConfigured": std::env::var("TROOZN_KODI_USERNAME").ok().map(|value| !value.trim().is_empty()).unwrap_or(false),
         "headCacheBytes": configured_cache_bytes("TROOZN_HEAD_CACHE_BYTES", DEFAULT_HEAD_CACHE_BYTES, Some((MIN_HEAD_CACHE_BYTES, MAX_HEAD_CACHE_BYTES))),
         "headCacheMaxBytes": configured_cache_bytes("TROOZN_HEAD_CACHE_MAX_BYTES", DEFAULT_HEAD_CACHE_MAX_BYTES, None),
         "headCacheDir": std::env::var("TROOZN_HEAD_CACHE_DIR").unwrap_or_else(|_| troozn_state_dir().join("head-cache").display().to_string()),
@@ -2621,10 +2634,14 @@ async fn kodi_json_rpc(kodi: &KodiConfig, method: &str, params: Value) -> anyhow
     let mut stream = TcpStream::connect((kodi.host.as_str(), kodi.port))
         .await
         .with_context(|| format!("Kodi indisponible sur {}:{}", kodi.host, kodi.port))?;
+    let auth_header = kodi_authorization_header(kodi)
+        .map(|value| format!("Authorization: {value}\r\n"))
+        .unwrap_or_default();
     let request = format!(
-        "POST /jsonrpc HTTP/1.1\r\nHost: {}:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        "POST /jsonrpc HTTP/1.1\r\nHost: {}:{}\r\n{}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         kodi.host,
         kodi.port,
+        auth_header,
         body.as_bytes().len(),
         body,
     );
@@ -2731,6 +2748,37 @@ fn decode_chunked_body(body: &[u8]) -> anyhow::Result<Vec<u8>> {
     }
 
     Ok(decoded)
+}
+
+fn kodi_authorization_header(kodi: &KodiConfig) -> Option<String> {
+    let username = kodi.username.as_deref()?;
+    Some(format!(
+        "Basic {}",
+        base64_encode(format!("{username}:{}", kodi.password).as_bytes())
+    ))
+}
+
+fn base64_encode(value: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut output = String::with_capacity(value.len().div_ceil(3) * 4);
+    for chunk in value.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = *chunk.get(1).unwrap_or(&0);
+        let b2 = *chunk.get(2).unwrap_or(&0);
+        output.push(TABLE[(b0 >> 2) as usize] as char);
+        output.push(TABLE[(((b0 & 0b0000_0011) << 4) | (b1 >> 4)) as usize] as char);
+        if chunk.len() > 1 {
+            output.push(TABLE[(((b1 & 0b0000_1111) << 2) | (b2 >> 6)) as usize] as char);
+        } else {
+            output.push('=');
+        }
+        if chunk.len() > 2 {
+            output.push(TABLE[(b2 & 0b0011_1111) as usize] as char);
+        } else {
+            output.push('=');
+        }
+    }
+    output
 }
 
 fn find_crlf(value: &[u8]) -> Option<usize> {
