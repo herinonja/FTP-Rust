@@ -109,6 +109,8 @@ struct PhoneSession {
     id: String,
     display_name: String,
     folder_name: String,
+    role: String,
+    source_visible: bool,
     connection: Arc<Connection>,
     disconnected_at: AtomicU64,
 }
@@ -116,11 +118,30 @@ struct PhoneSession {
 #[derive(Debug, Default)]
 struct PhoneRegistry {
     phones: RwLock<HashMap<String, Arc<PhoneSession>>>,
+    admin_device_id: RwLock<Option<String>>,
 }
 
 impl PhoneRegistry {
-    async fn register(&self, registration: PhoneRegister, connection: Arc<Connection>) {
+    async fn register(
+        &self,
+        registration: PhoneRegister,
+        connection: Arc<Connection>,
+    ) -> anyhow::Result<()> {
         let id = safe_device_id(&registration.device_id);
+        let role = normalize_phone_role(&registration.role);
+        if role == "admin" {
+            let mut admin_device_id = self.admin_device_id.write().await;
+            match admin_device_id.as_deref() {
+                Some(existing) if existing != id => {
+                    return Err(anyhow!("admin_already_claimed"));
+                }
+                Some(_) => {}
+                None => {
+                    *admin_device_id = Some(id.clone());
+                    println!("Admin TROOZN verrouille pour ce lancement: {id}");
+                }
+            }
+        }
         let display_name = registration
             .display_name
             .filter(|value| !value.trim().is_empty())
@@ -132,15 +153,21 @@ impl PhoneRegistry {
             id: id.clone(),
             display_name,
             folder_name,
+            role,
+            source_visible: registration.source_visible,
             connection,
             disconnected_at: AtomicU64::new(0),
         });
 
         println!(
-            "Telephone WebTransport enregistre: {} -> {}",
-            session.display_name, session.folder_name
+            "Telephone WebTransport enregistre: {} -> {} (role={}, sources={})",
+            session.display_name,
+            session.folder_name,
+            session.role,
+            if session.source_visible { "visible" } else { "masque" }
         );
         phones.insert(id, session);
+        Ok(())
     }
 
     async fn unregister_connection(&self, connection: &Arc<Connection>) {
@@ -162,7 +189,7 @@ impl PhoneRegistry {
         prune_stale_phones(&mut phones);
         let mut phones: Vec<_> = phones
             .values()
-            .filter(|phone| phone_is_visible(phone))
+            .filter(|phone| phone_is_published(phone))
             .cloned()
             .collect();
         phones.sort_by(|a, b| a.display_name.cmp(&b.display_name));
@@ -174,16 +201,21 @@ impl PhoneRegistry {
         prune_stale_phones(&mut phones);
         phones
             .values()
-            .filter(|phone| phone_is_visible(phone))
+            .filter(|phone| phone_is_connected(phone))
             .find(|phone| phone.folder_name == folder_name)
             .cloned()
-            .or_else(|| phones.get(folder_name).filter(|phone| phone_is_visible(phone)).cloned())
+            .or_else(|| {
+                phones
+                    .get(folder_name)
+                    .filter(|phone| phone_is_connected(phone))
+                    .cloned()
+            })
     }
 
     async fn get_by_id(&self, id: &str) -> Option<Arc<PhoneSession>> {
         let mut phones = self.phones.write().await;
         prune_stale_phones(&mut phones);
-        phones.get(id).filter(|phone| phone_is_visible(phone)).cloned()
+        phones.get(id).filter(|phone| phone_is_published(phone)).cloned()
     }
 }
 
@@ -196,6 +228,10 @@ enum RadxaRequest {
         device_id: String,
         #[serde(rename = "displayName")]
         display_name: Option<String>,
+        #[serde(default = "default_phone_role")]
+        role: String,
+        #[serde(default = "default_source_visible", rename = "sourceVisible")]
+        source_visible: bool,
     },
     #[serde(rename = "kodi.command")]
     KodiCommand { command: String },
@@ -212,6 +248,8 @@ enum RadxaRequest {
 struct PhoneRegister {
     device_id: String,
     display_name: Option<String>,
+    role: String,
+    source_visible: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -2389,18 +2427,39 @@ async fn handle_webtransport_client(
                     RadxaRequest::PhoneRegister {
                         device_id,
                         display_name,
+                        role,
+                        source_visible,
                     } => {
-                        registry
+                        match registry
                             .register(
                                 PhoneRegister {
                                     device_id,
                                     display_name,
+                                    role,
+                                    source_visible,
                                 },
                                 connection,
                             )
-                            .await;
-                        tx.write_all(json!({"ok":true}).to_string().as_bytes())
-                            .await?;
+                            .await
+                        {
+                            Ok(()) => {
+                                tx.write_all(json!({"ok":true}).to_string().as_bytes())
+                                    .await?;
+                            }
+                            Err(error) if error.to_string() == "admin_already_claimed" => {
+                                tx.write_all(
+                                    json!({
+                                        "ok": false,
+                                        "code": "admin_already_claimed",
+                                        "message": "Un téléphone admin est déjà connecté à cette session Kodi."
+                                    })
+                                    .to_string()
+                                    .as_bytes(),
+                                )
+                                .await?;
+                            }
+                            Err(error) => return Err(error),
+                        }
                     }
                     RadxaRequest::KodiCommand { command } => {
                         let response = run_kodi_command(&kodi, &command).await?;
@@ -2817,6 +2876,13 @@ fn safe_device_id(value: &str) -> String {
     }
 }
 
+fn normalize_phone_role(value: &str) -> String {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "admin" | "principal" => "admin".into(),
+        _ => "guest".into(),
+    }
+}
+
 fn safe_folder_name(value: &str) -> String {
     let trimmed = value.trim();
     let safe = trimmed
@@ -2864,10 +2930,22 @@ fn unique_folder_name(
     }
 }
 
-fn phone_is_visible(phone: &PhoneSession) -> bool {
+fn default_source_visible() -> bool {
+    true
+}
+
+fn default_phone_role() -> String {
+    "guest".into()
+}
+
+fn phone_is_connected(phone: &PhoneSession) -> bool {
     let disconnected_at = phone.disconnected_at.load(Ordering::Relaxed);
     disconnected_at == 0
         || unix_timestamp().saturating_sub(disconnected_at) <= PHONE_DISCONNECT_GRACE_SECONDS
+}
+
+fn phone_is_published(phone: &PhoneSession) -> bool {
+    phone.source_visible && phone_is_connected(phone)
 }
 
 fn prune_stale_phones(phones: &mut HashMap<String, Arc<PhoneSession>>) {
