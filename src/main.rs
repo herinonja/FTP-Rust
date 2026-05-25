@@ -131,6 +131,8 @@ enum RadxaRequest {
         method: String,
         params: Option<Value>,
     },
+    #[serde(rename = "proxy.list")]
+    ProxyList { path: String },
 }
 
 #[derive(Debug)]
@@ -707,6 +709,10 @@ async fn handle_webtransport_client(
                             kodi_json_rpc(&kodi, &method, params.unwrap_or(Value::Null)).await?;
                         tx.write_all(response.to_string().as_bytes()).await?;
                     }
+                    RadxaRequest::ProxyList { path } => {
+                        let response = proxy_list(&registry, &path).await?;
+                        tx.write_all(response.to_string().as_bytes()).await?;
+                    }
                 }
                 tx.finish().await?;
                 Ok::<(), anyhow::Error>(())
@@ -772,6 +778,83 @@ async fn read_stream_text(rx: &mut wtransport::RecvStream) -> anyhow::Result<Str
         response.extend_from_slice(&buffer[..bytes_read]);
     }
     String::from_utf8(response).context("reponse non UTF-8")
+}
+
+async fn proxy_list(registry: &Registry, raw_path: &str) -> anyhow::Result<Value> {
+    let path = normalize_proxy_path(raw_path);
+    if path == "/" {
+        let phones = registry.list().await;
+        println!("proxy.list / -> {} telephones", phones.len());
+        return Ok(json!({
+            "ok": true,
+            "entries": phones.into_iter().map(|phone| {
+                json!({
+                    "name": phone.folder_name.clone(),
+                    "displayName": phone.display_name.clone(),
+                    "isDirectory": true,
+                    "size": 0,
+                })
+            }).collect::<Vec<_>>(),
+        }));
+    }
+
+    let mut parts = path.trim_matches('/').split('/');
+    let phone_folder = parts
+        .next()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("telephone manquant dans le chemin"))?;
+    let target_path = format!("/{}", parts.collect::<Vec<_>>().join("/"));
+    let phone = registry
+        .get_by_folder(phone_folder)
+        .await
+        .ok_or_else(|| anyhow!("telephone WebTransport indisponible: {phone_folder}"))?;
+    let response = phone_json_request(
+        &phone,
+        &PhoneRequest::MediaList {
+            protocol_version: TROOZN_PROTOCOL_VERSION,
+            path: &target_path,
+        },
+        MEDIA_LIST_TIMEOUT,
+    )
+    .await?;
+    let entries = response.entries.unwrap_or_default();
+    println!(
+        "proxy.list {} -> {} entrees via {}",
+        path,
+        entries.len(),
+        phone.folder_name
+    );
+    Ok(json!({
+        "ok": true,
+        "entries": entries.into_iter().filter(|entry| entry.name != "." && entry.name != "..").map(|entry| {
+            json!({
+                "name": entry.name,
+                "isDirectory": entry.is_directory,
+                "size": entry.size,
+            })
+        }).collect::<Vec<_>>(),
+    }))
+}
+
+fn normalize_proxy_path(raw_path: &str) -> String {
+    let trimmed = raw_path.trim();
+    if trimmed.is_empty() || trimmed == "/" {
+        return "/".into();
+    }
+    let without_scheme = trimmed
+        .strip_prefix("ftp://127.0.0.1:2120")
+        .or_else(|| trimmed.strip_prefix("ftp://localhost:2120"))
+        .unwrap_or(trimmed);
+    let normalized = without_scheme.replace('\\', "/");
+    let parts = normalized
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .collect::<Vec<_>>();
+    if parts.is_empty() {
+        "/".into()
+    } else {
+        format!("/{}", parts.join("/"))
+    }
 }
 
 async fn run_kodi_command(kodi: &KodiConfig, command: &str) -> anyhow::Result<Value> {
