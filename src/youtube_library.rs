@@ -322,10 +322,12 @@ impl YoutubeLibrary {
         let nfo_path = self.current_dir.join(format!("{base}.nfo"));
         let thumb_path = meta.thumbnail.as_ref().map(|_| self.current_dir.join(format!("{base}-thumb.jpg")));
 
-        // URL lisible sans encodage visible.
-        // Les métadonnées propres viennent du ListItem Kodi, du .nfo et du nom local.
-        let media_filename = media_slug_filename(index, &meta.title);
-        let play_url = format!("{}/youtube/media/{}/{}", self.public_base_url, item_id, media_filename);
+        // URL technique courte.
+        // Le titre doit venir du ListItem Kodi, du .nfo et des métadonnées, pas du chemin HTTP.
+        let play_url = format!(
+            "{}/youtube/media/{}",
+            self.public_base_url, item_id
+        );
 
         let item = YoutubeItem {
             item_id,

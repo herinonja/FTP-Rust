@@ -770,10 +770,9 @@ async fn run_http_media_gateway(
         .route("/youtube/health", get(youtube_library::youtube_health))
         .route("/youtube/submit", post(youtube_library::youtube_submit))
         .route("/youtube/items", get(youtube_library::youtube_items))
-        .route("/youtube/item/:item_id/play", get(youtube_library::youtube_play))
-        .route("/youtube/media/:item_id/*filename",get(youtube_library::youtube_play_named)
-        .head(youtube_library::youtube_play_named_head),
-)
+        .route("/youtube/media/:item_id", get(youtube_library::youtube_play).head(youtube_library::youtube_play_head))
+        .route("/youtube/item/:item_id/play", get(youtube_library::youtube_play).head(youtube_library::youtube_play_head))
+        .route("/youtube/media/:item_id/*filename", get(youtube_library::youtube_play_named).head(youtube_library::youtube_play_named_head))
         .with_state(state);
     let listener = TcpListener::bind(bind)
         .await
