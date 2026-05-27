@@ -163,8 +163,8 @@ impl TrooznLive {
             }
         });
 
-        wait_for_hls_ready(&self.root_dir.join("index.m3u8"), &self.root_dir).await?;
-
+        // Ne pas attendre ici que le premier segment HLS soit prêt.
+        // /submit doit répondre rapidement; default.py attendra ensuite le manifeste.
         let now = self.current_now().await;
 
         Ok(TrooznLiveSubmitResponse {
