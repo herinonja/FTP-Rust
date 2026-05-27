@@ -1,7 +1,8 @@
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{anyhow, Context};
+use anyhow::Context;
+use sha1::{Digest, Sha1};
 use axum::body::Body;
 use axum::extract::{Path as AxumPath, State};
 use axum::http::{header, HeaderValue, StatusCode};
@@ -158,10 +159,12 @@ impl TrooznLive {
         let items_for_worker = items.clone();
 
         tokio::spawn(async move {
+            let live_for_error = live.clone();
+
             if let Err(err) = live.run_hls_worker(items_for_worker).await {
                 eprintln!("TROOZN_LIVE_WORKER_ERROR: {err:?}");
 
-                let mut guard = live.now.lock().await;
+                let mut guard = live_for_error.now.lock().await;
                 guard.state = "error".to_string();
                 guard.last_error = Some(err.to_string());
             }
@@ -649,8 +652,17 @@ async fn finalize_playlist(index_path: &Path) -> anyhow::Result<()> {
 }
 
 fn item_id_for_url(url: &str) -> String {
-    let digest = sha1::Sha1::from(url).digest().to_string();
-    digest.chars().take(16).collect()
+    let mut hasher = Sha1::new();
+    hasher.update(url.as_bytes());
+    let digest = hasher.finalize();
+
+    digest
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect::<String>()
+        .chars()
+        .take(16)
+        .collect()
 }
 
 fn unix_timestamp() -> u64 {
