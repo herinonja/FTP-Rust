@@ -338,11 +338,11 @@ impl YoutubeLibrary {
             .as_ref()
             .map(|_| self.current_dir.join(format!("{base}-thumb.jpg")));
 
-        // Named URL so Kodi does not display the current item as simply "play".
-        let media_filename = media_url_filename(index, &meta.title);
+        // Technical stable URL. Keep it short so Kodi does not display URL-encoded titles.
+        // Human-readable metadata must come from ListItem/.nfo/.strm filename, not from the HTTP path.
         let play_url = format!(
-            "{}/youtube/media/{}/{}",
-            self.public_base_url, item_id, media_filename
+            "{}/youtube/media/{}/video.mp4",
+            self.public_base_url, item_id
         );
 
         let item = YoutubeItem {
