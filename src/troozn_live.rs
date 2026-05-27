@@ -222,7 +222,7 @@ impl TrooznLive {
         write_empty_master_playlist(&self.root_dir.join("index.m3u8")).await?;
 
         for item in items.iter() {
-            self.wait_until_playback_allows_item(item.index).await;
+            self.wait_until_future_buffer_needed(item.index).await;
 
             let next_title = items
                 .iter()
@@ -412,7 +412,7 @@ impl TrooznLive {
         Ok(())
     }
 
-    async fn wait_until_playback_allows_item(&self, next_item_index: usize) {
+    async fn wait_until_future_buffer_needed(&self, next_item_index: usize) {
         if next_item_index <= 1 {
             return;
         }
@@ -420,23 +420,30 @@ impl TrooznLive {
         loop {
             let playback = self.playback_now.lock().await.clone();
 
-            if playback.index == 0 {
-                {
-                    let mut producer = self.producer_now.lock().await;
-                    producer.state = "waiting".to_string();
-                    producer.last_error = Some(format!(
-                        "Attente démarrage Kodi avant préparation item {}",
-                        next_item_index
-                    ));
-                }
+            // Si Kodi n'a pas encore commencé à demander des segments,
+            // on prend item 1 comme base. Ça autorise la préparation d'un
+            // futur item jouable avant le démarrage réel de Kodi.
+            let base_index = if playback.index == 0 {
+                1
+            } else {
+                playback.index
+            };
 
-                sleep(Duration::from_millis(750)).await;
-                continue;
+            let entries = self.master_entries.lock().await.clone();
+
+            let mut future_items = std::collections::HashSet::new();
+
+            for entry in entries.iter() {
+                if entry.item_index > base_index {
+                    future_items.insert(entry.item_index);
+                }
             }
 
-            let allowed_until = playback.index + MAX_PRODUCER_AHEAD_ITEMS;
-
-            if next_item_index <= allowed_until {
+            // Important :
+            // On limite l'avance aux items réellement segmentés.
+            // Si item 2 est bloqué/ignoré et ne produit aucun segment,
+            // item 3 reste autorisé.
+            if future_items.len() < MAX_PRODUCER_AHEAD_ITEMS {
                 return;
             }
 
@@ -444,8 +451,8 @@ impl TrooznLive {
                 let mut producer = self.producer_now.lock().await;
                 producer.state = "waiting".to_string();
                 producer.last_error = Some(format!(
-                    "Producteur en avance: item {}, lecture item {}, limite {}",
-                    next_item_index, playback.index, allowed_until
+                    "Buffer futur déjà prêt: base item {}, futurs prêts {:?}, prochain item {}",
+                    base_index, future_items, next_item_index
                 ));
             }
 
