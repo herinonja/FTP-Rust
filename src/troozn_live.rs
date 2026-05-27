@@ -18,14 +18,13 @@ use tokio::time::{sleep, timeout, Duration};
 
 use crate::HttpGatewayState;
 
-const LIVE_DIR: &str = "/tmp/troozn-live";
+const LIVE_DIR: &str = "/home/troozn/.kodi/userdata/TROOZN/live";
 const YTDLP_BIN: &str = "/usr/local/bin/yt-dlp";
 const MAX_ITEMS: usize = 20;
+const MAX_PRODUCER_AHEAD_ITEMS: usize = 1;
 
 const PUBLIC_HLS_URL: &str = "http://127.0.0.1:8787/troozn-live/playlist-youtube.m3u8";
 
-// 22 = MP4 progressif 720p H.264 + AAC quand disponible.
-// 18 = fallback MP4 progressif, souvent 360p.
 const YTDLP_720_FORMAT: &str =
     "22/best[ext=mp4][vcodec^=avc1][acodec^=mp4a][height<=720]/18";
 
@@ -223,6 +222,8 @@ impl TrooznLive {
         write_empty_master_playlist(&self.root_dir.join("index.m3u8")).await?;
 
         for item in items.iter() {
+            self.wait_until_playback_allows_item(item.index).await;
+
             let next_title = items
                 .iter()
                 .find(|candidate| candidate.index > item.index)
@@ -300,7 +301,6 @@ impl TrooznLive {
 
             let mut cmd = Command::new("ffmpeg");
 
-            // Pas de -re : on pré-segmente plus vite que la lecture.
             cmd.args([
                 "-hide_banner",
                 "-y",
@@ -412,6 +412,47 @@ impl TrooznLive {
         Ok(())
     }
 
+    async fn wait_until_playback_allows_item(&self, next_item_index: usize) {
+        if next_item_index <= 1 {
+            return;
+        }
+
+        loop {
+            let playback = self.playback_now.lock().await.clone();
+
+            if playback.index == 0 {
+                {
+                    let mut producer = self.producer_now.lock().await;
+                    producer.state = "waiting".to_string();
+                    producer.last_error = Some(format!(
+                        "Attente démarrage Kodi avant préparation item {}",
+                        next_item_index
+                    ));
+                }
+
+                sleep(Duration::from_millis(750)).await;
+                continue;
+            }
+
+            let allowed_until = playback.index + MAX_PRODUCER_AHEAD_ITEMS;
+
+            if next_item_index <= allowed_until {
+                return;
+            }
+
+            {
+                let mut producer = self.producer_now.lock().await;
+                producer.state = "waiting".to_string();
+                producer.last_error = Some(format!(
+                    "Producteur en avance: item {}, lecture item {}, limite {}",
+                    next_item_index, playback.index, allowed_until
+                ));
+            }
+
+            sleep(Duration::from_millis(1000)).await;
+        }
+    }
+
     async fn import_item_manifest_incremental(
         &self,
         item_index: usize,
@@ -462,8 +503,6 @@ impl TrooznLive {
         let mut out = String::new();
         out.push_str("#EXTM3U\n");
         out.push_str("#EXT-X-VERSION:3\n");
-        // Pas de EXT-X-PLAYLIST-TYPE:EVENT :
-        // on veut que Kodi démarre depuis le début, pas près du live edge.
         out.push_str(&format!("#EXT-X-TARGETDURATION:{target_duration}\n"));
         out.push_str("#EXT-X-MEDIA-SEQUENCE:0\n");
 
