@@ -227,7 +227,6 @@ impl TrooznLive {
             let mut hls_flags = "append_list+omit_endlist+program_date_time".to_string();
 
             if appended_any {
-                hls_flags.push_str("+discont_start");
                 insert_discontinuity_if_needed(&index_path).await.ok();
             }
 
