@@ -15,12 +15,16 @@ use tokio::sync::Mutex;
 use tokio::time::{sleep, timeout, Duration};
 
 use crate::HttpGatewayState;
-use sha1::{Digest, Sha1};
 
 const LIVE_DIR: &str = "/tmp/troozn-live";
 const YTDLP_BIN: &str = "/usr/local/bin/yt-dlp";
 const MAX_ITEMS: usize = 20;
 
+const PUBLIC_HLS_URL: &str = "http://127.0.0.1:8787/troozn-live/playlist-youtube.m3u8";
+
+// Priorité 720p progressif H.264/AAC.
+// 22 = 720p MP4 progressif quand disponible.
+// 18 = MP4 progressif fallback, souvent 360p.
 const YTDLP_720_FORMAT: &str =
     "22/best[ext=mp4][vcodec^=avc1][acodec^=mp4a][height<=720]/18";
 
@@ -86,7 +90,7 @@ impl TrooznLive {
             ffmpeg_child: Mutex::new(None),
             now: Mutex::new(TrooznLiveNow {
                 state: "idle".to_string(),
-                hls_url: "http://127.0.0.1:8787/troozn-live/playlist-youtube.m3u8".to_string(),
+                hls_url: PUBLIC_HLS_URL.to_string(),
                 ..Default::default()
             }),
             queue: Mutex::new(Vec::new()),
@@ -95,7 +99,7 @@ impl TrooznLive {
 
     async fn ensure_clean_dir(&self) -> anyhow::Result<()> {
         if self.root_dir.exists() {
-            let _ = fs::remove_dir_all(&self.root_dir).await;
+            fs::remove_dir_all(&self.root_dir).await.ok();
         }
 
         fs::create_dir_all(&self.root_dir)
@@ -109,7 +113,7 @@ impl TrooznLive {
         let mut guard = self.ffmpeg_child.lock().await;
 
         if let Some(child) = guard.as_mut() {
-            let _ = child.start_kill();
+            child.start_kill().ok();
         }
 
         *guard = None;
@@ -140,7 +144,7 @@ impl TrooznLive {
             state: "starting".to_string(),
             title: title.unwrap_or_else(|| "Playlist Youtube".to_string()),
             source_url: source_url.to_string(),
-            hls_url: "http://127.0.0.1:8787/troozn-live/playlist-youtube.m3u8".to_string(),
+            hls_url: PUBLIC_HLS_URL.to_string(),
             started_at: unix_timestamp(),
             ..Default::default()
         };
@@ -154,7 +158,7 @@ impl TrooznLive {
         let items_for_worker = items.clone();
 
         tokio::spawn(async move {
-            if let Err(err) = live.clone().run_hls_worker(items_for_worker).await {
+            if let Err(err) = live.run_hls_worker(items_for_worker).await {
                 eprintln!("TROOZN_LIVE_WORKER_ERROR: {err:?}");
 
                 let mut guard = live.now.lock().await;
@@ -163,13 +167,14 @@ impl TrooznLive {
             }
         });
 
-        // Ne pas attendre ici que le premier segment HLS soit prêt.
-        // /submit doit répondre rapidement; default.py attendra ensuite le manifeste.
+        // Important :
+        // /submit répond immédiatement après démarrage du worker.
+        // default.py/Kodi attendra ensuite que index.m3u8 existe réellement.
         let now = self.current_now().await;
 
         Ok(TrooznLiveSubmitResponse {
             ok: true,
-            hls_url: "http://127.0.0.1:8787/troozn-live/playlist-youtube.m3u8".to_string(),
+            hls_url: PUBLIC_HLS_URL.to_string(),
             live_dir: self.root_dir.clone(),
             count: items.len(),
             queue: items,
@@ -177,7 +182,10 @@ impl TrooznLive {
         })
     }
 
-    async fn run_hls_worker(self: std::sync::Arc<Self>, items: Vec<TrooznLiveItem>) -> anyhow::Result<()> {
+    async fn run_hls_worker(
+        self: std::sync::Arc<Self>,
+        items: Vec<TrooznLiveItem>,
+    ) -> anyhow::Result<()> {
         let mut appended_any = false;
         let stream_started_at = unix_timestamp();
 
@@ -187,6 +195,29 @@ impl TrooznLive {
                 .find(|candidate| candidate.index > item.index)
                 .map(|candidate| candidate.title.clone());
 
+            {
+                let mut guard = self.now.lock().await;
+                guard.state = "preparing".to_string();
+                guard.title = item.title.clone();
+                guard.source_url = item.source_url.clone();
+                guard.hls_url = PUBLIC_HLS_URL.to_string();
+                guard.item_id = item.item_id.clone();
+                guard.index = item.index;
+                guard.position = 0;
+                guard.duration = item.duration;
+                guard.thumbnail = item.thumbnail.clone();
+                guard.channel = item.channel.clone();
+                guard.started_at = stream_started_at;
+                guard.item_started_at = 0;
+                guard.next_title = next_title.clone();
+                guard.last_error = None;
+            }
+
+            eprintln!(
+                "TROOZN_LIVE_RESOLVE_START index={} title={}",
+                item.index, item.title
+            );
+
             let play_url = match resolve_youtube_720_url(&item.source_url).await {
                 Ok(url) => url,
                 Err(err) => {
@@ -194,6 +225,14 @@ impl TrooznLive {
                         "TROOZN_LIVE_SKIP_UNPLAYABLE index={} title={} error={err:?}",
                         item.index, item.title
                     );
+
+                    let mut guard = self.now.lock().await;
+                    guard.last_error = Some(format!(
+                        "Item ignoré: {} - {}",
+                        item.title,
+                        err
+                    ));
+
                     continue;
                 }
             };
@@ -206,7 +245,7 @@ impl TrooznLive {
                     state: "playing".to_string(),
                     title: item.title.clone(),
                     source_url: item.source_url.clone(),
-                    hls_url: "http://127.0.0.1:8787/troozn-live/playlist-youtube.m3u8".to_string(),
+                    hls_url: PUBLIC_HLS_URL.to_string(),
                     item_id: item.item_id.clone(),
                     index: item.index,
                     position: 0,
@@ -220,15 +259,22 @@ impl TrooznLive {
                 };
             }
 
-            let start_number = count_ts_segments(&self.root_dir).await.unwrap_or(0);
             let index_path = self.root_dir.join("index.m3u8");
             let segment_pattern = self.root_dir.join("seg-%05d.ts");
+            let start_number = next_segment_number(&self.root_dir).await.unwrap_or(0);
 
-            let mut hls_flags = "append_list+omit_endlist+program_date_time".to_string();
+            // Première vidéo : pas de DISCONTINUITY.
+            // Vidéos suivantes : FFmpeg ajoute DISCONTINUITY au début de ce nouvel append.
+            let hls_flags = if appended_any {
+                "append_list+omit_endlist+program_date_time+discont_start".to_string()
+            } else {
+                "append_list+omit_endlist+program_date_time".to_string()
+            };
 
-            if appended_any {
-                insert_discontinuity_if_needed(&index_path).await.ok();
-            }
+            eprintln!(
+                "TROOZN_LIVE_FFMPEG_START index={} title={} start_number={} flags={}",
+                item.index, item.title, start_number, hls_flags
+            );
 
             let mut cmd = Command::new("ffmpeg");
 
@@ -271,10 +317,12 @@ impl TrooznLive {
             loop {
                 sleep(Duration::from_millis(500)).await;
 
+                normalize_hls_event_playlist(&index_path).await.ok();
+
                 {
                     let mut now = self.now.lock().await;
-                    if now.item_id == item.item_id {
-                        now.position = unix_timestamp().saturating_sub(item_started_at);
+                    if now.item_id == item.item_id && now.item_started_at > 0 {
+                        now.position = unix_timestamp().saturating_sub(now.item_started_at);
                     }
                 }
 
@@ -306,6 +354,7 @@ impl TrooznLive {
                 };
 
                 if finished {
+                    normalize_hls_event_playlist(&index_path).await.ok();
                     break;
                 }
             }
@@ -339,14 +388,7 @@ impl TrooznLive {
 async fn extract_youtube_items(source_url: &str, limit: usize) -> anyhow::Result<Vec<TrooznLiveItem>> {
     let mut cmd = Command::new(YTDLP_BIN);
 
-    if Path::new("/home/troozn/.deno/bin/deno").exists() {
-        cmd.args([
-            "--js-runtimes",
-            "deno:/home/troozn/.deno/bin/deno",
-            "--remote-components",
-            "ejs:github",
-        ]);
-    }
+    add_ytdlp_common_args(&mut cmd).await;
 
     cmd.args([
         "--flat-playlist",
@@ -437,8 +479,68 @@ fn item_from_ytdlp_value(index: usize, v: &Value) -> Option<TrooznLiveItem> {
 }
 
 async fn resolve_youtube_720_url(source_url: &str) -> anyhow::Result<String> {
-    let mut cmd = Command::new(YTDLP_BIN);
+    let mut last_error = String::new();
 
+    for attempt in 1..=3 {
+        let mut cmd = Command::new(YTDLP_BIN);
+
+        add_ytdlp_common_args(&mut cmd).await;
+
+        cmd.args([
+            "--no-playlist",
+            "--no-warnings",
+            "--force-ipv4",
+            "--socket-timeout",
+            "20",
+            "--retries",
+            "3",
+            "--fragment-retries",
+            "3",
+            "-f",
+            YTDLP_720_FORMAT,
+            "-g",
+            source_url,
+        ]);
+
+        let output = match timeout(Duration::from_secs(90), cmd.output()).await {
+            Ok(Ok(output)) => output,
+            Ok(Err(err)) => {
+                last_error = format!("exécution yt-dlp: {err}");
+                sleep(Duration::from_millis(600 * attempt)).await;
+                continue;
+            }
+            Err(_) => {
+                last_error = "timeout yt-dlp".to_string();
+                sleep(Duration::from_millis(600 * attempt)).await;
+                continue;
+            }
+        };
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            last_error = stderr.trim().to_string();
+            sleep(Duration::from_millis(600 * attempt)).await;
+            continue;
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        if let Some(url) = stdout
+            .lines()
+            .map(str::trim)
+            .find(|line| line.starts_with("http://") || line.starts_with("https://"))
+        {
+            return Ok(url.to_string());
+        }
+
+        last_error = "yt-dlp n'a retourné aucune URL jouable".to_string();
+        sleep(Duration::from_millis(600 * attempt)).await;
+    }
+
+    anyhow::bail!("yt-dlp a échoué après retries: {last_error}");
+}
+
+async fn add_ytdlp_common_args(cmd: &mut Command) {
     if Path::new("/home/troozn/.deno/bin/deno").exists() {
         cmd.args([
             "--js-runtimes",
@@ -447,72 +549,10 @@ async fn resolve_youtube_720_url(source_url: &str) -> anyhow::Result<String> {
             "ejs:github",
         ]);
     }
-
-    cmd.args([
-        "--no-playlist",
-        "--no-warnings",
-        "--force-ipv4",
-        "--socket-timeout",
-        "20",
-        "--retries",
-        "3",
-        "--fragment-retries",
-        "3",
-        "-f",
-        YTDLP_720_FORMAT,
-        "-g",
-        source_url,
-    ]);
-
-    let output = timeout(Duration::from_secs(90), cmd.output())
-        .await
-        .context("timeout yt-dlp")?
-        .context("exécution yt-dlp")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("yt-dlp a échoué: {}", stderr.trim());
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-
-    let url = stdout
-        .lines()
-        .map(str::trim)
-        .find(|line| line.starts_with("http://") || line.starts_with("https://"))
-        .ok_or_else(|| anyhow!("yt-dlp n'a retourné aucune URL jouable"))?;
-
-    Ok(url.to_string())
 }
 
-async fn wait_for_hls_ready(index_path: &Path, root_dir: &Path) -> anyhow::Result<()> {
-    for _ in 0..160 {
-        let index_ok = index_path.exists();
-
-        let mut has_segment = false;
-
-        if let Ok(mut rd) = fs::read_dir(root_dir).await {
-            while let Ok(Some(entry)) = rd.next_entry().await {
-                let name = entry.file_name().to_string_lossy().to_string();
-                if name.ends_with(".ts") {
-                    has_segment = true;
-                    break;
-                }
-            }
-        }
-
-        if index_ok && has_segment {
-            return Ok(());
-        }
-
-        sleep(Duration::from_millis(250)).await;
-    }
-
-    anyhow::bail!("HLS non prêt: index.m3u8 ou segment .ts introuvable");
-}
-
-async fn count_ts_segments(root_dir: &Path) -> anyhow::Result<u64> {
-    let mut count = 0_u64;
+async fn next_segment_number(root_dir: &Path) -> anyhow::Result<u64> {
+    let mut max_seen: Option<u64> = None;
 
     let mut rd = match fs::read_dir(root_dir).await {
         Ok(rd) => rd,
@@ -521,31 +561,73 @@ async fn count_ts_segments(root_dir: &Path) -> anyhow::Result<u64> {
 
     while let Some(entry) = rd.next_entry().await? {
         let name = entry.file_name().to_string_lossy().to_string();
-        if name.ends_with(".ts") {
-            count += 1;
+
+        if !name.starts_with("seg-") || !name.ends_with(".ts") {
+            continue;
+        }
+
+        let number_text = name
+            .trim_start_matches("seg-")
+            .trim_end_matches(".ts");
+
+        if let Ok(n) = number_text.parse::<u64>() {
+            max_seen = Some(max_seen.map_or(n, |m| m.max(n)));
         }
     }
 
-    Ok(count)
+    Ok(max_seen.map_or(0, |n| n + 1))
 }
 
-async fn insert_discontinuity_if_needed(index_path: &Path) -> anyhow::Result<()> {
+async fn normalize_hls_event_playlist(index_path: &Path) -> anyhow::Result<()> {
     let content = match fs::read_to_string(index_path).await {
         Ok(content) => content,
         Err(_) => return Ok(()),
     };
 
-    if content.trim_end().ends_with("#EXT-X-DISCONTINUITY") {
+    if !content.contains("#EXTM3U") {
         return Ok(());
     }
 
-    let mut updated = content;
-    updated.push_str("#EXT-X-DISCONTINUITY\n");
-    fs::write(index_path, updated).await?;
+    let mut lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
+
+    // Ajoute PLAYLIST-TYPE:EVENT juste après EXT-X-VERSION.
+    if !lines.iter().any(|l| l.starts_with("#EXT-X-PLAYLIST-TYPE:")) {
+        if let Some(pos) = lines.iter().position(|l| l.starts_with("#EXT-X-VERSION:")) {
+            lines.insert(pos + 1, "#EXT-X-PLAYLIST-TYPE:EVENT".to_string());
+        }
+    }
+
+    // Supprime une ou plusieurs discontinuités accidentelles avant le premier segment.
+    // Cas typique à éviter :
+    // #EXT-X-MEDIA-SEQUENCE:0
+    // #EXT-X-DISCONTINUITY
+    // #EXTINF:...
+    loop {
+        let first_extinf = lines.iter().position(|l| l.starts_with("#EXTINF:"));
+        let first_discontinuity = lines
+            .iter()
+            .position(|l| l.trim() == "#EXT-X-DISCONTINUITY");
+
+        match (first_discontinuity, first_extinf) {
+            (Some(d), Some(e)) if d < e => {
+                lines.remove(d);
+            }
+            _ => break,
+        }
+    }
+
+    let updated = lines.join("\n") + "\n";
+
+    if updated != content {
+        fs::write(index_path, updated).await?;
+    }
+
     Ok(())
 }
 
 async fn finalize_playlist(index_path: &Path) -> anyhow::Result<()> {
+    normalize_hls_event_playlist(index_path).await.ok();
+
     let content = match fs::read_to_string(index_path).await {
         Ok(content) => content,
         Err(_) => return Ok(()),
@@ -556,15 +638,18 @@ async fn finalize_playlist(index_path: &Path) -> anyhow::Result<()> {
     }
 
     let mut updated = content;
+
+    if !updated.ends_with('\n') {
+        updated.push('\n');
+    }
+
     updated.push_str("#EXT-X-ENDLIST\n");
     fs::write(index_path, updated).await?;
     Ok(())
 }
 
 fn item_id_for_url(url: &str) -> String {
-    let mut hasher = Sha1::new();
-    hasher.update(url.as_bytes());
-    let digest = format!("{:x}", hasher.finalize());
+    let digest = sha1::Sha1::from(url).digest().to_string();
     digest.chars().take(16).collect()
 }
 
@@ -581,7 +666,7 @@ pub async fn troozn_live_health() -> impl IntoResponse {
         "service": "troozn-live",
         "mode": "hls",
         "quality": "720p-copy",
-        "hls_url": "http://127.0.0.1:8787/troozn-live/playlist-youtube.m3u8"
+        "hls_url": PUBLIC_HLS_URL
     }))
 }
 
