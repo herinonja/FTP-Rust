@@ -105,6 +105,21 @@ struct VideoMetadata {
 }
 
 impl YoutubeLibrary {
+    pub async fn cached_play_url(&self, item_id: &str) -> Option<String> {
+        let now = unix_timestamp();
+
+        let cache = self.resolved_cache.read().await;
+
+        cache.get(item_id).and_then(|entry| {
+            if entry.expires_at > now {
+                Some(entry.url.clone())
+            } else {
+                None
+            }
+        })
+    }
+
+
     pub fn new_default(http_bind: &str) -> Self {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
 
@@ -292,6 +307,20 @@ impl YoutubeLibrary {
 
         let playlist_path = self.write_playlist(&items).await?;
         self.save_db(&db).await?;
+
+        if let Some(first) = items.first() {
+            match self.play_redirect(&first.item_id).await {
+                Ok(_) => {
+                    eprintln!("youtube first item pre-resolved item={}", first.item_id);
+                }
+                Err(err) => {
+                    eprintln!(
+                        "youtube first item pre-resolve failed item={} error={err:?}",
+                        first.item_id
+                    );
+                }
+            }
+        }
 
         Ok(YoutubeSubmitResponse {
             ok: true,
@@ -505,6 +534,55 @@ pub async fn youtube_play(
             })),
         )
             .into_response(),
+    }
+}
+
+pub async fn youtube_play_head(
+    State(state): State<HttpGatewayState>,
+    AxumPath(item_id): AxumPath<String>,
+) -> Response {
+    match state.youtube.cached_play_url(&item_id).await {
+        Some(target) => {
+            let mut response = StatusCode::FOUND.into_response();
+
+            if let Ok(location) = HeaderValue::from_str(&target) {
+                response.headers_mut().insert(header::LOCATION, location);
+            }
+
+            response.headers_mut().insert(
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("no-store"),
+            );
+
+            response.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("video/mp4"),
+            );
+
+            response
+        }
+        None => {
+            // Important : ne jamais lancer yt-dlp sur HEAD.
+            // Kodi fait souvent HEAD/Stat avant Open.
+            let mut response = StatusCode::OK.into_response();
+
+            response.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("video/mp4"),
+            );
+
+            response.headers_mut().insert(
+                header::ACCEPT_RANGES,
+                HeaderValue::from_static("bytes"),
+            );
+
+            response.headers_mut().insert(
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("no-store"),
+            );
+
+            response
+        }
     }
 }
 
