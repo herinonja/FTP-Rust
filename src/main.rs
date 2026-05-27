@@ -167,7 +167,11 @@ impl PhoneRegistry {
             session.display_name,
             session.folder_name,
             session.role,
-            if session.source_visible { "visible" } else { "masque" }
+            if session.source_visible {
+                "visible"
+            } else {
+                "masque"
+            }
         );
         phones.insert(id, session);
         Ok(())
@@ -218,7 +222,10 @@ impl PhoneRegistry {
     async fn get_by_id(&self, id: &str) -> Option<Arc<PhoneSession>> {
         let mut phones = self.phones.write().await;
         prune_stale_phones(&mut phones);
-        phones.get(id).filter(|phone| phone_is_published(phone)).cloned()
+        phones
+            .get(id)
+            .filter(|phone| phone_is_published(phone))
+            .cloned()
     }
 }
 
@@ -590,8 +597,7 @@ async fn main() -> anyhow::Result<()> {
 
     let ftp_bind = std::env::var("TROOZN_FTP_BIND").unwrap_or_else(|_| DEFAULT_FTP_BIND.into());
     let http_bind = std::env::var("TROOZN_HTTP_BIND").unwrap_or_else(|_| DEFAULT_HTTP_BIND.into());
-    let upnp_bind =
-        std::env::var("TROOZN_UPNP_BIND").unwrap_or_else(|_| DEFAULT_UPNP_BIND.into());
+    let upnp_bind = std::env::var("TROOZN_UPNP_BIND").unwrap_or_else(|_| DEFAULT_UPNP_BIND.into());
     let webtransport_bind = std::env::var("TROOZN_WEBTRANSPORT_BIND")
         .unwrap_or_else(|_| DEFAULT_WEBTRANSPORT_BIND.into());
     let state_dir = troozn_state_dir();
@@ -697,7 +703,11 @@ async fn main() -> anyhow::Result<()> {
         " Kodi JSON-RPC local: {}:{} auth={}",
         kodi.host,
         kodi.port,
-        if kodi.username.is_some() { "oui" } else { "non" }
+        if kodi.username.is_some() {
+            "oui"
+        } else {
+            "non"
+        }
     );
     println!("=============================================================");
 
@@ -758,25 +768,39 @@ async fn run_http_media_gateway(
     tokio::fs::create_dir_all(&cache.dir)
         .await
         .with_context(|| format!("creation cache media {}", cache.dir.display()))?;
+
     let youtube = Arc::new(youtube_library::YoutubeLibrary::new_default(bind));
+
     let state = HttpGatewayState {
         registry,
         cache,
         youtube,
     };
+
     let app = Router::new()
         .route("/health", get(http_health))
         .route("/media/*path", get(http_get_media).head(http_head_media))
         .route("/youtube/health", get(youtube_library::youtube_health))
         .route("/youtube/submit", post(youtube_library::youtube_submit))
-        .route("/youtube/item/:item_id/play", get(youtube_library::youtube_play))
         .route("/youtube/items", get(youtube_library::youtube_items))
+        .route(
+            "/youtube/item/:item_id/play",
+            get(youtube_library::youtube_play).head(youtube_library::youtube_play_head),
+        )
+        .route(
+            "/youtube/media/:item_id/:filename",
+            get(youtube_library::youtube_play_named)
+                .head(youtube_library::youtube_play_named_head),
+        )
         .with_state(state);
+
     let listener = TcpListener::bind(bind)
         .await
         .with_context(|| format!("ecoute HTTP media {bind}"))?;
+
     println!("Serveur HTTP media TROOZN: http://{bind}/");
-    println!("Backend YouTube TROOZN: http://{bind}/youtube/health");
+    println!("Serveur YouTube TROOZN: http://{bind}/youtube/health");
+
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -828,7 +852,10 @@ async fn run_upnp_server(bind: &str, http_bind: &str, registry: Registry) -> any
     let listener = TcpListener::bind(bind)
         .await
         .with_context(|| format!("ecoute UPnP {bind}"))?;
-    println!("Serveur UPnP TROOZN: {}/upnp/root/device.xml", state.upnp_base_url);
+    println!(
+        "Serveur UPnP TROOZN: {}/upnp/root/device.xml",
+        state.upnp_base_url
+    );
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -949,7 +976,8 @@ async fn upnp_content_directory_control(
         return soap_response("ContentDirectory", "UpdateObjectResponse", "");
     }
 
-    let object_id = normalize_upnp_object_id(&soap_tag(&body, "ObjectID").unwrap_or_else(|| "0".into()));
+    let object_id =
+        normalize_upnp_object_id(&soap_tag(&body, "ObjectID").unwrap_or_else(|| "0".into()));
     let browse_flag =
         soap_tag(&body, "BrowseFlag").unwrap_or_else(|| "BrowseDirectChildren".into());
     let starting_index = soap_tag(&body, "StartingIndex")
@@ -1065,8 +1093,13 @@ async fn http_get_media(
                 }
             }
         }
-        schedule_head_cache_prefetch(state.cache.clone(), phone.clone(), target_path.clone(), size)
-            .await;
+        schedule_head_cache_prefetch(
+            state.cache.clone(),
+            phone.clone(),
+            target_path.clone(),
+            size,
+        )
+        .await;
     }
 
     match phone_media_body(phone.clone(), target_path.clone(), start, length).await {
@@ -1158,7 +1191,9 @@ fn parse_http_range(headers: &HeaderMap, size: u64) -> Result<(u64, u64, bool), 
     let Some(range) = headers.get(header::RANGE) else {
         return Ok((0, size - 1, false));
     };
-    let range = range.to_str().map_err(|_| StatusCode::RANGE_NOT_SATISFIABLE)?;
+    let range = range
+        .to_str()
+        .map_err(|_| StatusCode::RANGE_NOT_SATISFIABLE)?;
     let Some(spec) = range.strip_prefix("bytes=") else {
         return Err(StatusCode::RANGE_NOT_SATISFIABLE);
     };
@@ -1214,10 +1249,7 @@ fn media_headers_response(size: u64, start: u64, end: u64, partial: bool, body: 
         .header(header::CONTENT_TYPE, "application/octet-stream")
         .header(header::CONTENT_LENGTH, length.to_string());
     if partial && size > 0 {
-        response = response.header(
-            header::CONTENT_RANGE,
-            format!("bytes {start}-{end}/{size}"),
-        );
+        response = response.header(header::CONTENT_RANGE, format!("bytes {start}-{end}/{size}"));
     }
     response.body(body).unwrap_or_else(|_| {
         simple_response(
@@ -1308,7 +1340,10 @@ async fn upnp_browse(
     browse_flag: &str,
 ) -> anyhow::Result<Vec<UpnpDidlItem>> {
     if browse_flag == "BrowseMetadata" {
-        return Ok(upnp_metadata(state, device, object_id).await?.into_iter().collect());
+        return Ok(upnp_metadata(state, device, object_id)
+            .await?
+            .into_iter()
+            .collect());
     }
 
     if object_id == "0" {
@@ -1591,7 +1626,11 @@ async fn refresh_cache_recency(cache_path: &Path) {
     let Ok(metadata) = tokio::fs::metadata(cache_path).await else {
         return;
     };
-    if let Ok(file) = tokio::fs::OpenOptions::new().write(true).open(cache_path).await {
+    if let Ok(file) = tokio::fs::OpenOptions::new()
+        .write(true)
+        .open(cache_path)
+        .await
+    {
         let _ = file.set_len(metadata.len()).await;
     }
 }
@@ -1857,7 +1896,10 @@ async fn send_full_upnp_advertisement(state: &UpnpState, socket: &UdpSocket) {
             let packet = ssdp_packet(&[
                 "NOTIFY * HTTP/1.1".into(),
                 format!("HOST: {UPNP_MULTICAST_ADDR}:{UPNP_MULTICAST_PORT}"),
-                format!("CACHE-CONTROL: max-age={}", UPNP_ADVERTISE_INTERVAL.as_secs() * 4),
+                format!(
+                    "CACHE-CONTROL: max-age={}",
+                    UPNP_ADVERTISE_INTERVAL.as_secs() * 4
+                ),
                 format!("LOCATION: {}", upnp_device_location(state, &device)),
                 format!("NT: {}", target.0),
                 "NTS: ssdp:alive".into(),
@@ -1881,7 +1923,10 @@ async fn send_upnp_search_responses(state: &UpnpState, socket: &UdpSocket, sende
         for target in upnp_targets(&device) {
             let packet = ssdp_packet(&[
                 "HTTP/1.1 200 OK".into(),
-                format!("CACHE-CONTROL: max-age={}", UPNP_ADVERTISE_INTERVAL.as_secs() * 4),
+                format!(
+                    "CACHE-CONTROL: max-age={}",
+                    UPNP_ADVERTISE_INTERVAL.as_secs() * 4
+                ),
                 "EXT:".into(),
                 format!("LOCATION: {}", upnp_device_location(state, &device)),
                 format!("SERVER: {}", upnp_server_header()),
@@ -1931,12 +1976,16 @@ async fn upnp_device_for_key(state: &UpnpState, key: &str) -> Option<UpnpDeviceI
             phone_id: None,
         });
     }
-    state.registry.get_by_id(key).await.map(|phone| UpnpDeviceInfo {
-        key: phone.id.clone(),
-        uuid: deterministic_uuid(&format!("troozn-phone:{}", phone.id)),
-        friendly_name: format!("TROOZN - {}", phone.display_name),
-        phone_id: Some(phone.id.clone()),
-    })
+    state
+        .registry
+        .get_by_id(key)
+        .await
+        .map(|phone| UpnpDeviceInfo {
+            key: phone.id.clone(),
+            uuid: deterministic_uuid(&format!("troozn-phone:{}", phone.id)),
+            friendly_name: format!("TROOZN - {}", phone.display_name),
+            phone_id: Some(phone.id.clone()),
+        })
 }
 
 fn upnp_targets(device: &UpnpDeviceInfo) -> Vec<(String, String)> {
@@ -2661,16 +2710,30 @@ async fn run_kodi_command(kodi: &KodiConfig, command: &str) -> anyhow::Result<Va
             player_command(kodi, "Player.GoTo", json!({"to": "previous"})).await
         }
         "CMD_SEEK_FORWARD" | "CMD_FORWARD" => {
-            player_command(kodi, "Player.Seek", json!({"value": {"step": "smallforward"}})).await
+            player_command(
+                kodi,
+                "Player.Seek",
+                json!({"value": {"step": "smallforward"}}),
+            )
+            .await
         }
         "CMD_SEEK_BACKWARD" | "CMD_REWIND" | "CMD_BACKWARD" => {
-            player_command(kodi, "Player.Seek", json!({"value": {"step": "smallbackward"}})).await
+            player_command(
+                kodi,
+                "Player.Seek",
+                json!({"value": {"step": "smallbackward"}}),
+            )
+            .await
         }
         other => Err(anyhow!("commande inconnue: {other}")),
     }
 }
 
-async fn player_command(kodi: &KodiConfig, method: &str, mut params: Value) -> anyhow::Result<Value> {
+async fn player_command(
+    kodi: &KodiConfig,
+    method: &str,
+    mut params: Value,
+) -> anyhow::Result<Value> {
     let player_id = active_player_id(kodi)
         .await?
         .ok_or_else(|| anyhow!("aucune lecture active"))?;
@@ -2740,8 +2803,8 @@ fn parse_http_response_body(response: &[u8]) -> anyhow::Result<Vec<u8>> {
         std::str::from_utf8(&response[..header_end]).context("en-tetes HTTP non UTF-8")?;
     let body = &response[header_end + 4..];
 
-    let status_code = http_status_code(headers)
-        .ok_or_else(|| anyhow!("ligne de statut HTTP Kodi absente"))?;
+    let status_code =
+        http_status_code(headers).ok_or_else(|| anyhow!("ligne de statut HTTP Kodi absente"))?;
     if !(200..300).contains(&status_code) {
         let body_text = String::from_utf8_lossy(body);
         return Err(anyhow!(
@@ -2757,8 +2820,8 @@ fn parse_http_response_body(response: &[u8]) -> anyhow::Result<Vec<u8>> {
         return decode_chunked_body(body);
     }
 
-    if let Some(length) = header_value(headers, "content-length")
-        .and_then(|value| value.parse::<usize>().ok())
+    if let Some(length) =
+        header_value(headers, "content-length").and_then(|value| value.parse::<usize>().ok())
     {
         if body.len() < length {
             return Err(anyhow!(

@@ -104,11 +104,12 @@ impl YoutubeLibrary {
     pub fn new_default(http_bind: &str) -> Self {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
 
-        let public_base_url = if http_bind.starts_with("http://") || http_bind.starts_with("https://") {
-            http_bind.trim_end_matches('/').to_string()
-        } else {
-            format!("http://{http_bind}")
-        };
+        let public_base_url =
+            if http_bind.starts_with("http://") || http_bind.starts_with("https://") {
+                http_bind.trim_end_matches('/').to_string()
+            } else {
+                format!("http://{http_bind}")
+            };
 
         let state_dir = PathBuf::from("/tmp/troozn-youtube");
         let library_dir = PathBuf::from(home).join(".kodi/userdata/TROOZN");
@@ -120,7 +121,8 @@ impl YoutubeLibrary {
             current_dir,
             public_base_url,
             ytdlp_bin: PathBuf::from(
-                std::env::var("TROOZN_YTDLP").unwrap_or_else(|_| "/usr/local/bin/yt-dlp".to_string()),
+                std::env::var("TROOZN_YTDLP")
+                    .unwrap_or_else(|_| "/usr/local/bin/yt-dlp".to_string()),
             ),
             resolved_cache: Arc::new(RwLock::new(HashMap::new())),
             resolve_locks: Arc::new(RwLock::new(HashMap::new())),
@@ -149,7 +151,9 @@ impl YoutubeLibrary {
 
     async fn load_db(&self) -> HashMap<String, YoutubeItem> {
         match fs::read_to_string(&self.db_path).await {
-            Ok(text) => serde_json::from_str::<HashMap<String, YoutubeItem>>(&text).unwrap_or_default(),
+            Ok(text) => {
+                serde_json::from_str::<HashMap<String, YoutubeItem>>(&text).unwrap_or_default()
+            }
             Err(_) => HashMap::new(),
         }
     }
@@ -280,7 +284,10 @@ impl YoutubeLibrary {
         if let Some(first) = items.first() {
             match self.play_redirect(&first.item_id).await {
                 Ok(_) => eprintln!("youtube first item pre-resolved item={}", first.item_id),
-                Err(err) => eprintln!("youtube first item pre-resolve failed item={} error={err:?}", first.item_id),
+                Err(err) => eprintln!(
+                    "youtube first item pre-resolve failed item={} error={err:?}",
+                    first.item_id
+                ),
             }
         }
 
@@ -298,7 +305,9 @@ impl YoutubeLibrary {
                 for item_id in background_ids {
                     match youtube.play_redirect(&item_id).await {
                         Ok(_) => eprintln!("youtube background pre-resolved item={item_id}"),
-                        Err(err) => eprintln!("youtube background pre-resolve failed item={item_id} error={err:?}"),
+                        Err(err) => eprintln!(
+                            "youtube background pre-resolve failed item={item_id} error={err:?}"
+                        ),
                     }
                 }
             });
@@ -313,18 +322,28 @@ impl YoutubeLibrary {
         })
     }
 
-    async fn create_library_item(&self, index: usize, meta: VideoMetadata) -> anyhow::Result<YoutubeItem> {
+    async fn create_library_item(
+        &self,
+        index: usize,
+        meta: VideoMetadata,
+    ) -> anyhow::Result<YoutubeItem> {
         let item_id = item_id_for_url(&meta.source_url);
         let safe_title = sanitize_filename(&meta.title, &format!("video-{index:03}"));
         let base = format!("{index:03} - {safe_title}");
 
         let strm_path = self.current_dir.join(format!("{base}.strm"));
         let nfo_path = self.current_dir.join(format!("{base}.nfo"));
-        let thumb_path = meta.thumbnail.as_ref().map(|_| self.current_dir.join(format!("{base}-thumb.jpg")));
+        let thumb_path = meta
+            .thumbnail
+            .as_ref()
+            .map(|_| self.current_dir.join(format!("{base}-thumb.jpg")));
 
         // Named URL so Kodi does not display the current item as simply "play".
         let media_filename = media_url_filename(index, &meta.title);
-        let play_url = format!("{}/youtube/media/{}/{}", self.public_base_url, item_id, media_filename);
+        let play_url = format!(
+            "{}/youtube/media/{}/{}",
+            self.public_base_url, item_id, media_filename
+        );
 
         let item = YoutubeItem {
             item_id,
@@ -415,7 +434,10 @@ impl YoutubeLibrary {
             .get(item_id)
             .ok_or_else(|| anyhow::anyhow!("unknown YouTube item: {item_id}"))?;
 
-        eprintln!("youtube resolving via yt-dlp item={item_id} title={}", item.title);
+        eprintln!(
+            "youtube resolving via yt-dlp item={item_id} title={}",
+            item.title
+        );
         let url = self.ytdlp_play_url(&item.source_url).await?;
 
         {
@@ -538,8 +560,12 @@ async fn youtube_play_inner(youtube: Arc<YoutubeLibrary>, item_id: String) -> Re
             };
 
             response.headers_mut().insert(header::LOCATION, location);
-            response.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-            response.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("video/mp4"));
+            response
+                .headers_mut()
+                .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            response
+                .headers_mut()
+                .insert(header::CONTENT_TYPE, HeaderValue::from_static("video/mp4"));
             response
         }
         Err(err) => (
@@ -562,16 +588,26 @@ async fn youtube_play_head_inner(youtube: Arc<YoutubeLibrary>, item_id: String) 
                 response.headers_mut().insert(header::LOCATION, location);
             }
 
-            response.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-            response.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("video/mp4"));
+            response
+                .headers_mut()
+                .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            response
+                .headers_mut()
+                .insert(header::CONTENT_TYPE, HeaderValue::from_static("video/mp4"));
             response
         }
         None => {
             // Never spawn yt-dlp on HEAD. Kodi uses HEAD/Stat/GetMimeType before Open.
             let mut response = StatusCode::OK.into_response();
-            response.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("video/mp4"));
-            response.headers_mut().insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
-            response.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            response
+                .headers_mut()
+                .insert(header::CONTENT_TYPE, HeaderValue::from_static("video/mp4"));
+            response
+                .headers_mut()
+                .insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+            response
+                .headers_mut()
+                .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
             response
         }
     }
@@ -637,7 +673,10 @@ fn metadata_from_video_info(value: &Value, fallback_url: &str) -> VideoMetadata 
         title,
         source_url: webpage_url.clone(),
         webpage_url,
-        thumbnail: value.get("thumbnail").and_then(Value::as_str).map(str::to_string),
+        thumbnail: value
+            .get("thumbnail")
+            .and_then(Value::as_str)
+            .map(str::to_string),
         duration: value.get("duration").and_then(Value::as_u64),
         channel,
         uploader,
@@ -686,7 +725,10 @@ fn metadata_from_flat_entry(value: &Value) -> Option<VideoMetadata> {
         title,
         source_url: source_url.clone(),
         webpage_url: source_url,
-        thumbnail: value.get("thumbnail").and_then(Value::as_str).map(str::to_string),
+        thumbnail: value
+            .get("thumbnail")
+            .and_then(Value::as_str)
+            .map(str::to_string),
         duration: value.get("duration").and_then(Value::as_u64),
         channel,
         uploader,
@@ -840,7 +882,12 @@ fn compact_text(value: &str, max_chars: usize) -> String {
 
 fn parse_yt_date(value: &str) -> Option<String> {
     if value.len() == 8 && value.chars().all(|c| c.is_ascii_digit()) {
-        Some(format!("{}-{}-{}", &value[0..4], &value[4..6], &value[6..8]))
+        Some(format!(
+            "{}-{}-{}",
+            &value[0..4],
+            &value[4..6],
+            &value[6..8]
+        ))
     } else {
         None
     }
