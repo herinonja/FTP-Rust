@@ -15,6 +15,7 @@ use tokio::sync::Mutex;
 use tokio::time::{sleep, timeout, Duration};
 
 use crate::HttpGatewayState;
+use sha1::{Digest, Sha1};
 
 const LIVE_DIR: &str = "/tmp/troozn-live";
 const YTDLP_BIN: &str = "/usr/local/bin/yt-dlp";
@@ -153,7 +154,7 @@ impl TrooznLive {
         let items_for_worker = items.clone();
 
         tokio::spawn(async move {
-            if let Err(err) = live.run_hls_worker(items_for_worker).await {
+            if let Err(err) = live.clone().run_hls_worker(items_for_worker).await {
                 eprintln!("TROOZN_LIVE_WORKER_ERROR: {err:?}");
 
                 let mut guard = live.now.lock().await;
@@ -562,7 +563,9 @@ async fn finalize_playlist(index_path: &Path) -> anyhow::Result<()> {
 }
 
 fn item_id_for_url(url: &str) -> String {
-    let digest = sha1::Sha1::from(url).digest().to_string();
+    let mut hasher = Sha1::new();
+    hasher.update(url.as_bytes());
+    let digest = format!("{:x}", hasher.finalize());
     digest.chars().take(16).collect()
 }
 
