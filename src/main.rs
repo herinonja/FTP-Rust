@@ -28,6 +28,7 @@ use wtransport::tls::Sha256DigestFmt;
 use wtransport::{Connection, Endpoint, Identity, ServerConfig};
 
 mod youtube_library;
+mod troozn_live;
 
 const DEFAULT_FTP_BIND: &str = "127.0.0.1:2120";
 const DEFAULT_HTTP_BIND: &str = "127.0.0.1:8787";
@@ -69,6 +70,7 @@ struct HttpGatewayState {
     registry: Registry,
     cache: Arc<HeadCache>,
     youtube: Arc<youtube_library::YoutubeLibrary>,
+    live: Arc<troozn_live::TrooznLive>,
 }
 
 #[derive(Debug, Clone)]
@@ -767,6 +769,10 @@ async fn run_http_media_gateway(
     let app = Router::new()
         .route("/health", get(http_health))
         .route("/media/*path", get(http_get_media).head(http_head_media))
+        .route("/troozn-live/health", get(troozn_live::troozn_live_health))
+        .route("/troozn-live/submit", post(troozn_live::troozn_live_submit))
+        .route("/troozn-live/now", get(troozn_live::troozn_live_now))
+        .route("/troozn-live/*path", get(troozn_live::troozn_live_file))
         .route("/youtube/health", get(youtube_library::youtube_health))
         .route("/youtube/submit", post(youtube_library::youtube_submit))
         .route("/youtube/items", get(youtube_library::youtube_items))
