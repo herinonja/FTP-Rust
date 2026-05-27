@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -32,7 +33,8 @@ const YTDLP_720_FORMAT: &str =
 pub struct TrooznLive {
     pub root_dir: PathBuf,
     ffmpeg_child: Mutex<Option<Child>>,
-    now: Mutex<TrooznLiveNow>,
+    producer_now: Mutex<TrooznLiveNow>,
+    playback_now: Mutex<TrooznLiveNow>,
     queue: Mutex<Vec<TrooznLiveItem>>,
     master_entries: Mutex<Vec<MasterEntry>>,
 }
@@ -95,14 +97,17 @@ pub struct TrooznLiveSubmitResponse {
 
 impl TrooznLive {
     pub fn new_default() -> Self {
+        let idle = TrooznLiveNow {
+            state: "idle".to_string(),
+            hls_url: PUBLIC_HLS_URL.to_string(),
+            ..Default::default()
+        };
+
         Self {
             root_dir: PathBuf::from(LIVE_DIR),
             ffmpeg_child: Mutex::new(None),
-            now: Mutex::new(TrooznLiveNow {
-                state: "idle".to_string(),
-                hls_url: PUBLIC_HLS_URL.to_string(),
-                ..Default::default()
-            }),
+            producer_now: Mutex::new(idle.clone()),
+            playback_now: Mutex::new(idle),
             queue: Mutex::new(Vec::new()),
             master_entries: Mutex::new(Vec::new()),
         }
@@ -166,7 +171,12 @@ impl TrooznLive {
         };
 
         {
-            let mut guard = self.now.lock().await;
+            let mut guard = self.producer_now.lock().await;
+            *guard = now.clone();
+        }
+
+        {
+            let mut guard = self.playback_now.lock().await;
             *guard = now.clone();
         }
 
@@ -179,9 +189,15 @@ impl TrooznLive {
             if let Err(err) = live.run_hls_worker(items_for_worker).await {
                 eprintln!("TROOZN_LIVE_WORKER_ERROR: {err:?}");
 
-                let mut guard = live_for_error.now.lock().await;
-                guard.state = "error".to_string();
-                guard.last_error = Some(err.to_string());
+                let mut producer = live_for_error.producer_now.lock().await;
+                producer.state = "error".to_string();
+                producer.last_error = Some(err.to_string());
+
+                let mut playback = live_for_error.playback_now.lock().await;
+                if playback.state != "playing" {
+                    playback.state = "error".to_string();
+                    playback.last_error = Some(err.to_string());
+                }
             }
         });
 
@@ -213,7 +229,7 @@ impl TrooznLive {
                 .map(|candidate| candidate.title.clone());
 
             {
-                let mut guard = self.now.lock().await;
+                let mut guard = self.producer_now.lock().await;
                 guard.state = "preparing".to_string();
                 guard.title = item.title.clone();
                 guard.source_url = item.source_url.clone();
@@ -243,7 +259,7 @@ impl TrooznLive {
                         item.index, item.title
                     );
 
-                    let mut guard = self.now.lock().await;
+                    let mut guard = self.producer_now.lock().await;
                     guard.last_error = Some(format!("Item ignoré: {} - {}", item.title, err));
                     continue;
                 }
@@ -252,9 +268,9 @@ impl TrooznLive {
             let item_started_at = unix_timestamp();
 
             {
-                let mut guard = self.now.lock().await;
+                let mut guard = self.producer_now.lock().await;
                 *guard = TrooznLiveNow {
-                    state: "playing".to_string(),
+                    state: "preparing".to_string(),
                     title: item.title.clone(),
                     source_url: item.source_url.clone(),
                     hls_url: PUBLIC_HLS_URL.to_string(),
@@ -284,6 +300,7 @@ impl TrooznLive {
 
             let mut cmd = Command::new("ffmpeg");
 
+            // Pas de -re : on pré-segmente plus vite que la lecture.
             cmd.args([
                 "-hide_banner",
                 "-y",
@@ -321,9 +338,9 @@ impl TrooznLive {
                 sleep(Duration::from_millis(500)).await;
 
                 {
-                    let mut now = self.now.lock().await;
-                    if now.item_id == item.item_id && now.item_started_at > 0 {
-                        now.position = unix_timestamp().saturating_sub(now.item_started_at);
+                    let mut producer = self.producer_now.lock().await;
+                    if producer.item_id == item.item_id && producer.item_started_at > 0 {
+                        producer.position = unix_timestamp().saturating_sub(producer.item_started_at);
                     }
                 }
 
@@ -388,8 +405,8 @@ impl TrooznLive {
         self.rewrite_master_playlist(true).await.ok();
 
         {
-            let mut guard = self.now.lock().await;
-            guard.state = "ended".to_string();
+            let mut producer = self.producer_now.lock().await;
+            producer.state = "ended".to_string();
         }
 
         Ok(())
@@ -414,7 +431,6 @@ impl TrooznLive {
         }
 
         let mut entries = self.master_entries.lock().await;
-
         let existing_for_item = entries.iter().filter(|e| e.item_index == item_index).count();
 
         if parsed_count <= existing_for_item {
@@ -446,11 +462,12 @@ impl TrooznLive {
         let mut out = String::new();
         out.push_str("#EXTM3U\n");
         out.push_str("#EXT-X-VERSION:3\n");
-        out.push_str("#EXT-X-PLAYLIST-TYPE:EVENT\n");
+        // Pas de EXT-X-PLAYLIST-TYPE:EVENT :
+        // on veut que Kodi démarre depuis le début, pas près du live edge.
         out.push_str(&format!("#EXT-X-TARGETDURATION:{target_duration}\n"));
         out.push_str("#EXT-X-MEDIA-SEQUENCE:0\n");
 
-        let mut discontinuity_seen_for_item = std::collections::HashSet::new();
+        let mut discontinuity_seen_for_item = HashSet::new();
 
         for entry in entries {
             if entry.discontinuity_before && discontinuity_seen_for_item.insert(entry.item_index) {
@@ -475,14 +492,75 @@ impl TrooznLive {
         Ok(())
     }
 
-    pub async fn current_now(&self) -> TrooznLiveNow {
-        let mut now = self.now.lock().await.clone();
+    async fn note_segment_served(&self, relative: &str) {
+        let Some((item_index, segment_number)) = parse_item_segment_name(relative) else {
+            return;
+        };
 
-        if now.item_started_at > 0 && now.state == "playing" {
-            now.position = unix_timestamp().saturating_sub(now.item_started_at);
+        let queue = self.queue.lock().await.clone();
+        let Some(item) = queue.iter().find(|item| item.index == item_index).cloned() else {
+            return;
+        };
+
+        let entries = self.master_entries.lock().await.clone();
+
+        let mut position_f64 = 0.0_f64;
+
+        for entry in entries.iter().filter(|entry| entry.item_index == item_index) {
+            if entry.segment == relative {
+                break;
+            }
+
+            if let Ok(d) = entry.duration.parse::<f64>() {
+                position_f64 += d;
+            }
         }
 
-        now
+        let next_title = queue
+            .iter()
+            .find(|candidate| candidate.index > item.index)
+            .map(|candidate| candidate.title.clone());
+
+        let now = TrooznLiveNow {
+            state: "playing".to_string(),
+            title: item.title.clone(),
+            source_url: item.source_url.clone(),
+            hls_url: PUBLIC_HLS_URL.to_string(),
+            item_id: item.item_id.clone(),
+            index: item.index,
+            position: position_f64.floor() as u64,
+            duration: item.duration,
+            thumbnail: item.thumbnail.clone(),
+            channel: item.channel.clone(),
+            started_at: unix_timestamp(),
+            item_started_at: unix_timestamp().saturating_sub(position_f64.floor() as u64),
+            next_title,
+            last_error: None,
+        };
+
+        {
+            let mut guard = self.playback_now.lock().await;
+            *guard = now;
+        }
+
+        eprintln!(
+            "TROOZN_LIVE_SEGMENT_SERVED item={} segment={} file={}",
+            item_index, segment_number, relative
+        );
+    }
+
+    pub async fn current_now(&self) -> TrooznLiveNow {
+        let playback = self.playback_now.lock().await.clone();
+
+        if playback.state == "playing" && playback.index > 0 {
+            return playback;
+        }
+
+        self.producer_now.lock().await.clone()
+    }
+
+    pub async fn producer_now(&self) -> TrooznLiveNow {
+        self.producer_now.lock().await.clone()
     }
 
     pub async fn current_queue(&self) -> Vec<TrooznLiveItem> {
@@ -522,6 +600,11 @@ fn parse_item_hls_entries(
             continue;
         }
 
+        let segment_name = Path::new(line)
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| line.to_string());
+
         let duration = pending_duration.take().unwrap_or_else(|| "4.000000".to_string());
         let program_date_time = pending_program_date_time.take();
 
@@ -529,7 +612,7 @@ fn parse_item_hls_entries(
             item_index,
             duration,
             program_date_time,
-            segment: line.to_string(),
+            segment: segment_name,
             discontinuity_before: has_previous_item && out.is_empty(),
         });
     }
@@ -537,11 +620,30 @@ fn parse_item_hls_entries(
     out
 }
 
+fn parse_item_segment_name(relative: &str) -> Option<(usize, usize)> {
+    let name = Path::new(relative).file_name()?.to_string_lossy();
+
+    if !name.starts_with("item-") || !name.ends_with(".ts") {
+        return None;
+    }
+
+    let without_ext = name.trim_end_matches(".ts");
+    let parts: Vec<&str> = without_ext.split('-').collect();
+
+    if parts.len() != 3 {
+        return None;
+    }
+
+    let item_index = parts[1].parse::<usize>().ok()?;
+    let segment_number = parts[2].parse::<usize>().ok()?;
+
+    Some((item_index, segment_number))
+}
+
 async fn write_empty_master_playlist(index_path: &Path) -> anyhow::Result<()> {
     let content = "\
 #EXTM3U
 #EXT-X-VERSION:3
-#EXT-X-PLAYLIST-TYPE:EVENT
 #EXT-X-TARGETDURATION:4
 #EXT-X-MEDIA-SEQUENCE:0
 ";
@@ -777,6 +879,10 @@ pub async fn troozn_live_now(State(state): State<HttpGatewayState>) -> impl Into
     Json(state.live.current_now().await)
 }
 
+pub async fn troozn_live_producer(State(state): State<HttpGatewayState>) -> impl IntoResponse {
+    Json(state.live.producer_now().await)
+}
+
 pub async fn troozn_live_queue(State(state): State<HttpGatewayState>) -> impl IntoResponse {
     Json(json!({
         "items": state.live.current_queue().await
@@ -812,6 +918,10 @@ pub async fn troozn_live_file(
                 .into_response();
         }
     };
+
+    if relative.ends_with(".ts") {
+        state.live.note_segment_served(relative).await;
+    }
 
     let content_type = if relative.ends_with(".m3u8") {
         "application/vnd.apple.mpegurl"
