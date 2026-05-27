@@ -1,5 +1,5 @@
 use axum::extract::{Path as AxumPath, State};
-use axum::http::{header, StatusCode};
+use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
@@ -11,17 +11,26 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::fs;
 use tokio::process::Command;
+use tokio::sync::{Mutex, RwLock};
 
 use crate::HttpGatewayState;
 
 const DEFAULT_LIMIT: usize = 20;
 const MAX_LIMIT: usize = 100;
 
+// Important : on privilégie les flux MP4 progressifs HTTPS.
+// Ça évite autant que possible de donner à Kodi un manifest HLS index.m3u8.
+// Fallback HLS conservé si YouTube ne propose pas de MP4 progressif compatible.
 const YTDLP_FAST_FORMAT: &str =
-    "best[height<=720][ext=mp4][vcodec^=avc1][acodec^=mp4a]/\
-     best[height<=720][ext=mp4]/\
-     best[ext=mp4]/\
+    "best[height<=720][ext=mp4][vcodec^=avc1][acodec^=mp4a][protocol^=https]/\
+     best[height<=720][ext=mp4][protocol^=https]/\
+     best[ext=mp4][protocol^=https]/\
+     best[height<=720]/\
      best";
+
+// Durée courte : les URLs YouTube expirent.
+// 15 minutes suffit pour absorber les HEAD/GET/probes de Kodi sans garder une URL trop vieille.
+const RESOLVED_URL_CACHE_SECONDS: u64 = 15 * 60;
 
 #[derive(Debug, Clone)]
 pub struct YoutubeLibrary {
@@ -30,6 +39,20 @@ pub struct YoutubeLibrary {
     pub current_dir: PathBuf,
     pub public_base_url: String,
     pub ytdlp_bin: PathBuf,
+
+    // Cache mémoire : item_id -> URL finale déjà résolue par yt-dlp -g.
+    // Évite que Kodi déclenche plusieurs yt-dlp pour HEAD/GET/probe/retry.
+    resolved_cache: Arc<RwLock<HashMap<String, ResolvedUrlCache>>>,
+
+    // Verrou par item : si plusieurs requêtes arrivent en même temps,
+    // un seul yt-dlp tourne pour cet item.
+    resolve_locks: Arc<RwLock<HashMap<String, Arc<Mutex<()>>>>>,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedUrlCache {
+    url: String,
+    expires_at: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -85,10 +108,8 @@ impl YoutubeLibrary {
     pub fn new_default(http_bind: &str) -> Self {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
 
-        let public_base_url = if http_bind.starts_with("127.0.0.1:")
-            || http_bind.starts_with("localhost:")
-        {
-            format!("http://{http_bind}")
+        let public_base_url = if http_bind.starts_with("http://") || http_bind.starts_with("https://") {
+            http_bind.trim_end_matches('/').to_string()
         } else {
             format!("http://{http_bind}")
         };
@@ -105,6 +126,8 @@ impl YoutubeLibrary {
             ytdlp_bin: PathBuf::from(
                 std::env::var("TROOZN_YTDLP").unwrap_or_else(|_| "/usr/local/bin/yt-dlp".to_string()),
             ),
+            resolved_cache: Arc::new(RwLock::new(HashMap::new())),
+            resolve_locks: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -125,13 +148,16 @@ impl YoutubeLibrary {
         }
 
         fs::create_dir_all(&self.current_dir).await?;
+
+        // Quand on génère une nouvelle queue, les anciens item_id ne doivent plus polluer le cache.
+        self.resolved_cache.write().await.clear();
+
         Ok(())
     }
 
     async fn load_db(&self) -> HashMap<String, YoutubeItem> {
         match fs::read_to_string(&self.db_path).await {
-            Ok(text) => serde_json::from_str::<HashMap<String, YoutubeItem>>(&text)
-                .unwrap_or_default(),
+            Ok(text) => serde_json::from_str::<HashMap<String, YoutubeItem>>(&text).unwrap_or_default(),
             Err(_) => HashMap::new(),
         }
     }
@@ -156,11 +182,12 @@ impl YoutubeLibrary {
         }
 
         if playlist {
+            let limit_text = limit.to_string();
             cmd.args([
                 "--flat-playlist",
                 "--no-warnings",
                 "--playlist-end",
-                &limit.to_string(),
+                limit_text.as_str(),
                 "-J",
                 url,
             ]);
@@ -206,13 +233,18 @@ impl YoutubeLibrary {
 
         let stdout = String::from_utf8_lossy(&output.stdout);
 
-        let first_url = stdout
+        let urls = stdout
             .lines()
             .map(str::trim)
-            .find(|line| line.starts_with("http://") || line.starts_with("https://"))
-            .map(str::to_string);
+            .filter(|line| line.starts_with("http://") || line.starts_with("https://"))
+            .map(str::to_string)
+            .collect::<Vec<_>>();
 
-        first_url.ok_or_else(|| anyhow::anyhow!("yt-dlp returned no playable URL"))
+        let Some(first_url) = urls.first() else {
+            anyhow::bail!("yt-dlp returned no playable URL");
+        };
+
+        Ok(first_url.clone())
     }
 
     pub async fn submit(&self, url: String, limit: usize) -> anyhow::Result<YoutubeSubmitResponse> {
@@ -277,10 +309,7 @@ impl YoutubeLibrary {
 
         let strm_path = self.current_dir.join(format!("{base}.strm"));
         let nfo_path = self.current_dir.join(format!("{base}.nfo"));
-        let thumb_path = meta
-            .thumbnail
-            .as_ref()
-            .map(|_| self.current_dir.join(format!("{base}-thumb.jpg")));
+        let thumb_path = meta.thumbnail.as_ref().map(|_| self.current_dir.join(format!("{base}-thumb.jpg")));
 
         let play_url = format!("{}/youtube/item/{}/play", self.public_base_url, item_id);
 
@@ -330,13 +359,69 @@ impl YoutubeLibrary {
     }
 
     pub async fn play_redirect(&self, item_id: &str) -> anyhow::Result<String> {
+        let now = unix_timestamp();
+
+        {
+            let cache = self.resolved_cache.read().await;
+            if let Some(entry) = cache.get(item_id) {
+                if entry.expires_at > now {
+                    eprintln!("youtube cache hit item={item_id}");
+                    return Ok(entry.url.clone());
+                }
+            }
+        }
+
+        let lock = self.resolve_lock_for(item_id).await;
+        let _guard = lock.lock().await;
+
+        // Double check après acquisition du verrou.
+        {
+            let cache = self.resolved_cache.read().await;
+            if let Some(entry) = cache.get(item_id) {
+                if entry.expires_at > unix_timestamp() {
+                    eprintln!("youtube cache hit after lock item={item_id}");
+                    return Ok(entry.url.clone());
+                }
+            }
+        }
+
         let db = self.load_db().await;
 
         let item = db
             .get(item_id)
             .ok_or_else(|| anyhow::anyhow!("unknown YouTube item: {item_id}"))?;
 
-        self.ytdlp_play_url(&item.source_url).await
+        eprintln!("youtube resolving via yt-dlp item={item_id} title={}", item.title);
+
+        let url = self.ytdlp_play_url(&item.source_url).await?;
+
+        {
+            let mut cache = self.resolved_cache.write().await;
+            cache.insert(
+                item_id.to_string(),
+                ResolvedUrlCache {
+                    url: url.clone(),
+                    expires_at: unix_timestamp() + RESOLVED_URL_CACHE_SECONDS,
+                },
+            );
+        }
+
+        Ok(url)
+    }
+
+    async fn resolve_lock_for(&self, item_id: &str) -> Arc<Mutex<()>> {
+        {
+            let locks = self.resolve_locks.read().await;
+            if let Some(lock) = locks.get(item_id) {
+                return lock.clone();
+            }
+        }
+
+        let mut locks = self.resolve_locks.write().await;
+        locks
+            .entry(item_id.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
     }
 
     pub async fn items(&self) -> HashMap<String, YoutubeItem> {
@@ -393,26 +478,21 @@ pub async fn youtube_play(
         Ok(target) => {
             let mut response = StatusCode::FOUND.into_response();
 
-            response.headers_mut().insert(
-                header::LOCATION,
-                match target.parse() {
-                    Ok(value) => value,
-                    Err(_) => {
-                        return (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            Json(json!({
-                                "ok": false,
-                                "error": "invalid redirect URL"
-                            })),
-                        )
-                            .into_response();
-                    }
-                },
-            );
+            let Ok(location) = HeaderValue::from_str(&target) else {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({
+                        "ok": false,
+                        "error": "invalid redirect URL"
+                    })),
+                )
+                    .into_response();
+            };
 
+            response.headers_mut().insert(header::LOCATION, location);
             response.headers_mut().insert(
                 header::CACHE_CONTROL,
-                header::HeaderValue::from_static("no-store"),
+                HeaderValue::from_static("no-store"),
             );
 
             response
@@ -658,6 +738,7 @@ fn xml_escape(value: &str) -> String {
 
 fn compact_text(value: &str, max_chars: usize) -> String {
     let mut text = value.replace("\r\n", "\n").replace('\r', "\n");
+
     while text.contains("\n\n\n") {
         text = text.replace("\n\n\n", "\n\n");
     }
