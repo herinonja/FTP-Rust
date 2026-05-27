@@ -17,3 +17,5 @@ async-trait = "0.1"
 libunftp = "0.23"
 unftp-core = "0.1"
 wtransport = "0.1.13"
+sha1 = "0.10"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }

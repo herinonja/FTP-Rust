@@ -27,6 +27,8 @@ use unftp_core::storage::{Error, ErrorKind, Fileinfo, StorageBackend, FEATURE_RE
 use wtransport::tls::Sha256DigestFmt;
 use wtransport::{Connection, Endpoint, Identity, ServerConfig};
 
+mod youtube_library;
+
 const DEFAULT_FTP_BIND: &str = "127.0.0.1:2120";
 const DEFAULT_HTTP_BIND: &str = "127.0.0.1:8787";
 const DEFAULT_UPNP_BIND: &str = "0.0.0.0:8788";
@@ -66,6 +68,7 @@ struct HeadCache {
 struct HttpGatewayState {
     registry: Registry,
     cache: Arc<HeadCache>,
+    youtube: Arc<youtube_library::YoutubeLibrary>,
 }
 
 #[derive(Debug, Clone)]
@@ -755,15 +758,25 @@ async fn run_http_media_gateway(
     tokio::fs::create_dir_all(&cache.dir)
         .await
         .with_context(|| format!("creation cache media {}", cache.dir.display()))?;
-    let state = HttpGatewayState { registry, cache };
+    let youtube = Arc::new(youtube_library::YoutubeLibrary::new_default(bind));
+    let state = HttpGatewayState {
+        registry,
+        cache,
+        youtube,
+    };
     let app = Router::new()
         .route("/health", get(http_health))
         .route("/media/*path", get(http_get_media).head(http_head_media))
+        .route("/youtube/health", get(youtube_library::youtube_health))
+        .route("/youtube/submit", post(youtube_library::youtube_submit))
+        .route("/youtube/item/:item_id/play", get(youtube_library::youtube_play))
+        .route("/youtube/items", get(youtube_library::youtube_items))
         .with_state(state);
     let listener = TcpListener::bind(bind)
         .await
         .with_context(|| format!("ecoute HTTP media {bind}"))?;
     println!("Serveur HTTP media TROOZN: http://{bind}/");
+    println!("Backend YouTube TROOZN: http://{bind}/youtube/health");
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -2384,6 +2397,7 @@ async fn write_proxy_status(status_path: &Path, bind: &str, cert_hash: &str) -> 
         "transport": "webtransport",
         "ftpBind": std::env::var("TROOZN_FTP_BIND").unwrap_or_else(|_| DEFAULT_FTP_BIND.into()),
         "httpBind": std::env::var("TROOZN_HTTP_BIND").unwrap_or_else(|_| DEFAULT_HTTP_BIND.into()),
+        "youtubeSubmit": format!("http://{}/youtube/submit", std::env::var("TROOZN_HTTP_BIND").unwrap_or_else(|_| DEFAULT_HTTP_BIND.into())),
         "upnpBind": std::env::var("TROOZN_UPNP_BIND").unwrap_or_else(|_| DEFAULT_UPNP_BIND.into()),
         "webTransportBind": bind,
         "webTransportPort": bind.rsplit(':').next().and_then(|value| value.parse::<u16>().ok()).unwrap_or(4433),
