@@ -767,10 +767,24 @@ async fn run_http_media_gateway(
     let app = Router::new()
         .route("/health", get(http_health))
         .route("/media/*path", get(http_get_media).head(http_head_media))
+
+        // TROOZN YouTube backend
         .route("/youtube/health", get(youtube_library::youtube_health))
         .route("/youtube/submit", post(youtube_library::youtube_submit))
-        .route("/youtube/item/:item_id/play", get(youtube_library::youtube_play))
         .route("/youtube/items", get(youtube_library::youtube_items))
+
+        // Ancienne route conservée pour compatibilité
+        .route(
+            "/youtube/item/:item_id/play",
+            get(youtube_library::youtube_play).head(youtube_library::youtube_play_head),
+        )
+
+        // Nouvelle route recommandée : URL locale stable avec vrai nom de fichier
+        .route(
+            "/youtube/media/:item_id/:filename",
+            get(youtube_library::youtube_play_named).head(youtube_library::youtube_play_named_head),
+        )
+
         .with_state(state);
     let listener = TcpListener::bind(bind)
         .await
