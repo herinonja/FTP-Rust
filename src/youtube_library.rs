@@ -322,8 +322,9 @@ impl YoutubeLibrary {
         let nfo_path = self.current_dir.join(format!("{base}.nfo"));
         let thumb_path = meta.thumbnail.as_ref().map(|_| self.current_dir.join(format!("{base}-thumb.jpg")));
 
-        // Named URL so Kodi does not display the current item as simply "play".
-        let media_filename = media_url_filename(index, &meta.title);
+        // URL lisible sans encodage visible.
+        // Les métadonnées propres viennent du ListItem Kodi, du .nfo et du nom local.
+        let media_filename = media_slug_filename(index, &meta.title);
         let play_url = format!("{}/youtube/media/{}/{}", self.public_base_url, item_id, media_filename);
 
         let item = YoutubeItem {
@@ -759,27 +760,32 @@ fn sanitize_filename(name: &str, fallback: &str) -> String {
     }
 }
 
-fn media_url_filename(index: usize, title: &str) -> String {
-    let safe = sanitize_filename(title, &format!("video-{index:03}"));
-    let filename = format!("{index:03} - {safe}.mp4");
-    percent_encode_path_segment(&filename)
-}
-
-fn percent_encode_path_segment(value: &str) -> String {
+fn media_slug_filename(index: usize, title: &str) -> String {
     let mut out = String::new();
 
-    for byte in value.as_bytes() {
-        match *byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(*byte as char)
-            }
-            b' ' => out.push_str("%20"),
-            other => out.push_str(&format!("%{other:02X}")),
+    for ch in title.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch);
+        } else if ch == ' ' || ch == '-' || ch == '_' || ch == '.' {
+            out.push('-');
         }
     }
 
-    out
+    while out.contains("--") {
+        out = out.replace("--", "-");
+    }
+
+    let out = out.trim_matches('-');
+
+    if out.is_empty() {
+        format!("{index:03}-video.mp4")
+    } else {
+        let short = out.chars().take(96).collect::<String>();
+        format!("{index:03}-{short}.mp4")
+    }
 }
+
+
 
 fn movie_nfo_xml(item: &YoutubeItem) -> String {
     let title = xml_escape(&item.title);
