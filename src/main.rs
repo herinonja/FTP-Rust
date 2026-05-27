@@ -774,6 +774,7 @@ async fn run_http_media_gateway(
         .route("/troozn-live/health", get(troozn_live::troozn_live_health))
         .route("/troozn-live/submit", post(troozn_live::troozn_live_submit))
         .route("/troozn-live/now", get(troozn_live::troozn_live_now))
+        .route("/troozn-live/queue", get(troozn_live::troozn_live_queue))
         .route("/troozn-live/*path", get(troozn_live::troozn_live_file))
         .route("/youtube/health", get(youtube_library::youtube_health))
         .route("/youtube/submit", post(youtube_library::youtube_submit))
