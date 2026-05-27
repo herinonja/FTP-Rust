@@ -761,10 +761,12 @@ async fn run_http_media_gateway(
         .await
         .with_context(|| format!("creation cache media {}", cache.dir.display()))?;
     let youtube = Arc::new(youtube_library::YoutubeLibrary::new_default(bind));
+    let live = Arc::new(troozn_live::TrooznLive::new_default());
     let state = HttpGatewayState {
         registry,
         cache,
         youtube,
+        live,
     };
     let app = Router::new()
         .route("/health", get(http_health))
