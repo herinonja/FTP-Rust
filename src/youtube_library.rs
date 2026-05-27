@@ -18,9 +18,7 @@ use crate::HttpGatewayState;
 const DEFAULT_LIMIT: usize = 20;
 const MAX_LIMIT: usize = 100;
 
-// Important : on privilégie les flux MP4 progressifs HTTPS.
-// Ça évite autant que possible de donner à Kodi un manifest HLS index.m3u8.
-// Fallback HLS conservé si YouTube ne propose pas de MP4 progressif compatible.
+// Prefer progressive HTTPS MP4 for Kodi. HLS is kept only as fallback.
 const YTDLP_FAST_FORMAT: &str =
     "best[height<=720][ext=mp4][vcodec^=avc1][acodec^=mp4a][protocol^=https]/\
      best[height<=720][ext=mp4][protocol^=https]/\
@@ -28,9 +26,12 @@ const YTDLP_FAST_FORMAT: &str =
      best[height<=720]/\
      best";
 
-// Durée courte : les URLs YouTube expirent.
-// 15 minutes suffit pour absorber les HEAD/GET/probes de Kodi sans garder une URL trop vieille.
+// Short cache for YouTube temporary URLs. Long enough for Kodi HEAD/GET/probes,
+// short enough to avoid keeping expired googlevideo URLs.
 const RESOLVED_URL_CACHE_SECONDS: u64 = 15 * 60;
+
+// Items to pre-resolve after the first one. Keep low on Radxa Zero 3W.
+const BACKGROUND_PRERESOLVE_COUNT: usize = 2;
 
 #[derive(Debug, Clone)]
 pub struct YoutubeLibrary {
@@ -40,12 +41,7 @@ pub struct YoutubeLibrary {
     pub public_base_url: String,
     pub ytdlp_bin: PathBuf,
 
-    // Cache mémoire : item_id -> URL finale déjà résolue par yt-dlp -g.
-    // Évite que Kodi déclenche plusieurs yt-dlp pour HEAD/GET/probe/retry.
     resolved_cache: Arc<RwLock<HashMap<String, ResolvedUrlCache>>>,
-
-    // Verrou par item : si plusieurs requêtes arrivent en même temps,
-    // un seul yt-dlp tourne pour cet item.
     resolve_locks: Arc<RwLock<HashMap<String, Arc<Mutex<()>>>>>,
 }
 
@@ -105,21 +101,6 @@ struct VideoMetadata {
 }
 
 impl YoutubeLibrary {
-    pub async fn cached_play_url(&self, item_id: &str) -> Option<String> {
-        let now = unix_timestamp();
-
-        let cache = self.resolved_cache.read().await;
-
-        cache.get(item_id).and_then(|entry| {
-            if entry.expires_at > now {
-                Some(entry.url.clone())
-            } else {
-                None
-            }
-        })
-    }
-
-
     pub fn new_default(http_bind: &str) -> Self {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
 
@@ -150,7 +131,6 @@ impl YoutubeLibrary {
         if let Some(parent) = self.db_path.parent() {
             fs::create_dir_all(parent).await?;
         }
-
         fs::create_dir_all(&self.current_dir).await?;
         Ok(())
     }
@@ -163,10 +143,7 @@ impl YoutubeLibrary {
         }
 
         fs::create_dir_all(&self.current_dir).await?;
-
-        // Quand on génère une nouvelle queue, les anciens item_id ne doivent plus polluer le cache.
         self.resolved_cache.write().await.clear();
-
         Ok(())
     }
 
@@ -179,13 +156,10 @@ impl YoutubeLibrary {
 
     async fn save_db(&self, db: &HashMap<String, YoutubeItem>) -> anyhow::Result<()> {
         self.ensure_dirs().await?;
-
         let tmp = self.db_path.with_extension("json.tmp");
         let text = serde_json::to_string_pretty(db)?;
-
         fs::write(&tmp, text).await?;
         fs::rename(tmp, &self.db_path).await?;
-
         Ok(())
     }
 
@@ -218,9 +192,7 @@ impl YoutubeLibrary {
         }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let value = serde_json::from_str::<Value>(&stdout)?;
-
-        Ok(value)
+        Ok(serde_json::from_str::<Value>(&stdout)?)
     }
 
     async fn ytdlp_play_url(&self, source_url: &str) -> anyhow::Result<String> {
@@ -247,19 +219,13 @@ impl YoutubeLibrary {
         }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-
-        let urls = stdout
+        let first_url = stdout
             .lines()
             .map(str::trim)
-            .filter(|line| line.starts_with("http://") || line.starts_with("https://"))
-            .map(str::to_string)
-            .collect::<Vec<_>>();
+            .find(|line| line.starts_with("http://") || line.starts_with("https://"))
+            .map(str::to_string);
 
-        let Some(first_url) = urls.first() else {
-            anyhow::bail!("yt-dlp returned no playable URL");
-        };
-
-        Ok(first_url.clone())
+        first_url.ok_or_else(|| anyhow::anyhow!("yt-dlp returned no playable URL"))
     }
 
     pub async fn submit(&self, url: String, limit: usize) -> anyhow::Result<YoutubeSubmitResponse> {
@@ -267,7 +233,6 @@ impl YoutubeLibrary {
 
         let limit = limit.clamp(1, MAX_LIMIT);
         let mut db = self.load_db().await;
-
         let mut metadata_list = Vec::new();
 
         if is_probably_playlist_url(&url) {
@@ -297,8 +262,11 @@ impl YoutubeLibrary {
             metadata_list.push(metadata_from_video_info(&value, &url));
         }
 
-        let mut items = Vec::new();
+        if metadata_list.is_empty() {
+            anyhow::bail!("yt-dlp returned no video entries");
+        }
 
+        let mut items = Vec::new();
         for (idx, meta) in metadata_list.into_iter().enumerate() {
             let item = self.create_library_item(idx + 1, meta).await?;
             db.insert(item.item_id.clone(), item.clone());
@@ -308,18 +276,32 @@ impl YoutubeLibrary {
         let playlist_path = self.write_playlist(&items).await?;
         self.save_db(&db).await?;
 
+        // Critical for Kodi startup speed: the first item must already be resolved.
         if let Some(first) = items.first() {
             match self.play_redirect(&first.item_id).await {
-                Ok(_) => {
-                    eprintln!("youtube first item pre-resolved item={}", first.item_id);
-                }
-                Err(err) => {
-                    eprintln!(
-                        "youtube first item pre-resolve failed item={} error={err:?}",
-                        first.item_id
-                    );
-                }
+                Ok(_) => eprintln!("youtube first item pre-resolved item={}", first.item_id),
+                Err(err) => eprintln!("youtube first item pre-resolve failed item={} error={err:?}", first.item_id),
             }
+        }
+
+        // Opportunistic background pre-resolve for the next items.
+        let background_ids = items
+            .iter()
+            .skip(1)
+            .take(BACKGROUND_PRERESOLVE_COUNT)
+            .map(|item| item.item_id.clone())
+            .collect::<Vec<_>>();
+
+        if !background_ids.is_empty() {
+            let youtube = self.clone();
+            tokio::spawn(async move {
+                for item_id in background_ids {
+                    match youtube.play_redirect(&item_id).await {
+                        Ok(_) => eprintln!("youtube background pre-resolved item={item_id}"),
+                        Err(err) => eprintln!("youtube background pre-resolve failed item={item_id} error={err:?}"),
+                    }
+                }
+            });
         }
 
         Ok(YoutubeSubmitResponse {
@@ -340,7 +322,9 @@ impl YoutubeLibrary {
         let nfo_path = self.current_dir.join(format!("{base}.nfo"));
         let thumb_path = meta.thumbnail.as_ref().map(|_| self.current_dir.join(format!("{base}-thumb.jpg")));
 
-        let play_url = format!("{}/youtube/item/{}/play", self.public_base_url, item_id);
+        // Named URL so Kodi does not display the current item as simply "play".
+        let media_filename = media_url_filename(index, &meta.title);
+        let play_url = format!("{}/youtube/media/{}/{}", self.public_base_url, item_id, media_filename);
 
         let item = YoutubeItem {
             item_id,
@@ -374,7 +358,6 @@ impl YoutubeLibrary {
 
     async fn write_playlist(&self, items: &[YoutubeItem]) -> anyhow::Result<PathBuf> {
         let playlist_path = self.current_dir.join("playlist.m3u8");
-
         let mut text = String::from("#EXTM3U\n");
 
         for item in items {
@@ -385,6 +368,19 @@ impl YoutubeLibrary {
 
         fs::write(&playlist_path, text).await?;
         Ok(playlist_path)
+    }
+
+    pub async fn cached_play_url(&self, item_id: &str) -> Option<String> {
+        let now = unix_timestamp();
+        let cache = self.resolved_cache.read().await;
+
+        cache.get(item_id).and_then(|entry| {
+            if entry.expires_at > now {
+                Some(entry.url.clone())
+            } else {
+                None
+            }
+        })
     }
 
     pub async fn play_redirect(&self, item_id: &str) -> anyhow::Result<String> {
@@ -403,7 +399,7 @@ impl YoutubeLibrary {
         let lock = self.resolve_lock_for(item_id).await;
         let _guard = lock.lock().await;
 
-        // Double check après acquisition du verrou.
+        // Double-check after acquiring the per-item lock.
         {
             let cache = self.resolved_cache.read().await;
             if let Some(entry) = cache.get(item_id) {
@@ -415,13 +411,11 @@ impl YoutubeLibrary {
         }
 
         let db = self.load_db().await;
-
         let item = db
             .get(item_id)
             .ok_or_else(|| anyhow::anyhow!("unknown YouTube item: {item_id}"))?;
 
         eprintln!("youtube resolving via yt-dlp item={item_id} title={}", item.title);
-
         let url = self.ytdlp_play_url(&item.source_url).await?;
 
         {
@@ -503,7 +497,32 @@ pub async fn youtube_play(
     State(state): State<HttpGatewayState>,
     AxumPath(item_id): AxumPath<String>,
 ) -> Response {
-    match state.youtube.play_redirect(&item_id).await {
+    youtube_play_inner(state.youtube.clone(), item_id).await
+}
+
+pub async fn youtube_play_head(
+    State(state): State<HttpGatewayState>,
+    AxumPath(item_id): AxumPath<String>,
+) -> Response {
+    youtube_play_head_inner(state.youtube.clone(), item_id).await
+}
+
+pub async fn youtube_play_named(
+    State(state): State<HttpGatewayState>,
+    AxumPath((item_id, _filename)): AxumPath<(String, String)>,
+) -> Response {
+    youtube_play_inner(state.youtube.clone(), item_id).await
+}
+
+pub async fn youtube_play_named_head(
+    State(state): State<HttpGatewayState>,
+    AxumPath((item_id, _filename)): AxumPath<(String, String)>,
+) -> Response {
+    youtube_play_head_inner(state.youtube.clone(), item_id).await
+}
+
+async fn youtube_play_inner(youtube: Arc<YoutubeLibrary>, item_id: String) -> Response {
+    match youtube.play_redirect(&item_id).await {
         Ok(target) => {
             let mut response = StatusCode::FOUND.into_response();
 
@@ -519,11 +538,8 @@ pub async fn youtube_play(
             };
 
             response.headers_mut().insert(header::LOCATION, location);
-            response.headers_mut().insert(
-                header::CACHE_CONTROL,
-                HeaderValue::from_static("no-store"),
-            );
-
+            response.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            response.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("video/mp4"));
             response
         }
         Err(err) => (
@@ -537,11 +553,8 @@ pub async fn youtube_play(
     }
 }
 
-pub async fn youtube_play_head(
-    State(state): State<HttpGatewayState>,
-    AxumPath(item_id): AxumPath<String>,
-) -> Response {
-    match state.youtube.cached_play_url(&item_id).await {
+async fn youtube_play_head_inner(youtube: Arc<YoutubeLibrary>, item_id: String) -> Response {
+    match youtube.cached_play_url(&item_id).await {
         Some(target) => {
             let mut response = StatusCode::FOUND.into_response();
 
@@ -549,38 +562,16 @@ pub async fn youtube_play_head(
                 response.headers_mut().insert(header::LOCATION, location);
             }
 
-            response.headers_mut().insert(
-                header::CACHE_CONTROL,
-                HeaderValue::from_static("no-store"),
-            );
-
-            response.headers_mut().insert(
-                header::CONTENT_TYPE,
-                HeaderValue::from_static("video/mp4"),
-            );
-
+            response.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            response.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("video/mp4"));
             response
         }
         None => {
-            // Important : ne jamais lancer yt-dlp sur HEAD.
-            // Kodi fait souvent HEAD/Stat avant Open.
+            // Never spawn yt-dlp on HEAD. Kodi uses HEAD/Stat/GetMimeType before Open.
             let mut response = StatusCode::OK.into_response();
-
-            response.headers_mut().insert(
-                header::CONTENT_TYPE,
-                HeaderValue::from_static("video/mp4"),
-            );
-
-            response.headers_mut().insert(
-                header::ACCEPT_RANGES,
-                HeaderValue::from_static("bytes"),
-            );
-
-            response.headers_mut().insert(
-                header::CACHE_CONTROL,
-                HeaderValue::from_static("no-store"),
-            );
-
+            response.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("video/mp4"));
+            response.headers_mut().insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+            response.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
             response
         }
     }
@@ -614,7 +605,6 @@ async fn download_thumbnail(url: &str, path: &Path) -> anyhow::Result<()> {
 
     let bytes = response.bytes().await?;
     fs::write(path, bytes).await?;
-
     Ok(())
 }
 
@@ -719,11 +709,7 @@ fn youtube_mix_seed_url(url: &str) -> Option<String> {
     let start = index + list_marker.len();
 
     let rest = &url[start..];
-    let seed = rest
-        .split(['&', '#'])
-        .next()
-        .unwrap_or("")
-        .trim();
+    let seed = rest.split(['&', '#']).next().unwrap_or("").trim();
 
     if seed.len() >= 8 {
         Some(youtube_watch_url(seed))
@@ -771,6 +757,28 @@ fn sanitize_filename(name: &str, fallback: &str) -> String {
     } else {
         output.chars().take(140).collect()
     }
+}
+
+fn media_url_filename(index: usize, title: &str) -> String {
+    let safe = sanitize_filename(title, &format!("video-{index:03}"));
+    let filename = format!("{index:03} - {safe}.mp4");
+    percent_encode_path_segment(&filename)
+}
+
+fn percent_encode_path_segment(value: &str) -> String {
+    let mut out = String::new();
+
+    for byte in value.as_bytes() {
+        match *byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*byte as char)
+            }
+            b' ' => out.push_str("%20"),
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+
+    out
 }
 
 fn movie_nfo_xml(item: &YoutubeItem) -> String {
