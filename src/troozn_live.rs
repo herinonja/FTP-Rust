@@ -287,7 +287,6 @@ impl TrooznLive {
             cmd.args([
                 "-hide_banner",
                 "-y",
-                "-re",
                 "-i",
                 &play_url,
                 "-c",
