@@ -2,7 +2,6 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
-use sha1::{Digest, Sha1};
 use axum::body::Body;
 use axum::extract::{Path as AxumPath, State};
 use axum::http::{header, HeaderValue, StatusCode};
@@ -10,6 +9,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha1::{Digest, Sha1};
 use tokio::fs;
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
@@ -23,9 +23,8 @@ const MAX_ITEMS: usize = 20;
 
 const PUBLIC_HLS_URL: &str = "http://127.0.0.1:8787/troozn-live/playlist-youtube.m3u8";
 
-// Priorité 720p progressif H.264/AAC.
-// 22 = 720p MP4 progressif quand disponible.
-// 18 = MP4 progressif fallback, souvent 360p.
+// 22 = MP4 progressif 720p H.264 + AAC quand disponible.
+// 18 = fallback MP4 progressif, souvent 360p.
 const YTDLP_720_FORMAT: &str =
     "22/best[ext=mp4][vcodec^=avc1][acodec^=mp4a][height<=720]/18";
 
@@ -35,6 +34,7 @@ pub struct TrooznLive {
     ffmpeg_child: Mutex<Option<Child>>,
     now: Mutex<TrooznLiveNow>,
     queue: Mutex<Vec<TrooznLiveItem>>,
+    master_entries: Mutex<Vec<MasterEntry>>,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -67,6 +67,15 @@ pub struct TrooznLiveItem {
     pub channel: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct MasterEntry {
+    item_index: usize,
+    duration: String,
+    program_date_time: Option<String>,
+    segment: String,
+    discontinuity_before: bool,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct TrooznLiveSubmitRequest {
     pub url: String,
@@ -95,6 +104,7 @@ impl TrooznLive {
                 ..Default::default()
             }),
             queue: Mutex::new(Vec::new()),
+            master_entries: Mutex::new(Vec::new()),
         }
     }
 
@@ -128,6 +138,11 @@ impl TrooznLive {
     ) -> anyhow::Result<TrooznLiveSubmitResponse> {
         self.stop_current_ffmpeg().await;
         self.ensure_clean_dir().await?;
+
+        {
+            let mut entries = self.master_entries.lock().await;
+            entries.clear();
+        }
 
         let limit = limit.clamp(1, MAX_ITEMS);
         let items = extract_youtube_items(source_url, limit).await?;
@@ -170,9 +185,6 @@ impl TrooznLive {
             }
         });
 
-        // Important :
-        // /submit répond immédiatement après démarrage du worker.
-        // default.py/Kodi attendra ensuite que index.m3u8 existe réellement.
         let now = self.current_now().await;
 
         Ok(TrooznLiveSubmitResponse {
@@ -189,8 +201,10 @@ impl TrooznLive {
         self: std::sync::Arc<Self>,
         items: Vec<TrooznLiveItem>,
     ) -> anyhow::Result<()> {
-        let mut appended_any = false;
         let stream_started_at = unix_timestamp();
+        let mut appended_any = false;
+
+        write_empty_master_playlist(&self.root_dir.join("index.m3u8")).await?;
 
         for item in items.iter() {
             let next_title = items
@@ -230,12 +244,7 @@ impl TrooznLive {
                     );
 
                     let mut guard = self.now.lock().await;
-                    guard.last_error = Some(format!(
-                        "Item ignoré: {} - {}",
-                        item.title,
-                        err
-                    ));
-
+                    guard.last_error = Some(format!("Item ignoré: {} - {}", item.title, err));
                     continue;
                 }
             };
@@ -262,21 +271,15 @@ impl TrooznLive {
                 };
             }
 
-            let index_path = self.root_dir.join("index.m3u8");
-            let segment_pattern = self.root_dir.join("seg-%05d.ts");
-            let start_number = next_segment_number(&self.root_dir).await.unwrap_or(0);
-
-            // Première vidéo : pas de DISCONTINUITY.
-            // Vidéos suivantes : FFmpeg ajoute DISCONTINUITY au début de ce nouvel append.
-            let hls_flags = if appended_any {
-                "append_list+omit_endlist+program_date_time+discont_start".to_string()
-            } else {
-                "append_list+omit_endlist+program_date_time".to_string()
-            };
+            let item_prefix = format!("item-{:04}", item.index);
+            let item_manifest = self.root_dir.join(format!("{item_prefix}.m3u8"));
+            let segment_pattern = self.root_dir.join(format!("{item_prefix}-%05d.ts"));
 
             eprintln!(
-                "TROOZN_LIVE_FFMPEG_START index={} title={} start_number={} flags={}",
-                item.index, item.title, start_number, hls_flags
+                "TROOZN_LIVE_FFMPEG_START index={} title={} manifest={}",
+                item.index,
+                item.title,
+                item_manifest.display()
             );
 
             let mut cmd = Command::new("ffmpeg");
@@ -295,38 +298,49 @@ impl TrooznLive {
                 "4",
                 "-hls_list_size",
                 "0",
-                "-start_number",
-                &start_number.to_string(),
                 "-hls_flags",
-                &hls_flags,
+                "omit_endlist+program_date_time",
                 "-hls_segment_filename",
             ]);
 
             cmd.arg(segment_pattern.to_string_lossy().to_string());
-            cmd.arg(index_path.to_string_lossy().to_string());
+            cmd.arg(item_manifest.to_string_lossy().to_string());
 
             cmd.stdout(std::process::Stdio::null());
             cmd.stderr(std::process::Stdio::inherit());
 
-            let child = cmd.spawn().context("lancement ffmpeg HLS live")?;
+            let child = cmd.spawn().context("lancement ffmpeg HLS item")?;
 
             {
                 let mut guard = self.ffmpeg_child.lock().await;
                 *guard = Some(child);
             }
 
-            appended_any = true;
+            let mut imported_segments = 0_usize;
 
             loop {
                 sleep(Duration::from_millis(500)).await;
-
-                normalize_hls_event_playlist(&index_path).await.ok();
 
                 {
                     let mut now = self.now.lock().await;
                     if now.item_id == item.item_id && now.item_started_at > 0 {
                         now.position = unix_timestamp().saturating_sub(now.item_started_at);
                     }
+                }
+
+                let new_count = self
+                    .import_item_manifest_incremental(
+                        item.index,
+                        &item_manifest,
+                        appended_any,
+                    )
+                    .await
+                    .unwrap_or(imported_segments);
+
+                if new_count > imported_segments {
+                    imported_segments = new_count;
+                    appended_any = true;
+                    self.rewrite_master_playlist(false).await.ok();
                 }
 
                 let finished = {
@@ -357,19 +371,108 @@ impl TrooznLive {
                 };
 
                 if finished {
-                    normalize_hls_event_playlist(&index_path).await.ok();
+                    let final_count = self
+                        .import_item_manifest_incremental(item.index, &item_manifest, appended_any)
+                        .await
+                        .unwrap_or(imported_segments);
+
+                    if final_count > imported_segments {
+                        appended_any = true;
+                    }
+
+                    self.rewrite_master_playlist(false).await.ok();
                     break;
                 }
             }
         }
 
-        finalize_playlist(&self.root_dir.join("index.m3u8")).await.ok();
+        self.rewrite_master_playlist(true).await.ok();
 
         {
             let mut guard = self.now.lock().await;
             guard.state = "ended".to_string();
         }
 
+        Ok(())
+    }
+
+    async fn import_item_manifest_incremental(
+        &self,
+        item_index: usize,
+        item_manifest: &Path,
+        has_previous_item: bool,
+    ) -> anyhow::Result<usize> {
+        let content = match fs::read_to_string(item_manifest).await {
+            Ok(content) => content,
+            Err(_) => return Ok(0),
+        };
+
+        let parsed = parse_item_hls_entries(item_index, &content, has_previous_item);
+        let parsed_count = parsed.len();
+
+        if parsed.is_empty() {
+            return Ok(0);
+        }
+
+        let mut entries = self.master_entries.lock().await;
+
+        let existing_for_item = entries.iter().filter(|e| e.item_index == item_index).count();
+
+        if parsed_count <= existing_for_item {
+            return Ok(existing_for_item);
+        }
+
+        for entry in parsed.into_iter().skip(existing_for_item) {
+            entries.push(entry);
+        }
+
+        Ok(parsed_count)
+    }
+
+    async fn rewrite_master_playlist(&self, ended: bool) -> anyhow::Result<()> {
+        let entries = self.master_entries.lock().await.clone();
+        let index_path = self.root_dir.join("index.m3u8");
+
+        let mut target_duration = 4_u64;
+
+        for entry in &entries {
+            if let Ok(v) = entry.duration.parse::<f64>() {
+                let ceil = v.ceil() as u64;
+                if ceil > target_duration {
+                    target_duration = ceil;
+                }
+            }
+        }
+
+        let mut out = String::new();
+        out.push_str("#EXTM3U\n");
+        out.push_str("#EXT-X-VERSION:3\n");
+        out.push_str("#EXT-X-PLAYLIST-TYPE:EVENT\n");
+        out.push_str(&format!("#EXT-X-TARGETDURATION:{target_duration}\n"));
+        out.push_str("#EXT-X-MEDIA-SEQUENCE:0\n");
+
+        let mut discontinuity_seen_for_item = std::collections::HashSet::new();
+
+        for entry in entries {
+            if entry.discontinuity_before && discontinuity_seen_for_item.insert(entry.item_index) {
+                out.push_str("#EXT-X-DISCONTINUITY\n");
+            }
+
+            out.push_str(&format!("#EXTINF:{},\n", entry.duration));
+
+            if let Some(pdt) = entry.program_date_time {
+                out.push_str(&format!("#EXT-X-PROGRAM-DATE-TIME:{pdt}\n"));
+            }
+
+            out.push_str(&entry.segment);
+            out.push('\n');
+        }
+
+        if ended {
+            out.push_str("#EXT-X-ENDLIST\n");
+        }
+
+        fs::write(index_path, out).await?;
         Ok(())
     }
 
@@ -386,6 +489,66 @@ impl TrooznLive {
     pub async fn current_queue(&self) -> Vec<TrooznLiveItem> {
         self.queue.lock().await.clone()
     }
+}
+
+fn parse_item_hls_entries(
+    item_index: usize,
+    content: &str,
+    has_previous_item: bool,
+) -> Vec<MasterEntry> {
+    let mut out = Vec::new();
+
+    let mut pending_duration: Option<String> = None;
+    let mut pending_program_date_time: Option<String> = None;
+
+    for raw in content.lines() {
+        let line = raw.trim();
+
+        if let Some(rest) = line.strip_prefix("#EXTINF:") {
+            let duration = rest.trim_end_matches(',').trim().to_string();
+            pending_duration = Some(duration);
+            continue;
+        }
+
+        if let Some(rest) = line.strip_prefix("#EXT-X-PROGRAM-DATE-TIME:") {
+            pending_program_date_time = Some(rest.trim().to_string());
+            continue;
+        }
+
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        if !line.ends_with(".ts") {
+            continue;
+        }
+
+        let duration = pending_duration.take().unwrap_or_else(|| "4.000000".to_string());
+        let program_date_time = pending_program_date_time.take();
+
+        out.push(MasterEntry {
+            item_index,
+            duration,
+            program_date_time,
+            segment: line.to_string(),
+            discontinuity_before: has_previous_item && out.is_empty(),
+        });
+    }
+
+    out
+}
+
+async fn write_empty_master_playlist(index_path: &Path) -> anyhow::Result<()> {
+    let content = "\
+#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-PLAYLIST-TYPE:EVENT
+#EXT-X-TARGETDURATION:4
+#EXT-X-MEDIA-SEQUENCE:0
+";
+
+    fs::write(index_path, content).await?;
+    Ok(())
 }
 
 async fn extract_youtube_items(source_url: &str, limit: usize) -> anyhow::Result<Vec<TrooznLiveItem>> {
@@ -552,103 +715,6 @@ async fn add_ytdlp_common_args(cmd: &mut Command) {
             "ejs:github",
         ]);
     }
-}
-
-async fn next_segment_number(root_dir: &Path) -> anyhow::Result<u64> {
-    let mut max_seen: Option<u64> = None;
-
-    let mut rd = match fs::read_dir(root_dir).await {
-        Ok(rd) => rd,
-        Err(_) => return Ok(0),
-    };
-
-    while let Some(entry) = rd.next_entry().await? {
-        let name = entry.file_name().to_string_lossy().to_string();
-
-        if !name.starts_with("seg-") || !name.ends_with(".ts") {
-            continue;
-        }
-
-        let number_text = name
-            .trim_start_matches("seg-")
-            .trim_end_matches(".ts");
-
-        if let Ok(n) = number_text.parse::<u64>() {
-            max_seen = Some(max_seen.map_or(n, |m| m.max(n)));
-        }
-    }
-
-    Ok(max_seen.map_or(0, |n| n + 1))
-}
-
-async fn normalize_hls_event_playlist(index_path: &Path) -> anyhow::Result<()> {
-    let content = match fs::read_to_string(index_path).await {
-        Ok(content) => content,
-        Err(_) => return Ok(()),
-    };
-
-    if !content.contains("#EXTM3U") {
-        return Ok(());
-    }
-
-    let mut lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
-
-    // Ajoute PLAYLIST-TYPE:EVENT juste après EXT-X-VERSION.
-    if !lines.iter().any(|l| l.starts_with("#EXT-X-PLAYLIST-TYPE:")) {
-        if let Some(pos) = lines.iter().position(|l| l.starts_with("#EXT-X-VERSION:")) {
-            lines.insert(pos + 1, "#EXT-X-PLAYLIST-TYPE:EVENT".to_string());
-        }
-    }
-
-    // Supprime une ou plusieurs discontinuités accidentelles avant le premier segment.
-    // Cas typique à éviter :
-    // #EXT-X-MEDIA-SEQUENCE:0
-    // #EXT-X-DISCONTINUITY
-    // #EXTINF:...
-    loop {
-        let first_extinf = lines.iter().position(|l| l.starts_with("#EXTINF:"));
-        let first_discontinuity = lines
-            .iter()
-            .position(|l| l.trim() == "#EXT-X-DISCONTINUITY");
-
-        match (first_discontinuity, first_extinf) {
-            (Some(d), Some(e)) if d < e => {
-                lines.remove(d);
-            }
-            _ => break,
-        }
-    }
-
-    let updated = lines.join("\n") + "\n";
-
-    if updated != content {
-        fs::write(index_path, updated).await?;
-    }
-
-    Ok(())
-}
-
-async fn finalize_playlist(index_path: &Path) -> anyhow::Result<()> {
-    normalize_hls_event_playlist(index_path).await.ok();
-
-    let content = match fs::read_to_string(index_path).await {
-        Ok(content) => content,
-        Err(_) => return Ok(()),
-    };
-
-    if content.contains("#EXT-X-ENDLIST") {
-        return Ok(());
-    }
-
-    let mut updated = content;
-
-    if !updated.ends_with('\n') {
-        updated.push('\n');
-    }
-
-    updated.push_str("#EXT-X-ENDLIST\n");
-    fs::write(index_path, updated).await?;
-    Ok(())
 }
 
 fn item_id_for_url(url: &str) -> String {
