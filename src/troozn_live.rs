@@ -21,12 +21,12 @@ use crate::HttpGatewayState;
 const LIVE_DIR: &str = "/home/troozn/.kodi/userdata/TROOZN/live";
 const YTDLP_BIN: &str = "/usr/local/bin/yt-dlp";
 const MAX_ITEMS: usize = 20;
-const MAX_PRODUCER_AHEAD_ITEMS: usize = 1;
+const MAX_PRODUCER_AHEAD_ITEMS: usize = 20;
 
 const PUBLIC_HLS_URL: &str = "http://127.0.0.1:8787/troozn-live/playlist-youtube.m3u8";
 
 const YTDLP_720_FORMAT: &str =
-    "22/best[ext=mp4][vcodec^=avc1][acodec^=mp4a][height<=720]/18";
+    "96/95/94/93/22/18/best[height<=1080]";
 
 #[derive(Debug)]
 pub struct TrooznLive {
@@ -579,52 +579,11 @@ Lecture annulée pour éviter l'arrêt après une seule vidéo. Partage une vrai
         enriched
     }
 
-    async fn wait_until_future_buffer_needed(&self, next_item_index: usize) {
-        if next_item_index <= 1 {
-            return;
-        }
-
-        loop {
-            let playback = self.playback_now.lock().await.clone();
-
-            // Si Kodi n'a pas encore commencé à demander des segments,
-            // on prend item 1 comme base. Ça autorise la préparation d'un
-            // futur item jouable avant le démarrage réel de Kodi.
-            let base_index = if playback.index == 0 {
-                1
-            } else {
-                playback.index
-            };
-
-            let entries = self.master_entries.lock().await.clone();
-
-            let mut future_items = std::collections::HashSet::new();
-
-            for entry in entries.iter() {
-                if entry.item_index > base_index {
-                    future_items.insert(entry.item_index);
-                }
-            }
-
-            // Important :
-            // On limite l'avance aux items réellement segmentés.
-            // Si item 2 est bloqué/ignoré et ne produit aucun segment,
-            // item 3 reste autorisé.
-            if future_items.len() < MAX_PRODUCER_AHEAD_ITEMS {
-                return;
-            }
-
-            {
-                let mut producer = self.producer_now.lock().await;
-                producer.state = "waiting".to_string();
-                producer.last_error = Some(format!(
-                    "Buffer futur déjà prêt: base item {}, futurs prêts {:?}, prochain item {}",
-                    base_index, future_items, next_item_index
-                ));
-            }
-
-            sleep(Duration::from_millis(1000)).await;
-        }
+    async fn wait_until_future_buffer_needed(&self, _next_item_index: usize) {
+        // Producteur rapide :
+        // on ne bloque plus sur l'item actuellement lu par Kodi.
+        // La limite réelle reste MAX_ITEMS + stockage disque hors /tmp.
+        return;
     }
 
     async fn import_item_manifest_incremental(
@@ -1438,7 +1397,7 @@ pub async fn troozn_live_health() -> impl IntoResponse {
         "ok": true,
         "service": "troozn-live",
         "mode": "hls",
-        "quality": "720p-copy",
+        "quality": "1080p-hls-copy",
         "hls_url": PUBLIC_HLS_URL
     }))
 }
