@@ -25,8 +25,7 @@ const MAX_PRODUCER_AHEAD_ITEMS: usize = 1;
 
 const PUBLIC_HLS_URL: &str = "http://127.0.0.1:8787/troozn-live/playlist-youtube.m3u8";
 
-const YTDLP_720_FORMAT: &str =
-    "22/best[ext=mp4][vcodec^=avc1][acodec^=mp4a][height<=720]/18";
+const YTDLP_720_FORMAT: &str = "22/best[ext=mp4][vcodec^=avc1][acodec^=mp4a][height<=720]/18";
 
 #[derive(Debug)]
 pub struct TrooznLive {
@@ -99,7 +98,6 @@ pub struct TrooznLiveSubmitResponse {
     pub queue: Vec<TrooznLiveItem>,
     pub now: TrooznLiveNow,
 }
-
 
 #[derive(Debug, Clone)]
 struct FullVideoMetadata {
@@ -292,6 +290,11 @@ impl TrooznLive {
                 item.index, item.title
             );
 
+            {
+                let mut guard = self.producer_now.lock().await;
+                guard.last_error = Some("Extraction métadonnées complètes en cours".to_string());
+            }
+
             let item = self.enrich_item_metadata(item).await;
 
             eprintln!(
@@ -301,6 +304,11 @@ impl TrooznLive {
                 item.thumbnail.as_deref().unwrap_or("-"),
                 item.uploader.as_deref().unwrap_or("-")
             );
+
+            {
+                let mut guard = self.producer_now.lock().await;
+                guard.last_error = Some("Résolution URL vidéo 720p en cours".to_string());
+            }
 
             let play_url = match resolve_youtube_720_url(&item.source_url).await {
                 Ok(url) => url,
@@ -378,6 +386,11 @@ impl TrooznLive {
             cmd.stdout(std::process::Stdio::null());
             cmd.stderr(std::process::Stdio::inherit());
 
+            {
+                let mut guard = self.producer_now.lock().await;
+                guard.last_error = Some("Démarrage FFmpeg HLS en cours".to_string());
+            }
+
             let child = cmd.spawn().context("lancement ffmpeg HLS item")?;
 
             {
@@ -393,16 +406,13 @@ impl TrooznLive {
                 {
                     let mut producer = self.producer_now.lock().await;
                     if producer.item_id == item.item_id && producer.item_started_at > 0 {
-                        producer.position = unix_timestamp().saturating_sub(producer.item_started_at);
+                        producer.position =
+                            unix_timestamp().saturating_sub(producer.item_started_at);
                     }
                 }
 
                 let new_count = self
-                    .import_item_manifest_incremental(
-                        item.index,
-                        &item_manifest,
-                        appended_any,
-                    )
+                    .import_item_manifest_incremental(item.index, &item_manifest, appended_any)
                     .await
                     .unwrap_or(imported_segments);
 
@@ -589,7 +599,10 @@ impl TrooznLive {
         }
 
         let mut entries = self.master_entries.lock().await;
-        let existing_for_item = entries.iter().filter(|e| e.item_index == item_index).count();
+        let existing_for_item = entries
+            .iter()
+            .filter(|e| e.item_index == item_index)
+            .count();
 
         if parsed_count <= existing_for_item {
             return Ok(existing_for_item);
@@ -662,7 +675,10 @@ impl TrooznLive {
 
         let mut position_f64 = 0.0_f64;
 
-        for entry in entries.iter().filter(|entry| entry.item_index == item_index) {
+        for entry in entries
+            .iter()
+            .filter(|entry| entry.item_index == item_index)
+        {
             if entry.segment == relative {
                 break;
             }
@@ -764,7 +780,9 @@ fn parse_item_hls_entries(
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| line.to_string());
 
-        let duration = pending_duration.take().unwrap_or_else(|| "4.000000".to_string());
+        let duration = pending_duration
+            .take()
+            .unwrap_or_else(|| "4.000000".to_string());
         let program_date_time = pending_program_date_time.take();
 
         out.push(MasterEntry {
@@ -810,7 +828,6 @@ async fn write_empty_master_playlist(index_path: &Path) -> anyhow::Result<()> {
     fs::write(index_path, content).await?;
     Ok(())
 }
-
 
 fn fallback_single_item_from_url(source_url: &str) -> Option<TrooznLiveItem> {
     let video_id = extract_youtube_video_id(source_url)?;
@@ -876,10 +893,7 @@ fn extract_youtube_video_id(source_url: &str) -> Option<String> {
 
     // Cas radio/mix simple : list=RDVIDEO_ID ou list=RDMMVIDEO_ID
     if let Some(list) = query_param(source_url, "list") {
-        let candidates = [
-            list.strip_prefix("RDMM"),
-            list.strip_prefix("RD"),
-        ];
+        let candidates = [list.strip_prefix("RDMM"), list.strip_prefix("RD")];
 
         for candidate in candidates.into_iter().flatten() {
             let id = candidate
@@ -893,17 +907,17 @@ fn extract_youtube_video_id(source_url: &str) -> Option<String> {
             }
         }
 
-        eprintln!(
-            "TROOZN_LIVE_FALLBACK_NO_VIDEO_ID_IN_LIST list={}",
-            list
-        );
+        eprintln!("TROOZN_LIVE_FALLBACK_NO_VIDEO_ID_IN_LIST list={}", list);
     }
 
     None
 }
 
 fn query_param(source_url: &str, key: &str) -> Option<String> {
-    let query = source_url.split_once('?').map(|(_, q)| q).unwrap_or(source_url);
+    let query = source_url
+        .split_once('?')
+        .map(|(_, q)| q)
+        .unwrap_or(source_url);
 
     for part in query.split('&') {
         let Some((k, v)) = part.split_once('=') else {
@@ -953,8 +967,10 @@ fn looks_like_youtube_id(value: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
-
-async fn extract_youtube_items_with_retry(source_url: &str, limit: usize) -> anyhow::Result<Vec<TrooznLiveItem>> {
+async fn extract_youtube_items_with_retry(
+    source_url: &str,
+    limit: usize,
+) -> anyhow::Result<Vec<TrooznLiveItem>> {
     let mut last_error: Option<anyhow::Error> = None;
 
     for attempt in 1..=3 {
@@ -973,8 +989,7 @@ async fn extract_youtube_items_with_retry(source_url: &str, limit: usize) -> any
             Ok(_) => {
                 eprintln!(
                     "TROOZN_LIVE_PLAYLIST_EMPTY attempt={} source_url={}",
-                    attempt,
-                    source_url
+                    attempt, source_url
                 );
             }
             Err(err) => {
@@ -996,7 +1011,10 @@ async fn extract_youtube_items_with_retry(source_url: &str, limit: usize) -> any
     }
 }
 
-async fn extract_youtube_items(source_url: &str, limit: usize) -> anyhow::Result<Vec<TrooznLiveItem>> {
+async fn extract_youtube_items(
+    source_url: &str,
+    limit: usize,
+) -> anyhow::Result<Vec<TrooznLiveItem>> {
     let mut cmd = Command::new(YTDLP_BIN);
 
     add_ytdlp_common_args(&mut cmd).await;
@@ -1133,11 +1151,10 @@ fn item_from_ytdlp_value(index: usize, v: &Value) -> Option<TrooznLiveItem> {
     })
 }
 
-
 async fn extract_full_video_metadata(source_url: &str) -> anyhow::Result<FullVideoMetadata> {
     let mut last_error = String::new();
 
-    for attempt in 1..=2 {
+    for attempt in 1..=1 {
         let mut cmd = Command::new(YTDLP_BIN);
 
         add_ytdlp_common_args(&mut cmd).await;
@@ -1150,7 +1167,7 @@ async fn extract_full_video_metadata(source_url: &str) -> anyhow::Result<FullVid
             source_url,
         ]);
 
-        let output = match timeout(Duration::from_secs(25), cmd.output()).await {
+        let output = match timeout(Duration::from_secs(12), cmd.output()).await {
             Ok(Ok(output)) => output,
             Ok(Err(err)) => {
                 last_error = format!("exécution yt-dlp metadata: {err}");
