@@ -25,7 +25,8 @@ const MAX_PRODUCER_AHEAD_ITEMS: usize = 1;
 
 const PUBLIC_HLS_URL: &str = "http://127.0.0.1:8787/troozn-live/playlist-youtube.m3u8";
 
-const YTDLP_720_FORMAT: &str = "22/best[ext=mp4][vcodec^=avc1][acodec^=mp4a][height<=720]/18";
+const YTDLP_720_FORMAT: &str =
+    "22/best[ext=mp4][vcodec^=avc1][acodec^=mp4a][height<=720]/18";
 
 #[derive(Debug)]
 pub struct TrooznLive {
