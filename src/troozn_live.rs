@@ -430,6 +430,58 @@ impl TrooznLive {
                 *guard = Some(child);
             }
 
+            // Métadonnées complètes en arrière-plan seulement après démarrage FFmpeg.
+            // Elles ne doivent jamais retarder les premiers segments HLS.
+            {
+                let live_for_meta = self.clone();
+                let item_for_meta = item.clone();
+
+                tokio::spawn(async move {
+                    let enriched = live_for_meta.enrich_item_metadata(&item_for_meta).await;
+
+                    {
+                        let mut queue = live_for_meta.queue.lock().await;
+                        if let Some(slot) = queue.iter_mut().find(|q| q.item_id == enriched.item_id) {
+                            *slot = enriched.clone();
+                        }
+                    }
+
+                    {
+                        let mut producer = live_for_meta.producer_now.lock().await;
+                        if producer.item_id == enriched.item_id {
+                            producer.title = enriched.title.clone();
+                            producer.duration = enriched.duration;
+                            producer.thumbnail = enriched.thumbnail.clone();
+                            producer.channel = enriched.channel.clone();
+                            producer.description = enriched.description.clone();
+                            producer.upload_date = enriched.upload_date.clone();
+                            producer.uploader = enriched.uploader.clone();
+                        }
+                    }
+
+                    {
+                        let mut playback = live_for_meta.playback_now.lock().await;
+                        if playback.item_id == enriched.item_id {
+                            playback.title = enriched.title.clone();
+                            playback.duration = enriched.duration;
+                            playback.thumbnail = enriched.thumbnail.clone();
+                            playback.channel = enriched.channel.clone();
+                            playback.description = enriched.description.clone();
+                            playback.upload_date = enriched.upload_date.clone();
+                            playback.uploader = enriched.uploader.clone();
+                        }
+                    }
+
+                    eprintln!(
+                        "TROOZN_LIVE_METADATA_READY index={} title={} thumb={} uploader={}",
+                        enriched.index,
+                        enriched.title,
+                        enriched.thumbnail.as_deref().unwrap_or("-"),
+                        enriched.uploader.as_deref().unwrap_or("-")
+                    );
+                });
+            }
+
             let mut imported_segments = 0_usize;
 
             loop {
@@ -1199,7 +1251,7 @@ async fn extract_full_video_metadata(source_url: &str) -> anyhow::Result<FullVid
             source_url,
         ]);
 
-        let output = match timeout(Duration::from_secs(12), cmd.output()).await {
+        let output = match timeout(Duration::from_secs(8), cmd.output()).await {
             Ok(Ok(output)) => output,
             Ok(Err(err)) => {
                 last_error = format!("exécution yt-dlp metadata: {err}");
@@ -1283,7 +1335,7 @@ fn best_thumbnail_from_value(root: &Value) -> Option<String> {
 async fn resolve_youtube_720_url(source_url: &str) -> anyhow::Result<String> {
     let mut last_error = String::new();
 
-    for attempt in 1..=3 {
+    for attempt in 1..=1 {
         let mut cmd = Command::new(YTDLP_BIN);
 
         add_ytdlp_common_args(&mut cmd).await;
