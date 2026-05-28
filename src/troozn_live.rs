@@ -166,28 +166,66 @@ impl TrooznLive {
         }
 
         let limit = limit.clamp(1, MAX_ITEMS);
-        let items = match extract_youtube_items_with_retry(source_url, limit).await {
-            Ok(items) if !items.is_empty() => items,
-            Ok(_) => {
-                eprintln!("TROOZN_LIVE_PLAYLIST_EMPTY source_url={}", source_url);
+        let playlist_like = is_youtube_playlist_like_url(source_url);
+        let mut extraction_urls: Vec<String> = vec![source_url.to_string()];
 
-                fallback_single_item_from_url(source_url)
-                    .map(|item| vec![item])
-                    .ok_or_else(|| anyhow::anyhow!("Aucun item YouTube trouvé"))?
-            }
-            Err(err) => {
+        if let Some(normalized) = normalize_rd_playlist_to_watch_url(source_url) {
+            if normalized != source_url {
                 eprintln!(
-                    "TROOZN_LIVE_PLAYLIST_EXTRACT_FAILED source_url={} error={err:?}",
-                    source_url
+                    "TROOZN_LIVE_RD_NORMALIZED source_url={} normalized={}",
+                    source_url, normalized
                 );
-
-                fallback_single_item_from_url(source_url)
-                    .map(|item| vec![item])
-                    .ok_or_else(|| anyhow::anyhow!(
-                        "Extraction playlist échouée et aucun ID vidéo de fallback trouvé dans l’URL. Pour les mixes YouTube RDEM/RD opaque, partage plutôt une vidéo précise du mix. Erreur yt-dlp: {err}"
-                    ))?
+                extraction_urls.push(normalized);
             }
-        };
+        }
+
+        let mut last_error: Option<String> = None;
+        let mut items: Vec<TrooznLiveItem> = Vec::new();
+
+        for candidate_url in extraction_urls.iter() {
+            match extract_youtube_items_with_retry(candidate_url, limit).await {
+                Ok(found) if !found.is_empty() => {
+                    eprintln!(
+                        "TROOZN_LIVE_PLAYLIST_EXTRACT_OK url={} count={}",
+                        candidate_url,
+                        found.len()
+                    );
+                    items = found;
+                    break;
+                }
+                Ok(_) => {
+                    last_error = Some(format!("Extraction vide pour {}", candidate_url));
+                    eprintln!("TROOZN_LIVE_PLAYLIST_EMPTY url={}", candidate_url);
+                }
+                Err(err) => {
+                    last_error = Some(err.to_string());
+                    eprintln!(
+                        "TROOZN_LIVE_PLAYLIST_EXTRACT_FAILED url={} error={err:?}",
+                        candidate_url
+                    );
+                }
+            }
+        }
+
+        if items.is_empty() {
+            if playlist_like {
+                anyhow::bail!(
+                    "Playlist/mix YouTube non extractible. Aucun flux playlist ne sera lancé. Dernière erreur: {}",
+                    last_error.unwrap_or_else(|| "inconnue".to_string())
+                );
+            }
+
+            items = fallback_single_item_from_url(source_url)
+                .map(|item| vec![item])
+                .ok_or_else(|| anyhow::anyhow!("Aucun item YouTube trouvé"))?;
+        }
+
+        if playlist_like && items.len() <= 1 {
+            anyhow::bail!(
+                "Le lien partagé ressemble à une playlist/mix, mais yt-dlp n'a retourné qu'un seul item. \
+Lecture annulée pour éviter l'arrêt après une seule vidéo. Partage une vraie URL watch?v=... ou une playlist PL extractible."
+            );
+        }
 
         if items.is_empty() {
             anyhow::bail!("Aucun item YouTube trouvé");
@@ -925,6 +963,48 @@ async fn write_empty_master_playlist(index_path: &Path) -> anyhow::Result<()> {
 
     fs::write(index_path, content).await?;
     Ok(())
+}
+
+
+fn is_youtube_playlist_like_url(source_url: &str) -> bool {
+    query_param(source_url, "list").is_some()
+        || source_url.contains("/playlist?")
+        || source_url.contains("youtube.com/playlist")
+}
+
+fn is_youtube_mix_list(source_url: &str) -> bool {
+    let Some(list) = query_param(source_url, "list") else {
+        return false;
+    };
+
+    list.starts_with("RD")
+        || list.starts_with("RDEM")
+        || list.starts_with("RDMM")
+        || list.starts_with("RDGM")
+}
+
+fn normalize_rd_playlist_to_watch_url(source_url: &str) -> Option<String> {
+    let list = query_param(source_url, "list")?;
+
+    if let Some(video_id) = list.strip_prefix("RDMM") {
+        if looks_like_youtube_id(video_id) {
+            return Some(format!(
+                "https://www.youtube.com/watch?v={}&list={}&start_radio=1",
+                video_id, list
+            ));
+        }
+    }
+
+    if let Some(video_id) = list.strip_prefix("RD") {
+        if looks_like_youtube_id(video_id) {
+            return Some(format!(
+                "https://www.youtube.com/watch?v={}&list={}&start_radio=1",
+                video_id, list
+            ));
+        }
+    }
+
+    None
 }
 
 fn fallback_single_item_from_url(source_url: &str) -> Option<TrooznLiveItem> {
