@@ -50,6 +50,9 @@ pub struct TrooznLiveNow {
     pub duration: Option<u64>,
     pub thumbnail: Option<String>,
     pub channel: Option<String>,
+    pub description: Option<String>,
+    pub upload_date: Option<String>,
+    pub uploader: Option<String>,
     pub started_at: u64,
     pub item_started_at: u64,
     pub next_title: Option<String>,
@@ -66,6 +69,9 @@ pub struct TrooznLiveItem {
     pub duration: Option<u64>,
     pub thumbnail: Option<String>,
     pub channel: Option<String>,
+    pub description: Option<String>,
+    pub upload_date: Option<String>,
+    pub uploader: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -92,6 +98,19 @@ pub struct TrooznLiveSubmitResponse {
     pub count: usize,
     pub queue: Vec<TrooznLiveItem>,
     pub now: TrooznLiveNow,
+}
+
+
+#[derive(Debug, Clone)]
+struct FullVideoMetadata {
+    title: Option<String>,
+    webpage_url: Option<String>,
+    duration: Option<u64>,
+    thumbnail: Option<String>,
+    channel: Option<String>,
+    description: Option<String>,
+    upload_date: Option<String>,
+    uploader: Option<String>,
 }
 
 impl TrooznLive {
@@ -252,6 +271,16 @@ impl TrooznLive {
                 item.index, item.title
             );
 
+            let item = self.enrich_item_metadata(item).await;
+
+            eprintln!(
+                "TROOZN_LIVE_METADATA_READY index={} title={} thumb={} uploader={}",
+                item.index,
+                item.title,
+                item.thumbnail.as_deref().unwrap_or("-"),
+                item.uploader.as_deref().unwrap_or("-")
+            );
+
             let play_url = match resolve_youtube_720_url(&item.source_url).await {
                 Ok(url) => url,
                 Err(err) => {
@@ -281,6 +310,9 @@ impl TrooznLive {
                     duration: item.duration,
                     thumbnail: item.thumbnail.clone(),
                     channel: item.channel.clone(),
+                    description: item.description.clone(),
+                    upload_date: item.upload_date.clone(),
+                    uploader: item.uploader.clone(),
                     started_at: stream_started_at,
                     item_started_at,
                     next_title,
@@ -410,6 +442,63 @@ impl TrooznLive {
         }
 
         Ok(())
+    }
+
+    async fn enrich_item_metadata(&self, item: &TrooznLiveItem) -> TrooznLiveItem {
+        let meta = match extract_full_video_metadata(&item.source_url).await {
+            Ok(meta) => meta,
+            Err(err) => {
+                eprintln!(
+                    "TROOZN_LIVE_METADATA_FAILED index={} title={} error={err:?}",
+                    item.index, item.title
+                );
+                return item.clone();
+            }
+        };
+
+        let mut enriched = item.clone();
+
+        if let Some(title) = meta.title {
+            enriched.title = title;
+        }
+
+        if meta.webpage_url.is_some() {
+            enriched.webpage_url = meta.webpage_url;
+        }
+
+        if meta.duration.is_some() {
+            enriched.duration = meta.duration;
+        }
+
+        if meta.thumbnail.is_some() {
+            enriched.thumbnail = meta.thumbnail;
+        }
+
+        if meta.channel.is_some() {
+            enriched.channel = meta.channel;
+        }
+
+        if meta.description.is_some() {
+            enriched.description = meta.description;
+        }
+
+        if meta.upload_date.is_some() {
+            enriched.upload_date = meta.upload_date;
+        }
+
+        if meta.uploader.is_some() {
+            enriched.uploader = meta.uploader;
+        }
+
+        {
+            let mut queue = self.queue.lock().await;
+
+            if let Some(slot) = queue.iter_mut().find(|q| q.item_id == item.item_id) {
+                *slot = enriched.clone();
+            }
+        }
+
+        enriched
     }
 
     async fn wait_until_future_buffer_needed(&self, next_item_index: usize) {
@@ -578,6 +667,9 @@ impl TrooznLive {
             duration: item.duration,
             thumbnail: item.thumbnail.clone(),
             channel: item.channel.clone(),
+            description: item.description.clone(),
+            upload_date: item.upload_date.clone(),
+            uploader: item.uploader.clone(),
             started_at: unix_timestamp(),
             item_started_at: unix_timestamp().saturating_sub(position_f64.floor() as u64),
             next_title,
@@ -779,6 +871,21 @@ fn item_from_ytdlp_value(index: usize, v: &Value) -> Option<TrooznLiveItem> {
         .or_else(|| v.get("uploader").and_then(Value::as_str))
         .map(str::to_string);
 
+    let description = v
+        .get("description")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+
+    let upload_date = v
+        .get("upload_date")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+
+    let uploader = v
+        .get("uploader")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+
     Some(TrooznLiveItem {
         item_id: item_id_for_url(&source_url),
         index,
@@ -788,7 +895,108 @@ fn item_from_ytdlp_value(index: usize, v: &Value) -> Option<TrooznLiveItem> {
         duration,
         thumbnail,
         channel,
+        description,
+        upload_date,
+        uploader,
     })
+}
+
+
+async fn extract_full_video_metadata(source_url: &str) -> anyhow::Result<FullVideoMetadata> {
+    let mut last_error = String::new();
+
+    for attempt in 1..=2 {
+        let mut cmd = Command::new(YTDLP_BIN);
+
+        add_ytdlp_common_args(&mut cmd).await;
+
+        cmd.args([
+            "--no-playlist",
+            "--no-warnings",
+            "--skip-download",
+            "-J",
+            source_url,
+        ]);
+
+        let output = match timeout(Duration::from_secs(25), cmd.output()).await {
+            Ok(Ok(output)) => output,
+            Ok(Err(err)) => {
+                last_error = format!("exécution yt-dlp metadata: {err}");
+                sleep(Duration::from_millis(500 * attempt)).await;
+                continue;
+            }
+            Err(_) => {
+                last_error = "timeout yt-dlp metadata".to_string();
+                sleep(Duration::from_millis(500 * attempt)).await;
+                continue;
+            }
+        };
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            last_error = stderr.trim().to_string();
+            sleep(Duration::from_millis(500 * attempt)).await;
+            continue;
+        }
+
+        let root: Value =
+            serde_json::from_slice(&output.stdout).context("parse yt-dlp metadata JSON")?;
+
+        let meta = FullVideoMetadata {
+            title: root
+                .get("title")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            webpage_url: root
+                .get("webpage_url")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            duration: root.get("duration").and_then(Value::as_u64),
+            thumbnail: best_thumbnail_from_value(&root),
+            channel: root
+                .get("channel")
+                .and_then(Value::as_str)
+                .or_else(|| root.get("uploader").and_then(Value::as_str))
+                .map(str::to_string),
+            description: root
+                .get("description")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            upload_date: root
+                .get("upload_date")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            uploader: root
+                .get("uploader")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        };
+
+        return Ok(meta);
+    }
+
+    anyhow::bail!("yt-dlp metadata a échoué après retries: {last_error}");
+}
+
+fn best_thumbnail_from_value(root: &Value) -> Option<String> {
+    if let Some(url) = root.get("thumbnail").and_then(Value::as_str) {
+        if !url.trim().is_empty() {
+            return Some(url.to_string());
+        }
+    }
+
+    let thumbnails = root.get("thumbnails").and_then(Value::as_array)?;
+
+    thumbnails
+        .iter()
+        .filter_map(|thumb| {
+            let url = thumb.get("url").and_then(Value::as_str)?;
+            let width = thumb.get("width").and_then(Value::as_u64).unwrap_or(0);
+            let height = thumb.get("height").and_then(Value::as_u64).unwrap_or(0);
+            Some((width.saturating_mul(height), url.to_string()))
+        })
+        .max_by_key(|(score, _)| *score)
+        .map(|(_, url)| url)
 }
 
 async fn resolve_youtube_720_url(source_url: &str) -> anyhow::Result<String> {
