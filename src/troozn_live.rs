@@ -168,7 +168,7 @@ impl TrooznLive {
         }
 
         let limit = limit.clamp(1, MAX_ITEMS);
-        let items = match extract_youtube_items(source_url, limit).await {
+        let items = match extract_youtube_items_with_retry(source_url, limit).await {
             Ok(items) if !items.is_empty() => items,
             Ok(_) => {
                 eprintln!("TROOZN_LIVE_PLAYLIST_EMPTY source_url={}", source_url);
@@ -951,6 +951,49 @@ fn looks_like_youtube_id(value: &str) -> bool {
         && value
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+
+async fn extract_youtube_items_with_retry(source_url: &str, limit: usize) -> anyhow::Result<Vec<TrooznLiveItem>> {
+    let mut last_error: Option<anyhow::Error> = None;
+
+    for attempt in 1..=3 {
+        match extract_youtube_items(source_url, limit).await {
+            Ok(items) if !items.is_empty() => {
+                if attempt > 1 {
+                    eprintln!(
+                        "TROOZN_LIVE_PLAYLIST_RETRY_OK attempt={} count={}",
+                        attempt,
+                        items.len()
+                    );
+                }
+
+                return Ok(items);
+            }
+            Ok(_) => {
+                eprintln!(
+                    "TROOZN_LIVE_PLAYLIST_EMPTY attempt={} source_url={}",
+                    attempt,
+                    source_url
+                );
+            }
+            Err(err) => {
+                eprintln!(
+                    "TROOZN_LIVE_PLAYLIST_EXTRACT_RETRY_FAILED attempt={} source_url={} error={err:?}",
+                    attempt,
+                    source_url
+                );
+                last_error = Some(err);
+            }
+        }
+
+        sleep(Duration::from_millis(1200 * attempt)).await;
+    }
+
+    match last_error {
+        Some(err) => Err(err),
+        None => anyhow::bail!("Extraction playlist vide après retries"),
+    }
 }
 
 async fn extract_youtube_items(source_url: &str, limit: usize) -> anyhow::Result<Vec<TrooznLiveItem>> {
