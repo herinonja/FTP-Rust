@@ -112,6 +112,54 @@ struct FullVideoMetadata {
     uploader: Option<String>,
 }
 
+
+async fn live_audit(root_dir: &Path, line: impl AsRef<str>) {
+    let path = root_dir.join("audit.log");
+    let msg = format!("{}\n", line.as_ref());
+
+    let _ = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .await
+        .and_then(|mut f| async move {
+            use tokio::io::AsyncWriteExt;
+            f.write_all(msg.as_bytes()).await?;
+            Ok(())
+        })
+        .await;
+}
+
+fn count_item_ts_files(root_dir: &Path, item_index: usize) -> usize {
+    let prefix = format!("item-{item_index:04}-");
+    let Ok(entries) = std::fs::read_dir(root_dir) else {
+        return 0;
+    };
+
+    entries
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            let name = entry.file_name().to_string_lossy().to_string();
+            name.starts_with(&prefix) && name.ends_with(".ts")
+        })
+        .count()
+}
+
+fn count_manifest_ts_lines(path: &Path) -> usize {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return 0;
+    };
+
+    content
+        .lines()
+        .filter(|line| {
+            let line = line.trim();
+            !line.starts_with('#') && line.ends_with(".ts")
+        })
+        .count()
+}
+
+
 impl TrooznLive {
     pub fn new_default() -> Self {
         let idle = TrooznLiveNow {
@@ -300,6 +348,15 @@ Lecture annulée pour éviter l'arrêt après une seule vidéo. Partage une vrai
         write_empty_master_playlist(&self.root_dir.join("index.m3u8")).await?;
 
         for item in items.iter() {
+            live_audit(
+                &self.root_dir,
+                format!(
+                    "ITEM_START index={} title={} url={}",
+                    item.index, item.title, item.source_url
+                ),
+            )
+            .await;
+
             self.wait_until_future_buffer_needed(item.index).await;
 
             let next_title = items
@@ -352,6 +409,15 @@ Lecture annulée pour éviter l'arrêt après une seule vidéo. Partage une vrai
                         item.source_url
                     );
 
+                    live_audit(
+                        &self.root_dir,
+                        format!(
+                            "ITEM_YTDLP_FAIL index={} title={} url={} error={err:?}",
+                            item.index, item.title, item.source_url
+                        ),
+                    )
+                    .await;
+
                     {
                         let mut guard = self.producer_now.lock().await;
                         guard.state = "skipping".to_string();
@@ -374,6 +440,17 @@ Lecture annulée pour éviter l'arrêt après une seule vidéo. Partage une vrai
                     continue;
                 }
             };
+
+            live_audit(
+                &self.root_dir,
+                format!(
+                    "ITEM_YTDLP_OK index={} title={} play_url_prefix={}",
+                    item.index,
+                    item.title,
+                    play_url.chars().take(80).collect::<String>()
+                ),
+            )
+            .await;
 
             let item_started_at = unix_timestamp();
 
@@ -442,6 +519,18 @@ Lecture annulée pour éviter l'arrêt après une seule vidéo. Partage une vrai
                 guard.last_error = Some("Démarrage FFmpeg HLS en cours".to_string());
             }
 
+            live_audit(
+                &self.root_dir,
+                format!(
+                    "ITEM_FFMPEG_START index={} title={} manifest={} segment_pattern={}",
+                    item.index,
+                    item.title,
+                    item_manifest.display(),
+                    segment_pattern.display()
+                ),
+            )
+            .await;
+
             let child = cmd.spawn().context("lancement ffmpeg HLS item")?;
 
             {
@@ -487,6 +576,19 @@ Lecture annulée pour éviter l'arrêt après une seule vidéo. Partage une vrai
                                     "TROOZN_LIVE_FFMPEG_DONE index={} title={} status={status}",
                                     item.index, item.title
                                 );
+
+                                live_audit(
+                                    &self.root_dir,
+                                    format!(
+                                        "ITEM_FFMPEG_DONE index={} title={} status={} ts_files={} manifest_lines={}",
+                                        item.index,
+                                        item.title,
+                                        status,
+                                        count_item_ts_files(&self.root_dir, item.index),
+                                        count_manifest_ts_lines(&item_manifest)
+                                    ),
+                                )
+                                .await;
                                 *guard = None;
                                 true
                             }
