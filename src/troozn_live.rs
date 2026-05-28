@@ -168,7 +168,26 @@ impl TrooznLive {
         }
 
         let limit = limit.clamp(1, MAX_ITEMS);
-        let items = extract_youtube_items(source_url, limit).await?;
+        let items = match extract_youtube_items(source_url, limit).await {
+            Ok(items) if !items.is_empty() => items,
+            Ok(_) => {
+                eprintln!("TROOZN_LIVE_PLAYLIST_EMPTY source_url={}", source_url);
+
+                fallback_single_item_from_url(source_url)
+                    .map(|item| vec![item])
+                    .ok_or_else(|| anyhow::anyhow!("Aucun item YouTube trouvé"))?
+            }
+            Err(err) => {
+                eprintln!(
+                    "TROOZN_LIVE_PLAYLIST_EXTRACT_FAILED source_url={} error={err:?}",
+                    source_url
+                );
+
+                fallback_single_item_from_url(source_url)
+                    .map(|item| vec![item])
+                    .ok_or_else(|| anyhow::anyhow!("Extraction playlist échouée et fallback impossible: {err}"))?
+            }
+        };
 
         if items.is_empty() {
             anyhow::bail!("Aucun item YouTube trouvé");
@@ -790,6 +809,113 @@ async fn write_empty_master_playlist(index_path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+
+fn fallback_single_item_from_url(source_url: &str) -> Option<TrooznLiveItem> {
+    let video_id = extract_youtube_video_id(source_url)?;
+    let watch_url = format!("https://www.youtube.com/watch?v={}", video_id);
+
+    Some(TrooznLiveItem {
+        item_id: item_id_for_url(&watch_url),
+        index: 1,
+        title: "Playlist Youtube".to_string(),
+        source_url: watch_url.clone(),
+        webpage_url: Some(watch_url),
+        duration: None,
+        thumbnail: None,
+        channel: None,
+        description: None,
+        upload_date: None,
+        uploader: None,
+    })
+}
+
+fn extract_youtube_video_id(source_url: &str) -> Option<String> {
+    // Cas standard watch?v=VIDEO_ID
+    if let Some(v) = query_param(source_url, "v") {
+        if looks_like_youtube_id(&v) {
+            return Some(v);
+        }
+    }
+
+    // Cas youtu.be/VIDEO_ID
+    if let Some(pos) = source_url.find("youtu.be/") {
+        let rest = &source_url[pos + "youtu.be/".len()..];
+        let id = rest
+            .split(|c| c == '?' || c == '&' || c == '/' || c == '#')
+            .next()
+            .unwrap_or("")
+            .to_string();
+
+        if looks_like_youtube_id(&id) {
+            return Some(id);
+        }
+    }
+
+    // Cas playlist radio/mix YouTube list=RDVIDEO_ID ou RDMMVIDEO_ID.
+    if let Some(list) = query_param(source_url, "list") {
+        if let Some(rest) = list.strip_prefix("RDMM") {
+            if looks_like_youtube_id(rest) {
+                return Some(rest.to_string());
+            }
+        }
+
+        if let Some(rest) = list.strip_prefix("RD") {
+            if looks_like_youtube_id(rest) {
+                return Some(rest.to_string());
+            }
+        }
+    }
+
+    None
+}
+
+fn query_param(source_url: &str, key: &str) -> Option<String> {
+    for part in source_url.split(|c| c == '?' || c == '&') {
+        let (k, v) = part.split_once('=')?;
+
+        if k == key {
+            return Some(percent_decode_minimal(v));
+        }
+    }
+
+    None
+}
+
+fn percent_decode_minimal(input: &str) -> String {
+    let mut out = String::new();
+    let bytes = input.as_bytes();
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(hex) = std::str::from_utf8(&bytes[i + 1..i + 3]) {
+                if let Ok(v) = u8::from_str_radix(hex, 16) {
+                    out.push(v as char);
+                    i += 3;
+                    continue;
+                }
+            }
+        }
+
+        if bytes[i] == b'+' {
+            out.push(' ');
+        } else {
+            out.push(bytes[i] as char);
+        }
+
+        i += 1;
+    }
+
+    out
+}
+
+fn looks_like_youtube_id(value: &str) -> bool {
+    value.len() == 11
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
 async fn extract_youtube_items(source_url: &str, limit: usize) -> anyhow::Result<Vec<TrooznLiveItem>> {
     let mut cmd = Command::new(YTDLP_BIN);
 
@@ -837,6 +963,32 @@ fn item_from_ytdlp_value(index: usize, v: &Value) -> Option<TrooznLiveItem> {
         .and_then(Value::as_str)
         .unwrap_or("Vidéo TROOZN")
         .to_string();
+
+    let title_lc = title.to_lowercase();
+
+    if title_lc.contains("private video")
+        || title_lc.contains("deleted video")
+        || title_lc.contains("video unavailable")
+        || title_lc.contains("vidéo privée")
+        || title_lc.contains("vidéo supprimée")
+    {
+        eprintln!("TROOZN_LIVE_FLAT_SKIP index={} title={}", index, title);
+        return None;
+    }
+
+    if v.get("availability")
+        .and_then(Value::as_str)
+        .map(|s| s != "public" && s != "unlisted")
+        .unwrap_or(false)
+    {
+        eprintln!(
+            "TROOZN_LIVE_FLAT_SKIP_UNAVAILABLE index={} title={} availability={:?}",
+            index,
+            title,
+            v.get("availability")
+        );
+        return None;
+    }
 
     let id = v
         .get("id")
@@ -1023,7 +1175,7 @@ async fn resolve_youtube_720_url(source_url: &str) -> anyhow::Result<String> {
             source_url,
         ]);
 
-        let output = match timeout(Duration::from_secs(90), cmd.output()).await {
+        let output = match timeout(Duration::from_secs(30), cmd.output()).await {
             Ok(Ok(output)) => output,
             Ok(Err(err)) => {
                 last_error = format!("exécution yt-dlp: {err}");
