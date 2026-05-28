@@ -549,11 +549,25 @@ impl TrooznLive {
             }
         }
 
+        let has_any_segment = {
+            let entries = self.master_entries.lock().await;
+            !entries.is_empty()
+        };
+
         self.rewrite_master_playlist(true).await.ok();
 
         {
             let mut producer = self.producer_now.lock().await;
-            producer.state = "ended".to_string();
+
+            if has_any_segment {
+                producer.state = "ended".to_string();
+            } else {
+                producer.state = "error".to_string();
+
+                if producer.last_error.is_none() {
+                    producer.last_error = Some("Aucun segment HLS généré".to_string());
+                }
+            }
         }
 
         Ok(())
