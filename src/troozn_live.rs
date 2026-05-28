@@ -295,6 +295,7 @@ Lecture annulée pour éviter l'arrêt après une seule vidéo. Partage une vrai
     ) -> anyhow::Result<()> {
         let stream_started_at = unix_timestamp();
         let mut appended_any = false;
+        let mut skipped_items: usize = 0;
 
         write_empty_master_playlist(&self.root_dir.join("index.m3u8")).await?;
 
@@ -342,13 +343,34 @@ Lecture annulée pour éviter l'arrêt après une seule vidéo. Partage une vrai
             let play_url = match resolve_youtube_720_url(&item.source_url).await {
                 Ok(url) => url,
                 Err(err) => {
+                    // Échec silencieux par item :
+                    // on n'arrête pas le producer, on passe simplement à l'item suivant.
                     eprintln!(
-                        "TROOZN_LIVE_SKIP_UNPLAYABLE index={} title={} error={err:?}",
-                        item.index, item.title
+                        "TROOZN_LIVE_SKIP_ITEM index={} title={} source_url={} error={err:?}",
+                        item.index,
+                        item.title,
+                        item.source_url
                     );
 
-                    let mut guard = self.producer_now.lock().await;
-                    guard.last_error = Some(format!("Item ignoré: {} - {}", item.title, err));
+                    {
+                        let mut guard = self.producer_now.lock().await;
+                        guard.state = "skipping".to_string();
+                        guard.title = item.title.clone();
+                        guard.source_url = item.source_url.clone();
+                        guard.item_id = item.item_id.clone();
+                        guard.index = item.index;
+                        guard.position = 0;
+                        guard.duration = item.duration;
+                        guard.thumbnail = item.thumbnail.clone();
+                        guard.channel = item.channel.clone();
+                        guard.description = item.description.clone();
+                        guard.upload_date = item.upload_date.clone();
+                        guard.uploader = item.uploader.clone();
+                        guard.last_error = Some(format!("Item ignoré: {}", item.title));
+                    }
+
+                    skipped_items += 1;
+                    sleep(Duration::from_millis(150)).await;
                     continue;
                 }
             };
@@ -502,6 +524,11 @@ Lecture annulée pour éviter l'arrêt après une seule vidéo. Partage une vrai
             let entries = self.master_entries.lock().await;
             !entries.is_empty()
         };
+
+        eprintln!(
+            "TROOZN_LIVE_WORKER_FINISH skipped_items={}",
+            skipped_items
+        );
 
         self.rewrite_master_playlist(true).await.ok();
 
