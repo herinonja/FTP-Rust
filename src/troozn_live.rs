@@ -290,20 +290,52 @@ impl TrooznLive {
                 item.index, item.title
             );
 
+            // Ne pas bloquer le démarrage HLS sur les métadonnées complètes.
+            // On clone l'item flat-playlist pour démarrer vite, puis on enrichit en arrière-plan.
+            let item = item.clone();
+
             {
-                let mut guard = self.producer_now.lock().await;
-                guard.last_error = Some("Extraction métadonnées complètes en cours".to_string());
+                let live_for_meta = self.clone();
+                let item_for_meta = item.clone();
+
+                tokio::spawn(async move {
+                    let enriched = live_for_meta.enrich_item_metadata(&item_for_meta).await;
+
+                    {
+                        let mut producer = live_for_meta.producer_now.lock().await;
+                        if producer.item_id == enriched.item_id {
+                            producer.title = enriched.title.clone();
+                            producer.duration = enriched.duration;
+                            producer.thumbnail = enriched.thumbnail.clone();
+                            producer.channel = enriched.channel.clone();
+                            producer.description = enriched.description.clone();
+                            producer.upload_date = enriched.upload_date.clone();
+                            producer.uploader = enriched.uploader.clone();
+                        }
+                    }
+
+                    {
+                        let mut playback = live_for_meta.playback_now.lock().await;
+                        if playback.item_id == enriched.item_id {
+                            playback.title = enriched.title.clone();
+                            playback.duration = enriched.duration;
+                            playback.thumbnail = enriched.thumbnail.clone();
+                            playback.channel = enriched.channel.clone();
+                            playback.description = enriched.description.clone();
+                            playback.upload_date = enriched.upload_date.clone();
+                            playback.uploader = enriched.uploader.clone();
+                        }
+                    }
+
+                    eprintln!(
+                        "TROOZN_LIVE_METADATA_READY index={} title={} thumb={} uploader={}",
+                        enriched.index,
+                        enriched.title,
+                        enriched.thumbnail.as_deref().unwrap_or("-"),
+                        enriched.uploader.as_deref().unwrap_or("-")
+                    );
+                });
             }
-
-            let item = self.enrich_item_metadata(item).await;
-
-            eprintln!(
-                "TROOZN_LIVE_METADATA_READY index={} title={} thumb={} uploader={}",
-                item.index,
-                item.title,
-                item.thumbnail.as_deref().unwrap_or("-"),
-                item.uploader.as_deref().unwrap_or("-")
-            );
 
             {
                 let mut guard = self.producer_now.lock().await;
