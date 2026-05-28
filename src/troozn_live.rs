@@ -114,20 +114,27 @@ struct FullVideoMetadata {
 
 
 async fn live_audit(root_dir: &Path, line: impl AsRef<str>) {
-    let path = root_dir.join("audit.log");
-    let msg = format!("{}\n", line.as_ref());
+    use tokio::io::AsyncWriteExt;
 
-    let _ = fs::OpenOptions::new()
+    let path = root_dir.join("audit.log");
+    let msg = format!("{}
+", line.as_ref());
+
+    match fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(path)
+        .open(&path)
         .await
-        .and_then(|mut f| async move {
-            use tokio::io::AsyncWriteExt;
-            f.write_all(msg.as_bytes()).await?;
-            Ok(())
-        })
-        .await;
+    {
+        Ok(mut file) => {
+            if let Err(err) = file.write_all(msg.as_bytes()).await {
+                eprintln!("TROOZN_LIVE_AUDIT_WRITE_ERROR path={} error={err:?}", path.display());
+            }
+        }
+        Err(err) => {
+            eprintln!("TROOZN_LIVE_AUDIT_OPEN_ERROR path={} error={err:?}", path.display());
+        }
+    }
 }
 
 fn count_item_ts_files(root_dir: &Path, item_index: usize) -> usize {
