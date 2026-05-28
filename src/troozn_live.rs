@@ -360,22 +360,6 @@ impl TrooznLive {
         limit: usize,
     ) -> anyhow::Result<TrooznLiveSubmitResponse> {
 
-    let requested_name = filename.to_string();
-
-    if requested_name.ends_with("playlist-youtube.m3u8") || requested_name.ends_with("index.m3u8") {
-        let body = state.live.render_playback_playlist_from_anchor().await;
-
-        return (
-            StatusCode::OK,
-            [
-                ("content-type", "application/vnd.apple.mpegurl"),
-                ("cache-control", "no-store, no-cache, must-revalidate"),
-            ],
-            body,
-        )
-            .into_response();
-    }
-
         self.stop_current_ffmpeg().await;
         self.ensure_clean_dir().await?;
         self.new_session_id().await;
@@ -983,7 +967,8 @@ Lecture annulée pour éviter l'arrêt après une seule vidéo. Partage une vrai
 
         let target_duration = selected
             .iter()
-            .map(|entry| entry.duration.ceil() as u64)
+            .filter_map(|entry| entry.duration.parse::<f64>().ok())
+            .map(|duration| duration.ceil() as u64)
             .max()
             .unwrap_or(6)
             .max(2);
