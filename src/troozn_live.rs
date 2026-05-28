@@ -20,6 +20,8 @@ use crate::HttpGatewayState;
 
 const LIVE_DIR: &str = "/home/troozn/.kodi/userdata/TROOZN/live";
 const YTDLP_BIN: &str = "/usr/local/bin/yt-dlp";
+const LIVE_KEEP_BEHIND_ITEMS: usize = 2;
+const LIVE_MAX_DIR_BYTES: u64 = 1500 * 1024 * 1024;
 const MAX_ITEMS: usize = 20;
 const MAX_PRODUCER_AHEAD_ITEMS: usize = 20;
 
@@ -138,6 +140,17 @@ async fn live_audit(root_dir: &Path, line: impl AsRef<str>) {
             eprintln!("TROOZN_LIVE_AUDIT_OPEN_ERROR path={} error={err:?}", path.display());
         }
     }
+}
+
+fn parse_item_index_from_live_filename(name: &str) -> Option<usize> {
+    if !name.starts_with("item-") {
+        return None;
+    }
+
+    let rest = name.strip_prefix("item-")?;
+    let index_part = rest.get(0..4)?;
+
+    index_part.parse::<usize>().ok()
 }
 
 fn count_item_ts_files(root_dir: &Path, item_index: usize) -> usize {
@@ -998,6 +1011,145 @@ Lecture annulée pour éviter l'arrêt après une seule vidéo. Partage une vrai
         }
 
         out
+    }
+
+    async fn cleanup_old_live_files(&self) -> anyhow::Result<()> {
+        let current_index = {
+            let now = self.playback_now.lock().await;
+            now.index
+        };
+
+        if current_index <= LIVE_KEEP_BEHIND_ITEMS + 1 {
+            return Ok(());
+        }
+
+        let keep_from = current_index.saturating_sub(LIVE_KEEP_BEHIND_ITEMS);
+
+        self.cleanup_items_before(keep_from).await?;
+        self.cleanup_by_size_limit().await?;
+
+        Ok(())
+    }
+
+    async fn cleanup_items_before(&self, keep_from: usize) -> anyhow::Result<()> {
+        let mut rd = fs::read_dir(&self.root_dir).await?;
+
+        while let Some(entry) = rd.next_entry().await? {
+            let path = entry.path();
+
+            let Some(name) = path.file_name().map(|v| v.to_string_lossy().to_string()) else {
+                continue;
+            };
+
+            let Some(item_index) = parse_item_index_from_live_filename(&name) else {
+                continue;
+            };
+
+            if item_index >= keep_from {
+                continue;
+            }
+
+            if name.ends_with(".ts") || name.ends_with(".m3u8") {
+                match fs::remove_file(&path).await {
+                    Ok(_) => {
+                        eprintln!(
+                            "TROOZN_LIVE_CLEANUP_REMOVE keep_from={} file={}",
+                            keep_from,
+                            name
+                        );
+                    }
+                    Err(err) => {
+                        eprintln!(
+                            "TROOZN_LIVE_CLEANUP_REMOVE_FAILED file={} error={err:?}",
+                            name
+                        );
+                    }
+                }
+            }
+        }
+
+        // Supprimer aussi les entrées master en mémoire devenues trop anciennes.
+        {
+            let mut entries = self.master_entries.lock().await;
+            entries.retain(|entry| entry.item_index >= keep_from);
+        }
+
+        self.rewrite_master_playlist(false).await.ok();
+
+        Ok(())
+    }
+
+    async fn cleanup_by_size_limit(&self) -> anyhow::Result<()> {
+        let mut files: Vec<(usize, std::time::SystemTime, u64, PathBuf)> = Vec::new();
+        let mut total_size: u64 = 0;
+
+        let mut rd = fs::read_dir(&self.root_dir).await?;
+
+        while let Some(entry) = rd.next_entry().await? {
+            let path = entry.path();
+
+            let Some(name) = path.file_name().map(|v| v.to_string_lossy().to_string()) else {
+                continue;
+            };
+
+            if !name.ends_with(".ts") && !name.ends_with(".m3u8") {
+                continue;
+            }
+
+            if name == "index.m3u8" || name == "playlist-youtube.m3u8" {
+                continue;
+            }
+
+            let Some(item_index) = parse_item_index_from_live_filename(&name) else {
+                continue;
+            };
+
+            let Ok(meta) = entry.metadata().await else {
+                continue;
+            };
+
+            let size = meta.len();
+            let modified = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+
+            total_size = total_size.saturating_add(size);
+            files.push((item_index, modified, size, path));
+        }
+
+        if total_size <= LIVE_MAX_DIR_BYTES {
+            return Ok(());
+        }
+
+        files.sort_by_key(|(_, modified, _, _)| *modified);
+
+        let current_index = {
+            let now = self.playback_now.lock().await;
+            now.index
+        };
+
+        let protected_from = current_index.saturating_sub(LIVE_KEEP_BEHIND_ITEMS);
+
+        for (item_index, _, size, path) in files {
+            if total_size <= LIVE_MAX_DIR_BYTES {
+                break;
+            }
+
+            if item_index >= protected_from {
+                continue;
+            }
+
+            if fs::remove_file(&path).await.is_ok() {
+                total_size = total_size.saturating_sub(size);
+
+                eprintln!(
+                    "TROOZN_LIVE_CLEANUP_SIZE_REMOVE item={} remaining_bytes={} file={}",
+                    item_index,
+                    total_size,
+                    path.display()
+                );
+            }
+        }
+
+        Ok(())
     }
 
     async fn rewrite_master_playlist(&self, ended: bool) -> anyhow::Result<()> {
