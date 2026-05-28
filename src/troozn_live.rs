@@ -38,6 +38,7 @@ pub struct TrooznLive {
     master_entries: Mutex<Vec<MasterEntry>>,
     session_id: Mutex<String>,
     worker_running: Mutex<bool>,
+    playback_anchor_item: Mutex<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -186,6 +187,7 @@ impl TrooznLive {
             master_entries: Mutex::new(Vec::new()),
             session_id: Mutex::new(unix_timestamp().to_string()),
             worker_running: Mutex::new(false),
+            playback_anchor_item: Mutex::new(1),
         }
     }
 
@@ -344,9 +346,31 @@ impl TrooznLive {
         title: Option<String>,
         limit: usize,
     ) -> anyhow::Result<TrooznLiveSubmitResponse> {
+
+    let requested_name = filename.to_string();
+
+    if requested_name.ends_with("playlist-youtube.m3u8") || requested_name.ends_with("index.m3u8") {
+        let body = state.live.render_playback_playlist_from_anchor().await;
+
+        return (
+            StatusCode::OK,
+            [
+                ("content-type", "application/vnd.apple.mpegurl"),
+                ("cache-control", "no-store, no-cache, must-revalidate"),
+            ],
+            body,
+        )
+            .into_response();
+    }
+
         self.stop_current_ffmpeg().await;
         self.ensure_clean_dir().await?;
         self.new_session_id().await;
+
+        {
+            let mut anchor = self.playback_anchor_item.lock().await;
+            *anchor = 1;
+        }
 
         {
             let mut entries = self.master_entries.lock().await;
@@ -466,6 +490,11 @@ Lecture annulée pour éviter l'arrêt après une seule vidéo. Partage une vrai
     ) -> anyhow::Result<TrooznLiveSubmitResponse> {
         let items = self.extract_items_for_live(source_url, limit).await?;
         let added = self.append_items_to_queue(items).await;
+
+        if let Some(first_added) = added.first() {
+            let mut anchor = self.playback_anchor_item.lock().await;
+            *anchor = first_added.index;
+        }
 
         if added.is_empty() {
             anyhow::bail!("Aucun item ajouté à TROOZN Live");
@@ -922,6 +951,53 @@ Lecture annulée pour éviter l'arrêt après une seule vidéo. Partage une vrai
         }
 
         Ok(parsed_count)
+    }
+
+    async fn render_playback_playlist_from_anchor(&self) -> String {
+        let anchor = *self.playback_anchor_item.lock().await;
+        let entries = self.master_entries.lock().await.clone();
+
+        let filtered: Vec<MasterEntry> = entries
+            .into_iter()
+            .filter(|entry| entry.item_index >= anchor)
+            .collect();
+
+        let selected = if filtered.is_empty() {
+            self.master_entries.lock().await.clone()
+        } else {
+            filtered
+        };
+
+        let target_duration = selected
+            .iter()
+            .map(|entry| entry.duration.ceil() as u64)
+            .max()
+            .unwrap_or(6)
+            .max(2);
+
+        let mut out = String::new();
+
+        out.push_str("#EXTM3U\n");
+        out.push_str("#EXT-X-VERSION:3\n");
+        out.push_str("#EXT-X-PLAYLIST-TYPE:EVENT\n");
+        out.push_str(&format!("#EXT-X-TARGETDURATION:{}\n", target_duration));
+        out.push_str("#EXT-X-MEDIA-SEQUENCE:0\n");
+        out.push_str("#EXT-X-DISCONTINUITY-SEQUENCE:0\n");
+
+        let mut last_item: Option<usize> = None;
+
+        for entry in selected.iter() {
+            if last_item.map(|v| v != entry.item_index).unwrap_or(false) {
+                out.push_str("#EXT-X-DISCONTINUITY\n");
+            }
+
+            last_item = Some(entry.item_index);
+
+            out.push_str(&format!("#EXTINF:{:.6},\n", entry.duration));
+            out.push_str(&format!("{}\n", entry.segment));
+        }
+
+        out
     }
 
     async fn rewrite_master_playlist(&self, ended: bool) -> anyhow::Result<()> {
@@ -1505,7 +1581,7 @@ fn item_from_ytdlp_value(index: usize, v: &Value) -> Option<TrooznLiveItem> {
 async fn extract_full_video_metadata(source_url: &str) -> anyhow::Result<FullVideoMetadata> {
     let mut last_error = String::new();
 
-    for attempt in 1..=1 {
+    for attempt in 1..=3 {
         let mut cmd = Command::new(YTDLP_BIN);
 
         add_ytdlp_common_args(&mut cmd).await;
@@ -1601,8 +1677,10 @@ fn best_thumbnail_from_value(root: &Value) -> Option<String> {
 
 async fn resolve_youtube_720_url(source_url: &str) -> anyhow::Result<String> {
     let mut last_error = String::new();
+    let mut attempt_count: usize = 0;
 
-    for attempt in 1..=1 {
+    for attempt in 1..=3 {
+        attempt_count += 1;
         let mut cmd = Command::new(YTDLP_BIN);
 
         // Pas de add_ytdlp_common_args ici.
@@ -1660,7 +1738,7 @@ async fn resolve_youtube_720_url(source_url: &str) -> anyhow::Result<String> {
         sleep(Duration::from_millis(600 * attempt)).await;
     }
 
-    anyhow::bail!("yt-dlp a échoué après retries: {last_error}");
+    anyhow::bail!("yt-dlp a échoué après {attempt_count} tentative(s): {last_error}");
 }
 
 async fn add_ytdlp_common_args(cmd: &mut Command) {
