@@ -27,6 +27,7 @@ const MAX_PRODUCER_AHEAD_ITEMS: usize = 20;
 
 const PUBLIC_HLS_URL: &str = "http://127.0.0.1:8787/troozn-live/playlist-youtube.m3u8";
 
+const YTDLP_COOKIES_FILE: &str = "/home/troozn/.config/troozn/youtube-cookies.txt";
 const YTDLP_720_FORMAT: &str =
     "96/95/22/94/93/18/best[height<=1080]";
 
@@ -1812,6 +1813,25 @@ fn best_thumbnail_from_value(root: &Value) -> Option<String> {
         .map(|(_, url)| url)
 }
 
+fn is_youtube_auth_or_bot_error(text: &str) -> bool {
+    let lower = text.to_lowercase();
+
+    lower.contains("sign in to confirm")
+        || lower.contains("not a bot")
+        || lower.contains("use --cookies")
+        || lower.contains("please sign in")
+        || lower.contains("confirm you're not a bot")
+        || lower.contains("confirm you’re not a bot")
+}
+
+
+fn add_ytdlp_cookies_if_available(cmd: &mut Command) {
+    if std::path::Path::new(YTDLP_COOKIES_FILE).exists() {
+        cmd.args(["--cookies", YTDLP_COOKIES_FILE]);
+    }
+}
+
+
 async fn resolve_youtube_720_url(source_url: &str) -> anyhow::Result<String> {
     let mut last_error = String::new();
     let mut attempt_count: usize = 0;
@@ -1819,6 +1839,7 @@ async fn resolve_youtube_720_url(source_url: &str) -> anyhow::Result<String> {
     for attempt in 1..=3 {
         attempt_count += 1;
         let mut cmd = Command::new(YTDLP_BIN);
+        add_ytdlp_cookies_if_available(&mut cmd);
 
         // Pas de add_ytdlp_common_args ici.
         // Le test manuel yt-dlp -g fonctionne sans Deno/remote-components.
@@ -1857,6 +1878,15 @@ async fn resolve_youtube_720_url(source_url: &str) -> anyhow::Result<String> {
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             last_error = stderr.trim().to_string();
+
+            if is_youtube_auth_or_bot_error(&last_error) {
+                eprintln!(
+                    "TROOZN_LIVE_YTDLP_AUTH_OR_BOT_SKIP url={} error={}",
+                    source_url,
+                    last_error
+                );
+                break;
+            }
             sleep(Duration::from_millis(600 * attempt)).await;
             continue;
         }
