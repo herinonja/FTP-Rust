@@ -173,7 +173,7 @@ impl TrooznLive {
     pub fn new_default() -> Self {
         let idle = TrooznLiveNow {
             state: "idle".to_string(),
-            hls_url: hls_url.clone(),
+            hls_url: PUBLIC_HLS_URL.to_string(),
             ..Default::default()
         };
 
@@ -450,7 +450,7 @@ Lecture annulée pour éviter l'arrêt après une seule vidéo. Partage une vrai
 
         Ok(TrooznLiveSubmitResponse {
             ok: true,
-            hls_url: PUBLIC_HLS_URL.to_string(),
+            hls_url,
             live_dir: self.root_dir.clone(),
             count: items.len(),
             queue: items,
