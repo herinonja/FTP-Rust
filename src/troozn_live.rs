@@ -26,7 +26,7 @@ const MAX_PRODUCER_AHEAD_ITEMS: usize = 20;
 const PUBLIC_HLS_URL: &str = "http://127.0.0.1:8787/troozn-live/playlist-youtube.m3u8";
 
 const YTDLP_720_FORMAT: &str =
-    "96/95/94/93/22/18/best[height<=1080]";
+    "96/95/22/94/93/18/best[height<=1080]";
 
 #[derive(Debug)]
 pub struct TrooznLive {
@@ -607,9 +607,8 @@ Lecture annulée pour éviter l'arrêt après une seule vidéo. Partage une vrai
     }
 
     async fn wait_until_future_buffer_needed(&self, _next_item_index: usize) {
-        // Producteur rapide :
-        // on ne bloque plus sur l'item actuellement lu par Kodi.
-        // La limite réelle reste MAX_ITEMS + stockage disque hors /tmp.
+        // TROOZN Live v1 : producer rapide.
+        // Ne dépend pas de l'item actuellement lu par Kodi.
         return;
     }
 
