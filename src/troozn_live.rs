@@ -1352,7 +1352,9 @@ async fn resolve_youtube_720_url(source_url: &str) -> anyhow::Result<String> {
     for attempt in 1..=1 {
         let mut cmd = Command::new(YTDLP_BIN);
 
-        add_ytdlp_common_args(&mut cmd).await;
+        // Pas de add_ytdlp_common_args ici.
+        // Le test manuel yt-dlp -g fonctionne sans Deno/remote-components.
+        // On garde donc cette résolution aussi simple et rapide que possible.
 
         cmd.args([
             "--no-playlist",
