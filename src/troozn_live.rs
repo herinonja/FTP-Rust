@@ -36,6 +36,8 @@ pub struct TrooznLive {
     playback_now: Mutex<TrooznLiveNow>,
     queue: Mutex<Vec<TrooznLiveItem>>,
     master_entries: Mutex<Vec<MasterEntry>>,
+    session_id: Mutex<String>,
+    worker_running: Mutex<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -171,7 +173,7 @@ impl TrooznLive {
     pub fn new_default() -> Self {
         let idle = TrooznLiveNow {
             state: "idle".to_string(),
-            hls_url: PUBLIC_HLS_URL.to_string(),
+            hls_url: hls_url.clone(),
             ..Default::default()
         };
 
@@ -182,7 +184,136 @@ impl TrooznLive {
             playback_now: Mutex::new(idle),
             queue: Mutex::new(Vec::new()),
             master_entries: Mutex::new(Vec::new()),
+            session_id: Mutex::new(unix_timestamp().to_string()),
+            worker_running: Mutex::new(false),
         }
+    }
+
+    async fn current_hls_url(&self) -> String {
+        let session_id = self.session_id.lock().await.clone();
+        format!("{}?session={}", PUBLIC_HLS_URL, session_id)
+    }
+
+    async fn new_session_id(&self) -> String {
+        let id = unix_timestamp().to_string();
+        let mut guard = self.session_id.lock().await;
+        *guard = id.clone();
+        id
+    }
+
+    async fn append_items_to_queue(&self, items: Vec<TrooznLiveItem>) -> Vec<TrooznLiveItem> {
+        let mut queue = self.queue.lock().await;
+        let base = queue.len();
+
+        let mut added = Vec::new();
+
+        for (offset, mut item) in items.into_iter().enumerate() {
+            item.index = base + offset + 1;
+            added.push(item.clone());
+            queue.push(item);
+        }
+
+        added
+    }
+
+    async fn next_title_after(&self, index: usize) -> Option<String> {
+        let queue = self.queue.lock().await;
+
+        queue
+            .iter()
+            .find(|candidate| candidate.index > index)
+            .map(|candidate| candidate.title.clone())
+    }
+
+    async fn extract_items_for_live(
+        &self,
+        source_url: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<TrooznLiveItem>> {
+        let limit = limit.clamp(1, MAX_ITEMS);
+
+        let mut extraction_urls: Vec<String> = vec![source_url.to_string()];
+
+        if let Some(normalized) = normalize_rd_playlist_to_watch_url(source_url) {
+            if normalized != source_url {
+                eprintln!(
+                    "TROOZN_LIVE_RD_NORMALIZED source_url={} normalized={}",
+                    source_url, normalized
+                );
+                extraction_urls.push(normalized);
+            }
+        }
+
+        let mut last_error: Option<String> = None;
+
+        for candidate_url in extraction_urls.iter() {
+            match extract_youtube_items_with_retry(candidate_url, limit).await {
+                Ok(found) if !found.is_empty() => {
+                    eprintln!(
+                        "TROOZN_LIVE_EXTRACT_OK url={} count={}",
+                        candidate_url,
+                        found.len()
+                    );
+                    return Ok(found);
+                }
+                Ok(_) => {
+                    last_error = Some(format!("Extraction vide pour {}", candidate_url));
+                    eprintln!("TROOZN_LIVE_EXTRACT_EMPTY url={}", candidate_url);
+                }
+                Err(err) => {
+                    last_error = Some(err.to_string());
+                    eprintln!(
+                        "TROOZN_LIVE_EXTRACT_FAILED url={} error={err:?}",
+                        candidate_url
+                    );
+                }
+            }
+        }
+
+        if let Some(item) = fallback_single_item_from_url(source_url) {
+            eprintln!(
+                "TROOZN_LIVE_EXTRACT_FALLBACK_SINGLE source_url={} item_url={}",
+                source_url,
+                item.source_url
+            );
+            return Ok(vec![item]);
+        }
+
+        anyhow::bail!(
+            "Aucun item extractible pour ce lien. Dernière erreur: {}",
+            last_error.unwrap_or_else(|| "inconnue".to_string())
+        );
+    }
+
+    async fn ensure_worker_running(self: std::sync::Arc<Self>) {
+        {
+            let mut running = self.worker_running.lock().await;
+
+            if *running {
+                return;
+            }
+
+            *running = true;
+        }
+
+        let live = self.clone();
+
+        tokio::spawn(async move {
+            eprintln!("TROOZN_LIVE_WORKER_SPAWN");
+
+            if let Err(err) = live.clone().run_hls_worker().await {
+                eprintln!("TROOZN_LIVE_WORKER_ERROR: {err:?}");
+
+                let mut producer = live.producer_now.lock().await;
+                producer.state = "error".to_string();
+                producer.last_error = Some(err.to_string());
+            }
+
+            let mut running = live.worker_running.lock().await;
+            *running = false;
+
+            eprintln!("TROOZN_LIVE_WORKER_EXIT");
+        });
     }
 
     async fn ensure_clean_dir(&self) -> anyhow::Result<()> {
@@ -215,6 +346,7 @@ impl TrooznLive {
     ) -> anyhow::Result<TrooznLiveSubmitResponse> {
         self.stop_current_ffmpeg().await;
         self.ensure_clean_dir().await?;
+        self.new_session_id().await;
 
         {
             let mut entries = self.master_entries.lock().await;
@@ -311,28 +443,10 @@ Lecture annulée pour éviter l'arrêt après une seule vidéo. Partage une vrai
             *guard = now.clone();
         }
 
-        let live = self.clone();
-        let items_for_worker = items.clone();
-
-        tokio::spawn(async move {
-            let live_for_error = live.clone();
-
-            if let Err(err) = live.run_hls_worker(items_for_worker).await {
-                eprintln!("TROOZN_LIVE_WORKER_ERROR: {err:?}");
-
-                let mut producer = live_for_error.producer_now.lock().await;
-                producer.state = "error".to_string();
-                producer.last_error = Some(err.to_string());
-
-                let mut playback = live_for_error.playback_now.lock().await;
-                if playback.state != "playing" {
-                    playback.state = "error".to_string();
-                    playback.last_error = Some(err.to_string());
-                }
-            }
-        });
+        self.clone().ensure_worker_running().await;
 
         let now = self.current_now().await;
+        let hls_url = self.current_hls_url().await;
 
         Ok(TrooznLiveSubmitResponse {
             ok: true,
@@ -344,9 +458,45 @@ Lecture annulée pour éviter l'arrêt après une seule vidéo. Partage une vrai
         })
     }
 
+    pub async fn add_youtube_live_queue(
+        self: std::sync::Arc<Self>,
+        source_url: &str,
+        _title: Option<String>,
+        limit: usize,
+    ) -> anyhow::Result<TrooznLiveSubmitResponse> {
+        let items = self.extract_items_for_live(source_url, limit).await?;
+        let added = self.append_items_to_queue(items).await;
+
+        if added.is_empty() {
+            anyhow::bail!("Aucun item ajouté à TROOZN Live");
+        }
+
+        {
+            let mut producer = self.producer_now.lock().await;
+
+            if producer.state == "ended" || producer.state == "idle" {
+                producer.state = "waiting".to_string();
+                producer.last_error = Some("Nouveaux items ajoutés".to_string());
+            }
+        }
+
+        self.clone().ensure_worker_running().await;
+
+        let now = self.current_now().await;
+        let hls_url = self.current_hls_url().await;
+
+        Ok(TrooznLiveSubmitResponse {
+            ok: true,
+            hls_url,
+            live_dir: self.root_dir.clone(),
+            count: added.len(),
+            queue: added,
+            now,
+        })
+    }
+
     async fn run_hls_worker(
         self: std::sync::Arc<Self>,
-        items: Vec<TrooznLiveItem>,
     ) -> anyhow::Result<()> {
         let stream_started_at = unix_timestamp();
         let mut appended_any = false;
@@ -354,7 +504,28 @@ Lecture annulée pour éviter l'arrêt après une seule vidéo. Partage une vrai
 
         write_empty_master_playlist(&self.root_dir.join("index.m3u8")).await?;
 
-        for item in items.iter() {
+        let mut cursor: usize = 0;
+
+        loop {
+            let item = loop {
+                let queue = self.queue.lock().await;
+
+                if cursor < queue.len() {
+                    let item = queue[cursor].clone();
+                    cursor += 1;
+                    break item;
+                }
+
+                drop(queue);
+
+                {
+                    let mut producer = self.producer_now.lock().await;
+                    producer.state = "waiting".to_string();
+                    producer.last_error = Some("En attente de nouveaux items".to_string());
+                }
+
+                sleep(Duration::from_millis(1000)).await;
+            };
             live_audit(
                 &self.root_dir,
                 format!(
@@ -366,10 +537,7 @@ Lecture annulée pour éviter l'arrêt après une seule vidéo. Partage une vrai
 
             self.wait_until_future_buffer_needed(item.index).await;
 
-            let next_title = items
-                .iter()
-                .find(|candidate| candidate.index > item.index)
-                .map(|candidate| candidate.title.clone());
+            let next_title = self.next_title_after(item.index).await;
 
             {
                 let mut guard = self.producer_now.lock().await;
@@ -1535,6 +1703,59 @@ pub async fn troozn_live_health() -> impl IntoResponse {
         "quality": "1080p-hls-copy",
         "hls_url": PUBLIC_HLS_URL
     }))
+}
+
+
+pub async fn troozn_live_start(
+    State(state): State<HttpGatewayState>,
+    Json(req): Json<TrooznLiveSubmitRequest>,
+) -> Response {
+    let live = state.live.clone();
+
+    match live
+        .start_youtube_live_queue(&req.url, req.title, req.limit.unwrap_or(MAX_ITEMS))
+        .await
+    {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(err) => {
+            eprintln!("TROOZN_LIVE_START_ERROR: {err:?}");
+
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "ok": false,
+                    "error": err.to_string()
+                })),
+            )
+                .into_response()
+        }
+    }
+}
+
+pub async fn troozn_live_add(
+    State(state): State<HttpGatewayState>,
+    Json(req): Json<TrooznLiveSubmitRequest>,
+) -> Response {
+    let live = state.live.clone();
+
+    match live
+        .add_youtube_live_queue(&req.url, req.title, req.limit.unwrap_or(MAX_ITEMS))
+        .await
+    {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(err) => {
+            eprintln!("TROOZN_LIVE_ADD_ERROR: {err:?}");
+
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "ok": false,
+                    "error": err.to_string()
+                })),
+            )
+                .into_response()
+        }
+    }
 }
 
 pub async fn troozn_live_submit(

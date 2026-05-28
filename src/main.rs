@@ -782,6 +782,8 @@ async fn run_http_media_gateway(
         .route("/health", get(http_health))
         .route("/media/*path", get(http_get_media).head(http_head_media))
         .route("/troozn-live/health", get(troozn_live::troozn_live_health))
+        .route("/troozn-live/start", post(troozn_live::troozn_live_start))
+        .route("/troozn-live/add", post(troozn_live::troozn_live_add))
         .route("/troozn-live/submit", post(troozn_live::troozn_live_submit))
         .route("/troozn-live/now", get(troozn_live::troozn_live_now))
         .route(
