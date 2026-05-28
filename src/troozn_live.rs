@@ -185,7 +185,9 @@ impl TrooznLive {
 
                 fallback_single_item_from_url(source_url)
                     .map(|item| vec![item])
-                    .ok_or_else(|| anyhow::anyhow!("Extraction playlist échouée et fallback impossible: {err}"))?
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "Extraction playlist échouée et aucun ID vidéo de fallback trouvé dans l’URL. Pour les mixes YouTube RDEM/RD opaque, partage plutôt une vidéo précise du mix. Erreur yt-dlp: {err}"
+                    ))?
             }
         };
 
@@ -814,6 +816,11 @@ fn fallback_single_item_from_url(source_url: &str) -> Option<TrooznLiveItem> {
     let video_id = extract_youtube_video_id(source_url)?;
     let watch_url = format!("https://www.youtube.com/watch?v={}", video_id);
 
+    eprintln!(
+        "TROOZN_LIVE_FALLBACK_SINGLE source_url={} watch_url={}",
+        source_url, watch_url
+    );
+
     Some(TrooznLiveItem {
         item_id: item_id_for_url(&watch_url),
         index: 1,
@@ -830,14 +837,14 @@ fn fallback_single_item_from_url(source_url: &str) -> Option<TrooznLiveItem> {
 }
 
 fn extract_youtube_video_id(source_url: &str) -> Option<String> {
-    // Cas standard watch?v=VIDEO_ID
+    // Cas standard: watch?v=VIDEO_ID
     if let Some(v) = query_param(source_url, "v") {
         if looks_like_youtube_id(&v) {
             return Some(v);
         }
     }
 
-    // Cas youtu.be/VIDEO_ID
+    // Cas court: youtu.be/VIDEO_ID
     if let Some(pos) = source_url.find("youtu.be/") {
         let rest = &source_url[pos + "youtu.be/".len()..];
         let id = rest
@@ -851,27 +858,57 @@ fn extract_youtube_video_id(source_url: &str) -> Option<String> {
         }
     }
 
-    // Cas playlist radio/mix YouTube list=RDVIDEO_ID ou RDMMVIDEO_ID.
+    // Cas embed/shorts: /embed/VIDEO_ID ou /shorts/VIDEO_ID
+    for marker in ["/embed/", "/shorts/"] {
+        if let Some(pos) = source_url.find(marker) {
+            let rest = &source_url[pos + marker.len()..];
+            let id = rest
+                .split(|c| c == '?' || c == '&' || c == '/' || c == '#')
+                .next()
+                .unwrap_or("")
+                .to_string();
+
+            if looks_like_youtube_id(&id) {
+                return Some(id);
+            }
+        }
+    }
+
+    // Cas radio/mix simple : list=RDVIDEO_ID ou list=RDMMVIDEO_ID
     if let Some(list) = query_param(source_url, "list") {
-        if let Some(rest) = list.strip_prefix("RDMM") {
-            if looks_like_youtube_id(rest) {
-                return Some(rest.to_string());
+        let candidates = [
+            list.strip_prefix("RDMM"),
+            list.strip_prefix("RD"),
+        ];
+
+        for candidate in candidates.into_iter().flatten() {
+            let id = candidate
+                .split(|c| c == '?' || c == '&' || c == '/' || c == '#')
+                .next()
+                .unwrap_or("")
+                .to_string();
+
+            if looks_like_youtube_id(&id) {
+                return Some(id);
             }
         }
 
-        if let Some(rest) = list.strip_prefix("RD") {
-            if looks_like_youtube_id(rest) {
-                return Some(rest.to_string());
-            }
-        }
+        eprintln!(
+            "TROOZN_LIVE_FALLBACK_NO_VIDEO_ID_IN_LIST list={}",
+            list
+        );
     }
 
     None
 }
 
 fn query_param(source_url: &str, key: &str) -> Option<String> {
-    for part in source_url.split(|c| c == '?' || c == '&') {
-        let (k, v) = part.split_once('=')?;
+    let query = source_url.split_once('?').map(|(_, q)| q).unwrap_or(source_url);
+
+    for part in query.split('&') {
+        let Some((k, v)) = part.split_once('=') else {
+            continue;
+        };
 
         if k == key {
             return Some(percent_decode_minimal(v));
