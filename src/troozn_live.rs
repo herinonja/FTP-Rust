@@ -356,9 +356,12 @@ impl TrooznLive {
             fs::remove_dir_all(&self.root_dir).await.ok();
         }
 
-        fs::create_dir_all(&self.root_dir)
-            .await
-            .with_context(|| format!("création {}", self.root_dir.display()))?;
+        fs::create_dir_all(&self.root_dir).await?;
+
+        {
+            let mut entries = self.master_entries.lock().await;
+            entries.clear();
+        }
 
         Ok(())
     }
@@ -1879,7 +1882,7 @@ async fn resolve_youtube_720_url(source_url: &str) -> anyhow::Result<String> {
     let mut last_error = String::new();
     let mut attempt_count: usize = 0;
 
-    for attempt in 1..=3 {
+    for attempt in 1..=1 {
         attempt_count += 1;
         let mut cmd = Command::new(YTDLP_BIN);
         add_ytdlp_cookies_if_available(&mut cmd);
@@ -1904,7 +1907,7 @@ async fn resolve_youtube_720_url(source_url: &str) -> anyhow::Result<String> {
             source_url,
         ]);
 
-        let output = match timeout(Duration::from_secs(30), cmd.output()).await {
+        let output = match timeout(Duration::from_secs(20), cmd.output()).await {
             Ok(Ok(output)) => output,
             Ok(Err(err)) => {
                 last_error = format!("exécution yt-dlp: {err}");
