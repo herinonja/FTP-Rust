@@ -41,6 +41,7 @@ pub struct TrooznLive {
     master_entries: Mutex<Vec<MasterEntry>>,
     session_id: Mutex<String>,
     worker_running: Mutex<bool>,
+    generation_id: Mutex<u64>,
     playback_anchor_item: Mutex<usize>,
 }
 
@@ -201,6 +202,7 @@ impl TrooznLive {
             master_entries: Mutex::new(Vec::new()),
             session_id: Mutex::new(unix_timestamp().to_string()),
             worker_running: Mutex::new(false),
+            generation_id: Mutex::new(0),
             playback_anchor_item: Mutex::new(1),
         }
     }
@@ -301,6 +303,16 @@ impl TrooznLive {
         );
     }
 
+    async fn bump_generation(&self) -> u64 {
+        let mut guard = self.generation_id.lock().await;
+        *guard = guard.saturating_add(1);
+        *guard
+    }
+
+    async fn current_generation(&self) -> u64 {
+        *self.generation_id.lock().await
+    }
+
     async fn ensure_worker_running(self: std::sync::Arc<Self>) {
         {
             let mut running = self.worker_running.lock().await;
@@ -313,11 +325,15 @@ impl TrooznLive {
         }
 
         let live = self.clone();
+        let worker_generation = self.current_generation().await;
 
         tokio::spawn(async move {
-            eprintln!("TROOZN_LIVE_WORKER_SPAWN");
+            eprintln!(
+                "TROOZN_LIVE_WORKER_SPAWN generation={}",
+                worker_generation
+            );
 
-            if let Err(err) = live.clone().run_hls_worker().await {
+            if let Err(err) = live.clone().run_hls_worker(worker_generation).await {
                 eprintln!("TROOZN_LIVE_WORKER_ERROR: {err:?}");
 
                 let mut producer = live.producer_now.lock().await;
@@ -328,7 +344,10 @@ impl TrooznLive {
             let mut running = live.worker_running.lock().await;
             *running = false;
 
-            eprintln!("TROOZN_LIVE_WORKER_EXIT");
+            eprintln!(
+                "TROOZN_LIVE_WORKER_EXIT generation={}",
+                worker_generation
+            );
         });
     }
 
@@ -362,6 +381,13 @@ impl TrooznLive {
     ) -> anyhow::Result<TrooznLiveSubmitResponse> {
 
         self.stop_current_ffmpeg().await;
+
+        self.bump_generation().await;
+        {
+            let mut running = self.worker_running.lock().await;
+            *running = false;
+        }
+
         self.ensure_clean_dir().await?;
         self.new_session_id().await;
 
@@ -524,6 +550,7 @@ Lecture annulée pour éviter l'arrêt après une seule vidéo. Partage une vrai
 
     async fn run_hls_worker(
         self: std::sync::Arc<Self>,
+        worker_generation: u64,
     ) -> anyhow::Result<()> {
         let stream_started_at = unix_timestamp();
         let mut appended_any = false;
@@ -534,7 +561,23 @@ Lecture annulée pour éviter l'arrêt après une seule vidéo. Partage une vrai
         let mut cursor: usize = 0;
 
         loop {
+            if self.current_generation().await != worker_generation {
+                eprintln!(
+                    "TROOZN_LIVE_WORKER_STALE_EXIT generation={}",
+                    worker_generation
+                );
+                return Ok(());
+            }
+
             let item = loop {
+                if self.current_generation().await != worker_generation {
+                    eprintln!(
+                        "TROOZN_LIVE_WORKER_STALE_EXIT_IN_WAIT generation={}",
+                        worker_generation
+                    );
+                    return Ok(());
+                }
+
                 let queue = self.queue.lock().await;
 
                 if cursor < queue.len() {
