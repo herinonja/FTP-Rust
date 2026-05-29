@@ -19,7 +19,7 @@ use tokio::time::{sleep, timeout, Duration};
 use crate::HttpGatewayState;
 
 const LIVE_DIR: &str = "/home/troozn/.kodi/userdata/TROOZN/live";
-const YTDLP_BIN: &str = "/usr/local/bin/yt-dlp";
+const YTDLP_BIN: &str = "/home/troozn/.local/bin/yt-dlp";
 const LIVE_KEEP_BEHIND_ITEMS: usize = 2;
 const LIVE_MAX_DIR_BYTES: u64 = 1500 * 1024 * 1024;
 const MAX_ITEMS: usize = 20;
@@ -557,7 +557,6 @@ Lecture annulée pour éviter l'arrêt après une seule vidéo. Partage une vrai
     ) -> anyhow::Result<()> {
         let stream_started_at = unix_timestamp();
         let mut appended_any = false;
-        let mut skipped_items: usize = 0;
 
         write_empty_master_playlist(&self.root_dir.join("index.m3u8")).await?;
 
@@ -683,7 +682,6 @@ Lecture annulée pour éviter l'arrêt après une seule vidéo. Partage une vrai
                         guard.last_error = Some(format!("Item ignoré: {}", item.title));
                     }
 
-                    skipped_items += 1;
                     sleep(Duration::from_millis(150)).await;
                     continue;
                 }
@@ -1907,7 +1905,11 @@ async fn resolve_youtube_720_url(source_url: &str) -> anyhow::Result<String> {
             source_url,
         ]);
 
-        let output = match timeout(Duration::from_secs(20), cmd.output()).await {
+        let ytdlp_started = std::time::Instant::now();
+
+
+
+        let output = match timeout(Duration::from_secs(30), cmd.output()).await {
             Ok(Ok(output)) => output,
             Ok(Err(err)) => {
                 last_error = format!("exécution yt-dlp: {err}");
@@ -1920,6 +1922,15 @@ async fn resolve_youtube_720_url(source_url: &str) -> anyhow::Result<String> {
                 continue;
             }
         };
+
+        let elapsed_ms = ytdlp_started.elapsed().as_millis();
+
+        eprintln!(
+            "TROOZN_LIVE_YTDLP_G_DONE attempt={} elapsed_ms={} status={}",
+            attempt_count,
+            elapsed_ms,
+            output.status
+        );
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
