@@ -22,6 +22,10 @@ const LIVE_DIR: &str = "/home/troozn/.kodi/userdata/TROOZN/live";
 const YTDLP_BIN: &str = "/home/troozn/.local/bin/yt-dlp";
 const LIVE_KEEP_BEHIND_ITEMS: usize = 2;
 const LIVE_MAX_DIR_BYTES: u64 = 1500 * 1024 * 1024;
+const PLAYLIST_PAGE_SIZE: usize = 20;
+const PLAYLIST_REFILL_THRESHOLD: usize = 5;
+const LIVE_CONSUME_MODE: bool = true;
+const LIVE_CONSUME_KEEP_BEHIND_ITEMS: usize = 2;
 const MAX_ITEMS: usize = 20;
 const MAX_PRODUCER_AHEAD_ITEMS: usize = 20;
 
@@ -32,6 +36,15 @@ const YTDLP_720_FORMAT: &str =
     "96/95/22/94/93/18/best[height<=1080]";
 
 #[derive(Debug)]
+#[derive(Debug, Clone)]
+struct PlaylistRefillState {
+    source_url: String,
+    next_start: usize,
+    exhausted: bool,
+    active: bool,
+}
+
+
 pub struct TrooznLive {
     pub root_dir: PathBuf,
     ffmpeg_child: Mutex<Option<Child>>,
@@ -39,6 +52,7 @@ pub struct TrooznLive {
     playback_now: Mutex<TrooznLiveNow>,
     queue: Mutex<Vec<TrooznLiveItem>>,
     master_entries: Mutex<Vec<MasterEntry>>,
+    playlist_refill: Mutex<Option<PlaylistRefillState>>,
     session_id: Mutex<String>,
     worker_running: Mutex<bool>,
     generation_id: Mutex<u64>,
@@ -200,6 +214,7 @@ impl TrooznLive {
             playback_now: Mutex::new(idle),
             queue: Mutex::new(Vec::new()),
             master_entries: Mutex::new(Vec::new()),
+            playlist_refill: Mutex::new(None),
             session_id: Mutex::new(unix_timestamp().to_string()),
             worker_running: Mutex::new(false),
             generation_id: Mutex::new(0),
@@ -232,6 +247,100 @@ impl TrooznLive {
         }
 
         added
+    }
+
+    async fn maybe_refill_playlist_queue(&self, current_index: usize) {
+        let queue_len = {
+            let queue = self.queue.lock().await;
+            queue.len()
+        };
+
+        if queue_len <= current_index {
+            return;
+        }
+
+        let remaining = queue_len.saturating_sub(current_index);
+
+        if remaining > PLAYLIST_REFILL_THRESHOLD {
+            return;
+        }
+
+        let refill_state = {
+            let mut guard = self.playlist_refill.lock().await;
+
+            let Some(state) = guard.as_mut() else {
+                return;
+            };
+
+            if state.exhausted || state.active {
+                return;
+            }
+
+            state.active = true;
+            state.clone()
+        };
+
+        let start = refill_state.next_start;
+        let end = start + PLAYLIST_PAGE_SIZE - 1;
+        let source_url = refill_state.source_url.clone();
+
+        eprintln!(
+            "TROOZN_LIVE_REFILL_START current_index={} remaining={} start={} end={}",
+            current_index,
+            remaining,
+            start,
+            end
+        );
+
+        let result = extract_youtube_items_range_with_retry(&source_url, start, end).await;
+
+        let mut guard = self.playlist_refill.lock().await;
+
+        match result {
+            Ok(items) if !items.is_empty() => {
+                let count = items.len();
+
+                drop(guard);
+
+                let added = self.append_items_to_queue(items).await;
+
+                let mut guard = self.playlist_refill.lock().await;
+
+                if let Some(state) = guard.as_mut() {
+                    state.next_start = start + count;
+                    state.active = false;
+
+                    if count < PLAYLIST_PAGE_SIZE {
+                        state.exhausted = true;
+                    }
+                }
+
+                eprintln!(
+                    "TROOZN_LIVE_REFILL_DONE added={} next_start={}",
+                    added.len(),
+                    start + count
+                );
+            }
+            Ok(_) => {
+                if let Some(state) = guard.as_mut() {
+                    state.exhausted = true;
+                    state.active = false;
+                }
+
+                eprintln!("TROOZN_LIVE_REFILL_EXHAUSTED start={} end={}", start, end);
+            }
+            Err(err) => {
+                if let Some(state) = guard.as_mut() {
+                    state.active = false;
+                }
+
+                eprintln!(
+                    "TROOZN_LIVE_REFILL_ERROR start={} end={} error={err:?}",
+                    start,
+                    end
+                );
+            }
+        }
     }
 
     async fn next_title_after(&self, index: usize) -> Option<String> {
@@ -494,6 +603,25 @@ Lecture annulée pour éviter l'arrêt après une seule vidéo. Partage une vrai
             *guard = now.clone();
         }
 
+        if is_probably_youtube_playlist_url(source_url) && items.len() >= PLAYLIST_PAGE_SIZE {
+            let mut refill = self.playlist_refill.lock().await;
+            *refill = Some(PlaylistRefillState {
+                source_url: source_url.to_string(),
+                next_start: PLAYLIST_PAGE_SIZE + 1,
+                exhausted: false,
+                active: false,
+            });
+
+            eprintln!(
+                "TROOZN_LIVE_REFILL_REGISTER source_url={} next_start={}",
+                source_url,
+                PLAYLIST_PAGE_SIZE + 1
+            );
+        } else {
+            let mut refill = self.playlist_refill.lock().await;
+            *refill = None;
+        }
+
         self.clone().ensure_worker_running().await;
 
         let now = self.current_now().await;
@@ -518,7 +646,24 @@ Lecture annulée pour éviter l'arrêt après une seule vidéo. Partage une vrai
         let items = self.extract_items_for_live(source_url, limit).await?;
         let added = self.append_items_to_queue(items).await;
 
-        if let Some(first_added) = added.first() {
+        
+        if is_probably_youtube_playlist_url(source_url) && added.len() >= PLAYLIST_PAGE_SIZE {
+            let mut refill = self.playlist_refill.lock().await;
+            *refill = Some(PlaylistRefillState {
+                source_url: source_url.to_string(),
+                next_start: PLAYLIST_PAGE_SIZE + 1,
+                exhausted: false,
+                active: false,
+            });
+
+            eprintln!(
+                "TROOZN_LIVE_REFILL_REGISTER_ADD source_url={} next_start={}",
+                source_url,
+                PLAYLIST_PAGE_SIZE + 1
+            );
+        }
+
+if let Some(first_added) = added.first() {
             let mut anchor = self.playback_anchor_item.lock().await;
             *anchor = first_added.index;
         }
@@ -823,7 +968,9 @@ Lecture annulée pour éviter l'arrêt après une seule vidéo. Partage une vrai
                                     item.index, item.title
                                 );
 
-                                live_audit(
+                                
+                                self.maybe_refill_playlist_queue(item.index).await;
+live_audit(
                                     &self.root_dir,
                                     format!(
                                         "ITEM_FFMPEG_DONE index={} title={} status={} ts_files={} manifest_lines={}",
@@ -1157,6 +1304,101 @@ Lecture annulée pour éviter l'arrêt après une seule vidéo. Partage une vrai
         Ok(())
     }
 
+    async fn consume_cleanup_before_item(&self, current_item_index: usize) {
+        if !LIVE_CONSUME_MODE {
+            return;
+        }
+
+        if current_item_index <= LIVE_CONSUME_KEEP_BEHIND_ITEMS + 1 {
+            return;
+        }
+
+        let keep_from = current_item_index.saturating_sub(LIVE_CONSUME_KEEP_BEHIND_ITEMS);
+
+        eprintln!(
+            "TROOZN_LIVE_CONSUME_CLEANUP current_item={} keep_from={}",
+            current_item_index,
+            keep_from
+        );
+
+        let mut removed_count: usize = 0;
+        let mut removed_bytes: u64 = 0;
+
+        let mut rd = match fs::read_dir(&self.root_dir).await {
+            Ok(rd) => rd,
+            Err(err) => {
+                eprintln!("TROOZN_LIVE_CONSUME_READDIR_ERROR error={err:?}");
+                return;
+            }
+        };
+
+        while let Ok(Some(entry)) = rd.next_entry().await {
+            let path = entry.path();
+
+            let Some(name) = path.file_name().map(|v| v.to_string_lossy().to_string()) else {
+                continue;
+            };
+
+            if name == "index.m3u8"
+                || name == "playlist-youtube.m3u8"
+                || name == "audit.log"
+            {
+                continue;
+            }
+
+            if !name.ends_with(".ts") && !name.ends_with(".m3u8") {
+                continue;
+            }
+
+            let Some(item_index) = parse_item_index_from_live_filename(&name) else {
+                continue;
+            };
+
+            if item_index >= keep_from {
+                continue;
+            }
+
+            let size = match entry.metadata().await {
+                Ok(meta) => meta.len(),
+                Err(_) => 0,
+            };
+
+            match fs::remove_file(&path).await {
+                Ok(_) => {
+                    removed_count += 1;
+                    removed_bytes = removed_bytes.saturating_add(size);
+                    eprintln!(
+                        "TROOZN_LIVE_CONSUME_REMOVE item={} file={} bytes={}",
+                        item_index,
+                        name,
+                        size
+                    );
+                }
+                Err(err) => {
+                    eprintln!(
+                        "TROOZN_LIVE_CONSUME_REMOVE_FAILED file={} error={err:?}",
+                        name
+                    );
+                }
+            }
+        }
+
+        {
+            let mut entries = self.master_entries.lock().await;
+            entries.retain(|entry| entry.item_index >= keep_from);
+        }
+
+        self.rewrite_master_playlist(false).await.ok();
+
+        eprintln!(
+            "TROOZN_LIVE_CONSUME_DONE current_item={} keep_from={} removed_files={} removed_bytes={}",
+            current_item_index,
+            keep_from,
+            removed_count,
+            removed_bytes
+        );
+    }
+
     async fn rewrite_master_playlist(&self, ended: bool) -> anyhow::Result<()> {
         let entries = self.master_entries.lock().await.clone();
         let index_path = self.root_dir.join("index.m3u8");
@@ -1264,7 +1506,11 @@ Lecture annulée pour éviter l'arrêt après une seule vidéo. Partage une vrai
             "TROOZN_LIVE_SEGMENT_SERVED item={} segment={} file={}",
             item_index, segment_number, relative
         );
-    }
+    
+        if let Some(current_item_index) = parse_item_index_from_live_filename(filename) {
+            self.consume_cleanup_before_item(current_item_index).await;
+        }
+}
 
     pub async fn current_now(&self) -> TrooznLiveNow {
         let playback = self.playback_now.lock().await.clone();
@@ -1377,6 +1623,15 @@ fn is_youtube_playlist_like_url(source_url: &str) -> bool {
         || source_url.contains("/playlist?")
         || source_url.contains("youtube.com/playlist")
 }
+
+fn is_probably_youtube_playlist_url(source_url: &str) -> bool {
+    let lower = source_url.to_lowercase();
+
+    lower.contains("list=")
+        || lower.contains("/playlist?")
+        || lower.contains("youtube.com/playlist")
+}
+
 
 fn is_youtube_mix_list(source_url: &str) -> bool {
     let Some(list) = query_param(source_url, "list") else {
@@ -1550,6 +1805,161 @@ fn looks_like_youtube_id(value: &str) -> bool {
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
+
+
+async fn extract_youtube_items_range_with_retry(
+    source_url: &str,
+    start: usize,
+    end: usize,
+) -> anyhow::Result<Vec<TrooznLiveItem>> {
+    match extract_youtube_items_range(source_url, start, end).await {
+        Ok(items) => Ok(items),
+        Err(err) => {
+            eprintln!(
+                "TROOZN_LIVE_RANGE_EXTRACT_FAIL start={} end={} error={err:?}",
+                start,
+                end
+            );
+            Err(err)
+        }
+    }
+}
+
+async fn extract_youtube_items_range(
+    source_url: &str,
+    start: usize,
+    end: usize,
+) -> anyhow::Result<Vec<TrooznLiveItem>> {
+    let mut cmd = Command::new(YTDLP_BIN);
+
+    cmd.args([
+        "--flat-playlist",
+        "--dump-single-json",
+        "--no-warnings",
+        "--force-ipv4",
+        "--socket-timeout",
+        "20",
+        "--playlist-start",
+        &start.to_string(),
+        "--playlist-end",
+        &end.to_string(),
+        source_url,
+    ]);
+
+    eprintln!(
+        "TROOZN_LIVE_RANGE_EXTRACT_START start={} end={} url={}",
+        start,
+        end,
+        source_url
+    );
+
+    let output = timeout(Duration::from_secs(45), cmd.output())
+        .await
+        .context("timeout yt-dlp range extract")?
+        .context("spawn yt-dlp range extract")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("yt-dlp range extract failed: {}", stderr.trim());
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let root: serde_json::Value = serde_json::from_str(&stdout)
+        .context("parse yt-dlp range json")?;
+
+    let mut items = Vec::new();
+
+    if let Some(entries) = root.get("entries").and_then(|v| v.as_array()) {
+        for entry in entries {
+            if entry.is_null() {
+                continue;
+            }
+
+            if let Some(item) = troozn_live_item_from_ytdlp_entry(entry) {
+                items.push(item);
+            }
+        }
+    }
+
+    eprintln!(
+        "TROOZN_LIVE_RANGE_EXTRACT_DONE start={} end={} count={}",
+        start,
+        end,
+        items.len()
+    );
+
+    Ok(items)
+}
+
+fn troozn_live_item_from_ytdlp_entry(entry: &serde_json::Value) -> Option<TrooznLiveItem> {
+    let id = entry
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+
+    let url = entry
+        .get("url")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+
+    let webpage_url = entry
+        .get("webpage_url")
+        .and_then(serde_json::Value::as_str)
+        .map(ToString::to_string);
+
+    let source_url = if let Some(webpage_url) = webpage_url.clone() {
+        webpage_url
+    } else if !id.is_empty() && !id.starts_with("http://") && !id.starts_with("https://") {
+        format!("https://www.youtube.com/watch?v={}", id)
+    } else if url.starts_with("http://") || url.starts_with("https://") {
+        url
+    } else if !url.is_empty() {
+        format!("https://www.youtube.com/watch?v={}", url)
+    } else {
+        return None;
+    };
+
+    let title = entry
+        .get("title")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("YouTube")
+        .to_string();
+
+    let duration = entry
+        .get("duration")
+        .and_then(serde_json::Value::as_f64)
+        .map(|v| v as u64);
+
+    let thumbnail = entry
+        .get("thumbnail")
+        .and_then(serde_json::Value::as_str)
+        .map(ToString::to_string);
+
+    let channel = entry
+        .get("channel")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| entry.get("uploader").and_then(serde_json::Value::as_str))
+        .map(ToString::to_string);
+
+    Some(TrooznLiveItem {
+        item_id: stable_item_id(&source_url),
+        index: 0,
+        title,
+        source_url,
+        webpage_url,
+        duration,
+        thumbnail,
+        channel,
+        description: None,
+        upload_date: None,
+        uploader: None,
+    })
+}
+
 
 async fn extract_youtube_items_with_retry(
     source_url: &str,
