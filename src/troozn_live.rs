@@ -868,34 +868,9 @@ Lecture annulée pour éviter l'arrêt après une seule vidéo. Partage une vrai
             }
         }
 
-        let has_any_segment = {
-            let entries = self.master_entries.lock().await;
-            !entries.is_empty()
-        };
-
-        eprintln!(
-            "TROOZN_LIVE_WORKER_FINISH skipped_items={}",
-            skipped_items
-        );
-
-        self.rewrite_master_playlist(true).await.ok();
-
-        {
-            let mut producer = self.producer_now.lock().await;
-
-            if has_any_segment {
-                producer.state = "ended".to_string();
-            } else {
-                producer.state = "error".to_string();
-
-                if producer.last_error.is_none() {
-                    producer.last_error = Some("Aucun segment HLS généré".to_string());
-                }
-            }
-        }
-
-        Ok(())
+        // Worker persistant : il attend de nouveaux items jusqu'à génération obsolète.
     }
+
 
     async fn enrich_item_metadata(&self, item: &TrooznLiveItem) -> TrooznLiveItem {
         let meta = match extract_full_video_metadata(&item.source_url).await {
