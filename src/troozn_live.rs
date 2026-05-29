@@ -35,7 +35,6 @@ const YTDLP_COOKIES_FILE: &str = "/home/troozn/.config/troozn/youtube-cookies.tx
 const YTDLP_720_FORMAT: &str =
     "96/95/22/94/93/18/best[height<=1080]";
 
-#[derive(Debug)]
 #[derive(Debug, Clone)]
 struct PlaylistRefillState {
     source_url: String,
@@ -1507,7 +1506,7 @@ live_audit(
             item_index, segment_number, relative
         );
     
-        if let Some(current_item_index) = parse_item_index_from_live_filename(filename) {
+        if let Some(current_item_index) = parse_item_index_from_live_filename(relative) {
             self.consume_cleanup_before_item(current_item_index).await;
         }
 }
@@ -1889,6 +1888,19 @@ async fn extract_youtube_items_range(
     );
 
     Ok(items)
+}
+
+fn stable_item_id(source_url: &str) -> String {
+    use sha1::{Digest, Sha1};
+
+    let mut hasher = Sha1::new();
+    hasher.update(source_url.as_bytes());
+    let digest = hasher.finalize();
+
+    format!("{:x}", digest)
+        .chars()
+        .take(16)
+        .collect::<String>()
 }
 
 fn troozn_live_item_from_ytdlp_entry(entry: &serde_json::Value) -> Option<TrooznLiveItem> {

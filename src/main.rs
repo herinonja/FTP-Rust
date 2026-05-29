@@ -65,7 +65,7 @@ struct HeadCache {
     prefetching: RwLock<HashSet<String>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct HttpGatewayState {
     registry: Registry,
     cache: Arc<HeadCache>,
