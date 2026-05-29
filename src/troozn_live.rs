@@ -1825,10 +1825,10 @@ fn is_youtube_auth_or_bot_error(text: &str) -> bool {
 }
 
 
-fn add_ytdlp_cookies_if_available(cmd: &mut Command) {
-    if std::path::Path::new(YTDLP_COOKIES_FILE).exists() {
-        cmd.args(["--cookies", YTDLP_COOKIES_FILE]);
-    }
+fn add_ytdlp_cookies_if_available(_cmd: &mut Command) {
+    // TROOZN Live v1: cookies désactivés par défaut.
+    // Un fichier cookies invalide peut provoquer des erreurs YouTube difficiles à diagnostiquer.
+    // On réactivera plus tard via une option explicite si nécessaire.
 }
 
 
