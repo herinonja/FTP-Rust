@@ -34,7 +34,7 @@ const MAX_PRODUCER_AHEAD_ITEMS: usize = 20;
 const PUBLIC_HLS_URL: &str = "http://127.0.0.1:8787/troozn-live/playlist-youtube.m3u8";
 
 const YTDLP_COOKIES_FILE: &str = "/home/troozn/.config/troozn/youtube-cookies.txt";
-const YTDLP_720_FORMAT: &str = "95/94/22";
+const YTDLP_720_FORMAT: &str = "22/95/94";
 
 #[derive(Debug, Clone)]
 struct PlaylistRefillState {
@@ -149,11 +149,11 @@ async fn live_audit(root_dir: &Path, line: impl AsRef<str>) {
     {
         Ok(mut file) => {
             if let Err(err) = file.write_all(msg.as_bytes()).await {
-                eprintln!("TROOZN_LIVE_AUDIT_WRITE_ERROR path={} error={err:?}", path.display());
+                eprintln!("TROOZN_LIVE_AUDIT_WRITE_ERROR path={} state={err:?}", path.display());
             }
         }
         Err(err) => {
-            eprintln!("TROOZN_LIVE_AUDIT_OPEN_ERROR path={} error={err:?}", path.display());
+            eprintln!("TROOZN_LIVE_AUDIT_OPEN_ERROR path={} state={err:?}", path.display());
         }
     }
 }
@@ -349,7 +349,7 @@ impl TrooznLive {
                 }
 
                 eprintln!(
-                    "TROOZN_LIVE_REFILL_ERROR start={} end={} error={err:?}",
+                    "TROOZN_LIVE_REFILL_ERROR start={} end={} state={err:?}",
                     start,
                     end
                 );
@@ -404,7 +404,7 @@ impl TrooznLive {
                 Err(err) => {
                     last_error = Some(err.to_string());
                     eprintln!(
-                        "TROOZN_LIVE_EXTRACT_FAILED url={} error={err:?}",
+                        "TROOZN_LIVE_EXTRACT_FAILED url={} state={err:?}",
                         candidate_url
                     );
                 }
@@ -562,7 +562,7 @@ impl TrooznLive {
                 Err(err) => {
                     last_error = Some(err.to_string());
                     eprintln!(
-                        "TROOZN_LIVE_PLAYLIST_EXTRACT_FAILED url={} error={err:?}",
+                        "TROOZN_LIVE_PLAYLIST_EXTRACT_FAILED url={} state={err:?}",
                         candidate_url
                     );
                 }
@@ -809,7 +809,7 @@ if let Some(first_added) = added.first() {
                     // Échec silencieux par item :
                     // on n'arrête pas le producer, on passe simplement à l'item suivant.
                     eprintln!(
-                        "TROOZN_LIVE_SKIP_ITEM index={} title={} source_url={} error={err:?}",
+                        "TROOZN_LIVE_SKIP_ITEM index={} title={} source_url={} state={err:?}",
                         item.index,
                         item.title,
                         item.source_url
@@ -818,7 +818,7 @@ if let Some(first_added) = added.first() {
                     live_audit(
                         &self.root_dir,
                         format!(
-                            "ITEM_YTDLP_FAIL index={} title={} url={} error={err:?}",
+                            "ITEM_YTDLP_FAIL index={} title={} url={} state={err:?}",
                             item.index, item.title, item.source_url
                         ),
                     )
@@ -1051,7 +1051,7 @@ live_audit(
                             Ok(None) => false,
                             Err(err) => {
                                 eprintln!(
-                                    "TROOZN_LIVE_FFMPEG_WAIT_ERROR index={} title={} error={err:?}",
+                                    "TROOZN_LIVE_FFMPEG_WAIT_ERROR index={} title={} state={err:?}",
                                     item.index, item.title
                                 );
                                 *guard = None;
@@ -1087,7 +1087,7 @@ live_audit(
             Ok(meta) => meta,
             Err(err) => {
                 eprintln!(
-                    "TROOZN_LIVE_METADATA_FAILED index={} title={} error={err:?}",
+                    "TROOZN_LIVE_METADATA_FAILED index={} title={} state={err:?}",
                     item.index, item.title
                 );
                 return item.clone();
@@ -1275,7 +1275,7 @@ live_audit(
                     }
                     Err(err) => {
                         eprintln!(
-                            "TROOZN_LIVE_CLEANUP_REMOVE_FAILED file={} error={err:?}",
+                            "TROOZN_LIVE_CLEANUP_REMOVE_FAILED file={} state={err:?}",
                             name
                         );
                     }
@@ -1390,7 +1390,7 @@ live_audit(
         let mut rd = match fs::read_dir(&self.root_dir).await {
             Ok(rd) => rd,
             Err(err) => {
-                eprintln!("TROOZN_LIVE_CONSUME_READDIR_ERROR error={err:?}");
+                eprintln!("TROOZN_LIVE_CONSUME_READDIR_ERROR state={err:?}");
                 return;
             }
         };
@@ -1439,7 +1439,7 @@ live_audit(
                 }
                 Err(err) => {
                     eprintln!(
-                        "TROOZN_LIVE_CONSUME_REMOVE_FAILED file={} error={err:?}",
+                        "TROOZN_LIVE_CONSUME_REMOVE_FAILED file={} state={err:?}",
                         name
                     );
                 }
@@ -1879,7 +1879,7 @@ async fn extract_youtube_items_range_with_retry(
         Ok(items) => Ok(items),
         Err(err) => {
             eprintln!(
-                "TROOZN_LIVE_RANGE_EXTRACT_FAIL start={} end={} error={err:?}",
+                "TROOZN_LIVE_RANGE_EXTRACT_FAIL start={} end={} state={err:?}",
                 start,
                 end
             );
@@ -2064,7 +2064,7 @@ async fn extract_youtube_items_with_retry(
             }
             Err(err) => {
                 eprintln!(
-                    "TROOZN_LIVE_PLAYLIST_EXTRACT_RETRY_FAILED attempt={} source_url={} error={err:?}",
+                    "TROOZN_LIVE_PLAYLIST_EXTRACT_RETRY_FAILED attempt={} source_url={} state={err:?}",
                     attempt,
                     source_url
                 );
@@ -2507,10 +2507,8 @@ fn best_dash_av_format_from_list_formats(text: &str) -> Option<&'static str> {
         })
     };
 
-    if has("137") && has("140") {
-        return Some("137+140");
-    }
-
+    // Profil rapide Radxa :
+    // pas de 137+140, car le 1080p DASH séparé ralentit trop le producer.
     if has("136") && has("140") {
         return Some("136+140");
     }
@@ -2610,7 +2608,7 @@ async fn resolve_youtube_media_input(source_url: &str) -> anyhow::Result<Resolve
         }
         Err(first_err) => {
             eprintln!(
-                "TROOZN_LIVE_SINGLE_INPUT_FAIL url={} error={first_err:?}",
+                "TROOZN_LIVE_SINGLE_INPUT_FAIL url={} state={first_err:?}",
                 source_url
             );
         }
@@ -2637,7 +2635,7 @@ async fn resolve_youtube_720_url(source_url: &str) -> anyhow::Result<String> {
             last_error = err.to_string();
 
             eprintln!(
-                "TROOZN_LIVE_YTDLP_STRICT_FAIL url={} error={}",
+                "TROOZN_LIVE_YTDLP_STRICT_FAIL url={} state={}",
                 source_url,
                 last_error
             );
