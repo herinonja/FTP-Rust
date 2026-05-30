@@ -19,6 +19,8 @@ use tokio::time::{sleep, timeout, Duration};
 use crate::HttpGatewayState;
 
 const LIVE_DIR: &str = "/home/troozn/.kodi/userdata/TROOZN/live";
+const TROOZN_LIVE_BUILD_TAG: &str = "v1-quality-strict-96-95-94-22-ignore-config-2026-05-29";
+
 const YTDLP_BIN: &str = "/home/troozn/.local/bin/yt-dlp";
 const LIVE_KEEP_BEHIND_ITEMS: usize = 2;
 const LIVE_MAX_DIR_BYTES: u64 = 1500 * 1024 * 1024;
@@ -2188,7 +2190,18 @@ async fn extract_full_video_metadata(source_url: &str) -> anyhow::Result<FullVid
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            last_error = stderr.trim().to_string();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+
+            last_error = format!(
+                "yt-dlp command failed: build_tag={} bin={} ignore_config=true format={} url={} status={} stderr={} stdout={}",
+                TROOZN_LIVE_BUILD_TAG,
+                YTDLP_BIN,
+                YTDLP_720_FORMAT,
+                source_url,
+                output.status,
+                stderr.trim(),
+                stdout.trim()
+            );
             sleep(Duration::from_millis(500 * attempt)).await;
             continue;
         }
@@ -2339,7 +2352,17 @@ async fn resolve_youtube_720_url(source_url: &str) -> anyhow::Result<String> {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            last_error = stderr.trim().to_string();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+
+            last_error = format!(
+                "yt-dlp command failed: bin={} ignore_config=true format={} url={} status={} stderr={} stdout={}",
+                YTDLP_BIN,
+                YTDLP_720_FORMAT,
+                source_url,
+                output.status,
+                stderr.trim(),
+                stdout.trim()
+            );
 
             if is_youtube_auth_or_bot_error(&last_error) {
                 eprintln!(
@@ -2424,7 +2447,9 @@ pub async fn troozn_live_health() -> impl IntoResponse {
     Json(json!({
         "ok": true,
         "service": "troozn-live",
+        "build_tag": TROOZN_LIVE_BUILD_TAG,
         "mode": "hls",
+        "yt_dlp_bin": YTDLP_BIN,
         "target_format": YTDLP_720_FORMAT,
         "actual_resolution": null,
         "note": "La résolution réelle est celle du flux choisi par yt-dlp puis décodé par Kodi.",
