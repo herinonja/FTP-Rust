@@ -2285,130 +2285,200 @@ fn add_ytdlp_cookies_if_available(_cmd: &mut Command) {
 }
 
 
+
+fn best_allowed_format_from_list_formats(text: &str) -> Option<&'static str> {
+    let allowed = ["96", "95", "94", "22"];
+
+    for fmt in allowed {
+        let found = text.lines().any(|line| {
+            let trimmed = line.trim_start();
+            trimmed.starts_with(fmt)
+                && trimmed
+                    .get(fmt.len()..)
+                    .map(|rest| rest.starts_with(' ') || rest.starts_with('\t'))
+                    .unwrap_or(false)
+        });
+
+        if found {
+            return Some(fmt);
+        }
+    }
+
+    None
+}
+
+async fn ytdlp_list_formats_text(source_url: &str) -> anyhow::Result<String> {
+    let mut cmd = Command::new(YTDLP_BIN);
+
+    cmd.args([
+        "--ignore-config",
+        "--force-ipv4",
+        "--socket-timeout",
+        "20",
+        "--list-formats",
+        source_url,
+    ]);
+
+    let output = timeout(Duration::from_secs(30), cmd.output())
+        .await
+        .context("timeout yt-dlp list-formats")?
+        .context("spawn yt-dlp list-formats")?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    if !output.status.success() {
+        anyhow::bail!(
+            "yt-dlp list-formats failed status={} stderr={}",
+            output.status,
+            stderr.trim()
+        );
+    }
+
+    Ok(stdout)
+}
+
+async fn resolve_youtube_url_with_format(
+    source_url: &str,
+    format_selector: &str,
+) -> anyhow::Result<String> {
+    let mut cmd = Command::new(YTDLP_BIN);
+    add_ytdlp_cookies_if_available(&mut cmd);
+
+    cmd.args([
+        "--ignore-config",
+        "--no-playlist",
+        "--no-warnings",
+        "--force-ipv4",
+        "--socket-timeout",
+        "20",
+        "--retries",
+        "1",
+        "--fragment-retries",
+        "1",
+        "-f",
+        format_selector,
+        "-g",
+        source_url,
+    ]);
+
+    eprintln!(
+        "TROOZN_LIVE_YTDLP_RESOLVE_FORMAT bin={} format={} url={}",
+        YTDLP_BIN,
+        format_selector,
+        source_url
+    );
+
+    let output = timeout(Duration::from_secs(30), cmd.output())
+        .await
+        .context("timeout yt-dlp -g")?
+        .context("spawn yt-dlp -g")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        anyhow::bail!(
+            "yt-dlp -g failed: bin={} format={} url={} status={} stderr={} stdout={}",
+            YTDLP_BIN,
+            format_selector,
+            source_url,
+            output.status,
+            stderr.trim(),
+            stdout.trim()
+        );
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    let Some(url) = stdout
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("http://") || line.starts_with("https://"))
+    else {
+        anyhow::bail!(
+            "yt-dlp -g OK mais aucune URL: format={} stdout={}",
+            format_selector,
+            stdout.trim()
+        );
+    };
+
+    eprintln!(
+        "TROOZN_LIVE_RESOLVED_ITAG format={} itag96={} itag95={} itag94={} itag93={} itag18={} prefix={}",
+        format_selector,
+        url.contains("itag/96") || url.contains("itag=96"),
+        url.contains("itag/95") || url.contains("itag=95"),
+        url.contains("itag/94") || url.contains("itag=94"),
+        url.contains("itag/93") || url.contains("itag=93"),
+        url.contains("itag/18") || url.contains("itag=18"),
+        url.chars().take(160).collect::<String>()
+    );
+
+    Ok(url.to_string())
+}
+
 async fn resolve_youtube_720_url(source_url: &str) -> anyhow::Result<String> {
     let mut last_error = String::new();
-    let mut attempt_count: usize = 0;
 
-    for attempt in 1..=2 {
-        attempt_count += 1;
-        let mut cmd = Command::new(YTDLP_BIN);
-        add_ytdlp_cookies_if_available(&mut cmd);
+    // 1) Tentative directe stricte : 1080p HLS, 720p HLS, 480p HLS, 720p MP4.
+    match resolve_youtube_url_with_format(source_url, YTDLP_720_FORMAT).await {
+        Ok(url) => return Ok(url),
+        Err(err) => {
+            last_error = err.to_string();
 
-        // Pas de add_ytdlp_common_args ici.
-        // Le test manuel yt-dlp -g fonctionne sans Deno/remote-components.
-        // On garde donc cette résolution aussi simple et rapide que possible.
-
-        cmd.args([
-            "--ignore-config",
-            "--no-playlist",
-            "--no-warnings",
-            "--force-ipv4",
-            "--socket-timeout",
-            "20",
-            "--retries",
-            "1",
-            "--fragment-retries",
-            "1",
-            "-f",
-            YTDLP_720_FORMAT,
-            "-g",
-            source_url,
-        ]);
-
-        eprintln!(
-            "TROOZN_LIVE_YTDLP_CMD bin={} format={} ignore_config=true retries=1 url={}",
-            YTDLP_BIN,
-            YTDLP_720_FORMAT,
-            source_url
-        );
-
-
-        let ytdlp_started = std::time::Instant::now();
-
-
-
-        let output = match timeout(Duration::from_secs(30), cmd.output()).await {
-            Ok(Ok(output)) => output,
-            Ok(Err(err)) => {
-                last_error = format!("exécution yt-dlp: {err}");
-                sleep(Duration::from_millis(600 * attempt)).await;
-                continue;
-            }
-            Err(_) => {
-                last_error = "timeout yt-dlp".to_string();
-                sleep(Duration::from_millis(600 * attempt)).await;
-                continue;
-            }
-        };
-
-        let elapsed_ms = ytdlp_started.elapsed().as_millis();
-
-        eprintln!(
-            "TROOZN_LIVE_YTDLP_G_DONE attempt={} elapsed_ms={} status={}",
-            attempt_count,
-            elapsed_ms,
-            output.status
-        );
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let stdout = String::from_utf8_lossy(&output.stdout);
-
-            last_error = format!(
-                "yt-dlp command failed: bin={} ignore_config=true format={} url={} status={} stderr={} stdout={}",
-                YTDLP_BIN,
-                YTDLP_720_FORMAT,
+            eprintln!(
+                "TROOZN_LIVE_YTDLP_STRICT_FAIL url={} error={}",
                 source_url,
-                output.status,
-                stderr.trim(),
-                stdout.trim()
+                last_error
             );
 
             if is_youtube_auth_or_bot_error(&last_error) {
-                eprintln!(
-                    "TROOZN_LIVE_YTDLP_AUTH_OR_BOT_SKIP url={} error={}",
-                    source_url,
+                anyhow::bail!(
+                    "yt-dlp a échoué après 1 tentative(s): {}",
                     last_error
                 );
-                break;
             }
-            sleep(Duration::from_millis(600 * attempt)).await;
-            continue;
         }
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-
-        if let Some(url) = stdout
-            .lines()
-            .map(str::trim)
-            .find(|line| line.starts_with("http://") || line.starts_with("https://"))
-        {
-            eprintln!(
-
-                "TROOZN_LIVE_RESOLVED_ITAG itag96={} itag95={} itag94={} itag93={} itag18={} prefix={}",
-
-                url.contains("itag/96") || url.contains("itag=96"),
-
-                url.contains("itag/95") || url.contains("itag=95"),
-
-                url.contains("itag/94") || url.contains("itag=94"),
-
-                url.contains("itag/93") || url.contains("itag=93"),
-
-                url.contains("itag/18") || url.contains("itag=18"),
-
-                url.chars().take(160).collect::<String>()
-
-            );
-
-            return Ok(url.to_string());
-        }
-
-        last_error = "yt-dlp n'a retourné aucune URL jouable".to_string();
-        sleep(Duration::from_millis(600 * attempt)).await;
     }
 
-    anyhow::bail!("yt-dlp a échoué après {attempt_count} tentative(s): {last_error}");
+    // 2) Si yt-dlp a dit format indisponible, on vérifie les formats réels.
+    // Certains appels -g sont intermittents alors que --list-formats voit bien 96/95/94/22.
+    let list_text = match ytdlp_list_formats_text(source_url).await {
+        Ok(text) => text,
+        Err(err) => {
+            anyhow::bail!(
+                "yt-dlp a échoué après fallback list-formats: premier_error={} list_error={}",
+                last_error,
+                err
+            );
+        }
+    };
+
+    let Some(best_format) = best_allowed_format_from_list_formats(&list_text) else {
+        anyhow::bail!(
+            "yt-dlp a échoué: aucun format autorisé 96/95/94/22 trouvé. premier_error={}",
+            last_error
+        );
+    };
+
+    eprintln!(
+        "TROOZN_LIVE_YTDLP_LIST_FORMATS_PICK format={} url={}",
+        best_format,
+        source_url
+    );
+
+    // 3) Relance avec le format exact détecté.
+    match resolve_youtube_url_with_format(source_url, best_format).await {
+        Ok(url) => Ok(url),
+        Err(err) => {
+            anyhow::bail!(
+                "yt-dlp a échoué après fallback format exact {}: premier_error={} final_error={}",
+                best_format,
+                last_error,
+                err
+            );
+        }
+    }
 }
 
 async fn add_ytdlp_common_args(cmd: &mut Command) {
