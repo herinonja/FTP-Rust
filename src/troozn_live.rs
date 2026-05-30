@@ -2293,14 +2293,22 @@ async fn resolve_youtube_720_url(source_url: &str) -> anyhow::Result<String> {
             "--socket-timeout",
             "20",
             "--retries",
-            "3",
+            "1",
             "--fragment-retries",
-            "3",
+            "1",
             "-f",
             YTDLP_720_FORMAT,
             "-g",
             source_url,
         ]);
+
+        eprintln!(
+            "TROOZN_LIVE_YTDLP_CMD bin={} format={} ignore_config=true retries=1 url={}",
+            YTDLP_BIN,
+            YTDLP_720_FORMAT,
+            source_url
+        );
+
 
         let ytdlp_started = std::time::Instant::now();
 
