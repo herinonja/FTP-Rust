@@ -948,6 +948,12 @@ if let Some(first_added) = added.first() {
             }
 
             cmd.args([
+                "-fflags",
+                "+genpts",
+                "-avoid_negative_ts",
+                "make_zero",
+                "-max_interleave_delta",
+                "0",
                 "-c",
                 "copy",
                 "-f",
