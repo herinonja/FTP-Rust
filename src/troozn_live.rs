@@ -904,6 +904,9 @@ if let Some(first_added) = added.first() {
 
             cmd.args([
                 "-hide_banner",
+                "-nostdin",
+                "-loglevel",
+                "warning",
                 "-y",
             ]);
 
@@ -916,6 +919,7 @@ if let Some(first_added) = added.first() {
                     );
 
                     cmd.args([
+                        "-re",
                         "-i",
                         url,
                     ]);
@@ -932,8 +936,10 @@ if let Some(first_added) = added.first() {
                     );
 
                     cmd.args([
+                        "-re",
                         "-i",
                         video_url,
+                        "-re",
                         "-i",
                         audio_url,
                         "-map",
