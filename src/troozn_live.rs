@@ -32,8 +32,7 @@ const MAX_PRODUCER_AHEAD_ITEMS: usize = 20;
 const PUBLIC_HLS_URL: &str = "http://127.0.0.1:8787/troozn-live/playlist-youtube.m3u8";
 
 const YTDLP_COOKIES_FILE: &str = "/home/troozn/.config/troozn/youtube-cookies.txt";
-const YTDLP_720_FORMAT: &str =
-    "96/95/22/94/93/18/best[height<=1080]";
+const YTDLP_720_FORMAT: &str = "96/95/94/22/best[height<=1080][vcodec^=avc1]/best[height<=1080]/18/best";
 
 #[derive(Debug, Clone)]
 struct PlaylistRefillState {
@@ -2352,6 +2351,24 @@ async fn resolve_youtube_720_url(source_url: &str) -> anyhow::Result<String> {
             .map(str::trim)
             .find(|line| line.starts_with("http://") || line.starts_with("https://"))
         {
+            eprintln!(
+
+                "TROOZN_LIVE_RESOLVED_ITAG itag96={} itag95={} itag94={} itag93={} itag18={} prefix={}",
+
+                url.contains("itag/96") || url.contains("itag=96"),
+
+                url.contains("itag/95") || url.contains("itag=95"),
+
+                url.contains("itag/94") || url.contains("itag=94"),
+
+                url.contains("itag/93") || url.contains("itag=93"),
+
+                url.contains("itag/18") || url.contains("itag=18"),
+
+                url.chars().take(160).collect::<String>()
+
+            );
+
             return Ok(url.to_string());
         }
 
@@ -2399,7 +2416,9 @@ pub async fn troozn_live_health() -> impl IntoResponse {
         "ok": true,
         "service": "troozn-live",
         "mode": "hls",
-        "quality": "1080p-hls-copy",
+        "target_format": YTDLP_720_FORMAT,
+        "actual_resolution": null,
+        "note": "La résolution réelle est celle du flux choisi par yt-dlp puis décodé par Kodi.",
         "hls_url": PUBLIC_HLS_URL
     }))
 }
