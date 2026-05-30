@@ -32,7 +32,7 @@ const MAX_PRODUCER_AHEAD_ITEMS: usize = 20;
 const PUBLIC_HLS_URL: &str = "http://127.0.0.1:8787/troozn-live/playlist-youtube.m3u8";
 
 const YTDLP_COOKIES_FILE: &str = "/home/troozn/.config/troozn/youtube-cookies.txt";
-const YTDLP_720_FORMAT: &str = "96/95/94/22/best[height<=1080][vcodec^=avc1]/best[height<=1080]/18/best";
+const YTDLP_720_FORMAT: &str = "96/95/94/22";
 
 #[derive(Debug, Clone)]
 struct PlaylistRefillState {
@@ -2286,6 +2286,7 @@ async fn resolve_youtube_720_url(source_url: &str) -> anyhow::Result<String> {
         // On garde donc cette résolution aussi simple et rapide que possible.
 
         cmd.args([
+            "--ignore-config",
             "--no-playlist",
             "--no-warnings",
             "--force-ipv4",
