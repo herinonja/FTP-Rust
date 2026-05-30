@@ -852,7 +852,14 @@ if let Some(first_added) = added.first() {
                     "ITEM_YTDLP_OK index={} title={} play_url_prefix={}",
                     item.index,
                     item.title,
-                    play_url.chars().take(80).collect::<String>()
+                    match &media_input {
+                        ResolvedMediaInput::Single { url, format_selector } => {
+                            format!("single format={} url={}", format_selector, url.chars().take(80).collect::<String>())
+                        }
+                        ResolvedMediaInput::SeparateAv { video_url, audio_url: _, format_selector } => {
+                            format!("dash-av format={} video={}", format_selector, video_url.chars().take(80).collect::<String>())
+                        }
+                    }
                 ),
             )
             .await;
