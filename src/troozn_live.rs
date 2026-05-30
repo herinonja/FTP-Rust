@@ -19,7 +19,7 @@ use tokio::time::{sleep, timeout, Duration};
 use crate::HttpGatewayState;
 
 const LIVE_DIR: &str = "/home/troozn/.kodi/userdata/TROOZN/live";
-const TROOZN_LIVE_BUILD_TAG: &str = "v1-quality-strict-96-95-94-22-ignore-config-2026-05-29";
+const TROOZN_LIVE_BUILD_TAG: &str = "v1-quality-strict-95-94-22-ignore-config-2026-05-29";
 
 const YTDLP_BIN: &str = "/home/troozn/.local/bin/yt-dlp";
 const LIVE_KEEP_BEHIND_ITEMS: usize = 2;
@@ -2351,11 +2351,10 @@ fn add_ytdlp_cookies_if_available(_cmd: &mut Command) {
 
 fn best_allowed_format_from_list_formats(text: &str) -> Option<&'static str> {
     // Formats autorisés, dans l'ordre de préférence :
-    // 96 = 1080p HLS
     // 95 = 720p HLS
     // 94 = 480p HLS
     // 22 = 720p MP4 progressif
-    let allowed = ["96", "95", "94", "22"];
+    let allowed = ["95", "94", "22"];
 
     for wanted in allowed {
         for line in text.lines() {
@@ -2487,7 +2486,6 @@ async fn resolve_youtube_url_with_format(
     eprintln!(
         "TROOZN_LIVE_RESOLVED_ITAG format={} itag96={} itag95={} itag94={} itag93={} itag18={} prefix={}",
         format_selector,
-        url.contains("itag/96") || url.contains("itag=96"),
         url.contains("itag/95") || url.contains("itag=95"),
         url.contains("itag/94") || url.contains("itag=94"),
         url.contains("itag/93") || url.contains("itag=93"),
@@ -2622,7 +2620,7 @@ async fn resolve_youtube_media_input(source_url: &str) -> anyhow::Result<Resolve
 
     let Some(format_selector) = best_dash_av_format_from_list_formats(&list_text) else {
         anyhow::bail!(
-            "aucun format muxé 96/95/94/22 ni DASH séparé 137+140/136+140/135+140 disponible"
+            "aucun format muxé 95/94/22 ni DASH séparé 137+140/136+140/135+140 disponible"
         );
     };
 
@@ -2654,7 +2652,7 @@ async fn resolve_youtube_720_url(source_url: &str) -> anyhow::Result<String> {
     }
 
     // 2) Si yt-dlp a dit format indisponible, on vérifie les formats réels.
-    // Certains appels -g sont intermittents alors que --list-formats voit bien 96/95/94/22.
+    // Certains appels -g sont intermittents alors que --list-formats voit bien 95/94/22.
     let list_text = match ytdlp_list_formats_text(source_url).await {
         Ok(text) => text,
         Err(err) => {
@@ -2674,14 +2672,14 @@ async fn resolve_youtube_720_url(source_url: &str) -> anyhow::Result<String> {
                 let first = line.split_whitespace().next().unwrap_or("");
                 matches!(
                     first,
-                    "96" | "95" | "94" | "93" | "22" | "18" | "137" | "136" | "135" | "134" | "140"
+                    "95" | "94" | "93" | "22" | "18" | "137" | "136" | "135" | "134" | "140"
                 )
             })
             .collect::<Vec<_>>()
             .join(" | ");
 
         anyhow::bail!(
-            "yt-dlp a échoué: aucun format autorisé 96/95/94/22 trouvé. premier_error={} formats_detectes={}",
+            "yt-dlp a échoué: aucun format autorisé 95/94/22 trouvé. premier_error={} formats_detectes={}",
             last_error,
             interesting_formats
         );
