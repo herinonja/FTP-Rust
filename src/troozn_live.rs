@@ -900,8 +900,7 @@ if let Some(first_added) = added.first() {
                 item_manifest.display()
             );
 
-            let mut cmd = Command::new("nice");
-            cmd.args(["-n", "10", "ionice", "-c", "2", "-n", "7", "ffmpeg"]);
+            let mut cmd = Command::new("ffmpeg");
 
             cmd.args([
                 "-hide_banner",
