@@ -2276,7 +2276,7 @@ async fn resolve_youtube_720_url(source_url: &str) -> anyhow::Result<String> {
     let mut last_error = String::new();
     let mut attempt_count: usize = 0;
 
-    for attempt in 1..=1 {
+    for attempt in 1..=2 {
         attempt_count += 1;
         let mut cmd = Command::new(YTDLP_BIN);
         add_ytdlp_cookies_if_available(&mut cmd);
