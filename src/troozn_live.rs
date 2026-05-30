@@ -34,7 +34,7 @@ const MAX_PRODUCER_AHEAD_ITEMS: usize = 20;
 const PUBLIC_HLS_URL: &str = "http://127.0.0.1:8787/troozn-live/playlist-youtube.m3u8";
 
 const YTDLP_COOKIES_FILE: &str = "/home/troozn/.config/troozn/youtube-cookies.txt";
-const YTDLP_720_FORMAT: &str = "96/95/94/22";
+const YTDLP_720_FORMAT: &str = "95/94/22";
 
 #[derive(Debug, Clone)]
 struct PlaylistRefillState {
