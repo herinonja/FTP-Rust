@@ -919,7 +919,8 @@ if let Some(first_added) = added.first() {
                     );
 
                     cmd.args([
-                        "-re",
+                        "-readrate",
+                        "1.20",
                         "-i",
                         url,
                     ]);
@@ -936,10 +937,12 @@ if let Some(first_added) = added.first() {
                     );
 
                     cmd.args([
-                        "-re",
+                        "-readrate",
+                        "1.20",
                         "-i",
                         video_url,
-                        "-re",
+                        "-readrate",
+                        "1.20",
                         "-i",
                         audio_url,
                         "-map",
