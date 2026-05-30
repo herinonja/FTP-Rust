@@ -199,6 +199,20 @@ fn count_manifest_ts_lines(path: &Path) -> usize {
 }
 
 
+
+#[derive(Debug, Clone)]
+enum ResolvedMediaInput {
+    Single {
+        url: String,
+        format_selector: String,
+    },
+    SeparateAv {
+        video_url: String,
+        audio_url: String,
+        format_selector: String,
+    },
+}
+
 impl TrooznLive {
     pub fn new_default() -> Self {
         let idle = TrooznLiveNow {
@@ -789,8 +803,8 @@ if let Some(first_added) = added.first() {
                 guard.last_error = Some("Résolution URL vidéo 720p en cours".to_string());
             }
 
-            let play_url = match resolve_youtube_720_url(&item.source_url).await {
-                Ok(url) => url,
+            let media_input = match resolve_youtube_media_input(&item.source_url).await {
+                Ok(input) => input,
                 Err(err) => {
                     // Échec silencieux par item :
                     // on n'arrête pas le producer, on passe simplement à l'item suivant.
@@ -884,8 +898,46 @@ if let Some(first_added) = added.first() {
             cmd.args([
                 "-hide_banner",
                 "-y",
-                "-i",
-                &play_url,
+            ]);
+
+            match &media_input {
+                ResolvedMediaInput::Single { url, format_selector } => {
+                    eprintln!(
+                        "TROOZN_LIVE_FFMPEG_INPUT_SINGLE index={} format={}",
+                        item.index,
+                        format_selector
+                    );
+
+                    cmd.args([
+                        "-i",
+                        url,
+                    ]);
+                }
+                ResolvedMediaInput::SeparateAv {
+                    video_url,
+                    audio_url,
+                    format_selector,
+                } => {
+                    eprintln!(
+                        "TROOZN_LIVE_FFMPEG_INPUT_DASH_AV index={} format={}",
+                        item.index,
+                        format_selector
+                    );
+
+                    cmd.args([
+                        "-i",
+                        video_url,
+                        "-i",
+                        audio_url,
+                        "-map",
+                        "0:v:0",
+                        "-map",
+                        "1:a:0",
+                    ]);
+                }
+            }
+
+            cmd.args([
                 "-c",
                 "copy",
                 "-f",
@@ -2433,6 +2485,137 @@ async fn resolve_youtube_url_with_format(
     );
 
     Ok(url.to_string())
+}
+
+
+fn best_dash_av_format_from_list_formats(text: &str) -> Option<&'static str> {
+    let has = |wanted: &str| -> bool {
+        text.lines().any(|line| {
+            line.split_whitespace()
+                .next()
+                .map(|fmt| fmt == wanted)
+                .unwrap_or(false)
+        })
+    };
+
+    if has("137") && has("140") {
+        return Some("137+140");
+    }
+
+    if has("136") && has("140") {
+        return Some("136+140");
+    }
+
+    if has("135") && has("140") {
+        return Some("135+140");
+    }
+
+    None
+}
+
+async fn resolve_youtube_separate_av_with_format(
+    source_url: &str,
+    format_selector: &str,
+) -> anyhow::Result<ResolvedMediaInput> {
+    let mut cmd = Command::new(YTDLP_BIN);
+    add_ytdlp_cookies_if_available(&mut cmd);
+
+    cmd.args([
+        "--ignore-config",
+        "--no-playlist",
+        "--no-warnings",
+        "--force-ipv4",
+        "--socket-timeout",
+        "20",
+        "--retries",
+        "1",
+        "--fragment-retries",
+        "1",
+        "-f",
+        format_selector,
+        "-g",
+        source_url,
+    ]);
+
+    eprintln!(
+        "TROOZN_LIVE_YTDLP_DASH_AV_CMD bin={} format={} url={}",
+        YTDLP_BIN,
+        format_selector,
+        source_url
+    );
+
+    let output = timeout(Duration::from_secs(35), cmd.output())
+        .await
+        .context("timeout yt-dlp dash av -g")?
+        .context("spawn yt-dlp dash av -g")?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    if !output.status.success() {
+        anyhow::bail!(
+            "yt-dlp dash av failed: format={} status={} stderr={} stdout={}",
+            format_selector,
+            output.status,
+            stderr.trim(),
+            stdout.trim()
+        );
+    }
+
+    let urls = stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("http://") || line.starts_with("https://"))
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+
+    if urls.len() < 2 {
+        anyhow::bail!(
+            "yt-dlp dash av OK mais moins de 2 URLs: format={} stdout={}",
+            format_selector,
+            stdout.trim()
+        );
+    }
+
+    eprintln!(
+        "TROOZN_LIVE_DASH_AV_RESOLVED format={} video_prefix={} audio_prefix={}",
+        format_selector,
+        urls[0].chars().take(100).collect::<String>(),
+        urls[1].chars().take(100).collect::<String>()
+    );
+
+    Ok(ResolvedMediaInput::SeparateAv {
+        video_url: urls[0].clone(),
+        audio_url: urls[1].clone(),
+        format_selector: format_selector.to_string(),
+    })
+}
+
+async fn resolve_youtube_media_input(source_url: &str) -> anyhow::Result<ResolvedMediaInput> {
+    match resolve_youtube_720_url(source_url).await {
+        Ok(url) => {
+            return Ok(ResolvedMediaInput::Single {
+                url,
+                format_selector: YTDLP_720_FORMAT.to_string(),
+            });
+        }
+        Err(first_err) => {
+            eprintln!(
+                "TROOZN_LIVE_SINGLE_INPUT_FAIL url={} error={first_err:?}",
+                source_url
+            );
+        }
+    }
+
+    let list_text = ytdlp_list_formats_text(source_url).await?;
+
+    let Some(format_selector) = best_dash_av_format_from_list_formats(&list_text) else {
+        anyhow::bail!(
+            "aucun format muxé 96/95/94/22 ni DASH séparé 137+140/136+140/135+140 disponible"
+        );
+    };
+
+    resolve_youtube_separate_av_with_format(source_url, format_selector).await
 }
 
 async fn resolve_youtube_720_url(source_url: &str) -> anyhow::Result<String> {
