@@ -2287,20 +2287,24 @@ fn add_ytdlp_cookies_if_available(_cmd: &mut Command) {
 
 
 fn best_allowed_format_from_list_formats(text: &str) -> Option<&'static str> {
+    // Formats autorisés, dans l'ordre de préférence :
+    // 96 = 1080p HLS
+    // 95 = 720p HLS
+    // 94 = 480p HLS
+    // 22 = 720p MP4 progressif
     let allowed = ["96", "95", "94", "22"];
 
-    for fmt in allowed {
-        let found = text.lines().any(|line| {
-            let trimmed = line.trim_start();
-            trimmed.starts_with(fmt)
-                && trimmed
-                    .get(fmt.len()..)
-                    .map(|rest| rest.starts_with(' ') || rest.starts_with('\t'))
-                    .unwrap_or(false)
-        });
+    for wanted in allowed {
+        for line in text.lines() {
+            let mut parts = line.split_whitespace();
 
-        if found {
-            return Some(fmt);
+            let Some(format_id) = parts.next() else {
+                continue;
+            };
+
+            if format_id == wanted {
+                return Some(wanted);
+            }
         }
     }
 
@@ -2313,11 +2317,18 @@ async fn ytdlp_list_formats_text(source_url: &str) -> anyhow::Result<String> {
     cmd.args([
         "--ignore-config",
         "--force-ipv4",
+        "--no-warnings",
         "--socket-timeout",
         "20",
         "--list-formats",
         source_url,
     ]);
+
+    eprintln!(
+        "TROOZN_LIVE_LIST_FORMATS_CMD bin={} url={}",
+        YTDLP_BIN,
+        source_url
+    );
 
     let output = timeout(Duration::from_secs(30), cmd.output())
         .await
@@ -2327,15 +2338,22 @@ async fn ytdlp_list_formats_text(source_url: &str) -> anyhow::Result<String> {
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
+    let combined = if stderr.trim().is_empty() {
+        stdout
+    } else {
+        format!("{}
+{}", stdout, stderr)
+    };
+
     if !output.status.success() {
         anyhow::bail!(
-            "yt-dlp list-formats failed status={} stderr={}",
+            "yt-dlp list-formats failed status={} output={}",
             output.status,
-            stderr.trim()
+            combined.trim()
         );
     }
 
-    Ok(stdout)
+    Ok(combined)
 }
 
 async fn resolve_youtube_url_with_format(
@@ -2455,9 +2473,23 @@ async fn resolve_youtube_720_url(source_url: &str) -> anyhow::Result<String> {
     };
 
     let Some(best_format) = best_allowed_format_from_list_formats(&list_text) else {
+        let interesting_formats = list_text
+            .lines()
+            .map(str::trim)
+            .filter(|line| {
+                let first = line.split_whitespace().next().unwrap_or("");
+                matches!(
+                    first,
+                    "96" | "95" | "94" | "93" | "22" | "18" | "137" | "136" | "135" | "134" | "140"
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" | ");
+
         anyhow::bail!(
-            "yt-dlp a échoué: aucun format autorisé 96/95/94/22 trouvé. premier_error={}",
-            last_error
+            "yt-dlp a échoué: aucun format autorisé 96/95/94/22 trouvé. premier_error={} formats_detectes={}",
+            last_error,
+            interesting_formats
         );
     };
 
