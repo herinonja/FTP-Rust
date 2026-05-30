@@ -900,7 +900,8 @@ if let Some(first_added) = added.first() {
                 item_manifest.display()
             );
 
-            let mut cmd = Command::new("ffmpeg");
+            let mut cmd = Command::new("nice");
+            cmd.args(["-n", "10", "ionice", "-c", "2", "-n", "7", "ffmpeg"]);
 
             cmd.args([
                 "-hide_banner",
@@ -919,8 +920,6 @@ if let Some(first_added) = added.first() {
                     );
 
                     cmd.args([
-                        "-readrate",
-                        "1.20",
                         "-i",
                         url,
                     ]);
@@ -937,12 +936,8 @@ if let Some(first_added) = added.first() {
                     );
 
                     cmd.args([
-                        "-readrate",
-                        "1.20",
                         "-i",
                         video_url,
-                        "-readrate",
-                        "1.20",
                         "-i",
                         audio_url,
                         "-map",
