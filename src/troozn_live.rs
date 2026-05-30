@@ -2484,7 +2484,7 @@ async fn resolve_youtube_url_with_format(
     };
 
     eprintln!(
-        "TROOZN_LIVE_RESOLVED_ITAG format={} itag96={} itag95={} itag94={} itag93={} itag18={} prefix={}",
+        "TROOZN_LIVE_RESOLVED_ITAG format={} itag95={} itag94={} itag93={} itag18={} prefix={}",
         format_selector,
         url.contains("itag/95") || url.contains("itag=95"),
         url.contains("itag/94") || url.contains("itag=94"),
