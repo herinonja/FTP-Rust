@@ -37,9 +37,9 @@ const PUBLIC_HLS_URL: &str = "http://127.0.0.1:8787/troozn-live/playlist-youtube
 const YTDLP_COOKIES_FILE: &str = "/home/troozn/.config/troozn/youtube-cookies.txt";
 const YTDLP_YOUTUBE_FAST_FORMAT: &str = "22/95/94";
 const YTDLP_GENERIC_SINGLE_FORMAT: &str =
-    "best[height<=720][vcodec!=none][acodec!=none]/best[vcodec!=none][acodec!=none]/best";
+    "best[height<=720][height>=480][vcodec!=none][acodec!=none]/best[height=720][vcodec!=none][acodec!=none]/best[height=480][vcodec!=none][acodec!=none]";
 const YTDLP_GENERIC_SEPARATE_FORMAT: &str =
-    "bv*[height<=720][vcodec!=none]+ba[acodec!=none]/bv*[vcodec!=none]+ba[acodec!=none]/bestvideo+bestaudio";
+    "bv*[height<=720][height>=480][vcodec!=none]+ba[acodec!=none]/bv*[height=720][vcodec!=none]+ba[acodec!=none]/bv*[height=480][vcodec!=none]+ba[acodec!=none]";
 
 #[derive(Debug, Clone)]
 struct PlaylistRefillState {
