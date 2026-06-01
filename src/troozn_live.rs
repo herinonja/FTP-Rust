@@ -19,7 +19,7 @@ use tokio::time::{sleep, timeout, Duration};
 use crate::HttpGatewayState;
 
 const LIVE_DIR: &str = "/home/troozn/.kodi/userdata/TROOZN/live";
-const TROOZN_LIVE_BUILD_TAG: &str = "v2-generic-ytdlp-prewarm-2026-06-01";
+const TROOZN_LIVE_BUILD_TAG: &str = "v2.1-generic-ytdlp-hls720-stable-2026-06-01";
 
 const YTDLP_BIN: &str = "/home/troozn/.local/bin/yt-dlp";
 const LIVE_KEEP_BEHIND_ITEMS: usize = 2;
@@ -30,12 +30,13 @@ const LIVE_CONSUME_MODE: bool = false;
 const LIVE_CONSUME_KEEP_BEHIND_ITEMS: usize = 2;
 const MAX_ITEMS: usize = 20;
 const MAX_PRODUCER_AHEAD_ITEMS: usize = 20;
-const PREWARM_AHEAD_ITEMS: usize = 4;
+const PREWARM_AHEAD_ITEMS: usize = 2;
 
 const PUBLIC_HLS_URL: &str = "http://127.0.0.1:8787/troozn-live/playlist-youtube.m3u8";
 
 const YTDLP_COOKIES_FILE: &str = "/home/troozn/.config/troozn/youtube-cookies.txt";
 const YTDLP_YOUTUBE_FAST_FORMAT: &str = "22/95/94";
+const YTDLP_YOUTUBE_DASH_FORMAT: &str = "136+140/135+140";
 const YTDLP_GENERIC_SINGLE_FORMAT: &str =
     "best[height<=720][height>=480][vcodec!=none][acodec!=none]/best[height=720][vcodec!=none][acodec!=none]/best[height=480][vcodec!=none][acodec!=none]";
 const YTDLP_GENERIC_SEPARATE_FORMAT: &str =
@@ -1061,20 +1062,44 @@ impl TrooznLive {
                 "+genpts",
                 "-avoid_negative_ts",
                 "make_zero",
-                "-max_interleave_delta",
-                "0",
-                "-c",
-                "copy",
+            ]);
+
+            match &media_input {
+                ResolvedMediaInput::Single { .. } => {
+                    // Chemin rapide qui conservait la logique YouTube stable : remux pur.
+                    cmd.args(["-map", "0:v:0?", "-map", "0:a:0?", "-c", "copy"]);
+                }
+                ResolvedMediaInput::SeparateAv { .. } => {
+                    // DASH séparé : on copie la vidéo et on normalise seulement l'audio.
+                    // Cela évite les coupures audio en fin d'item avec certains flux 136+140/135+140.
+                    cmd.args([
+                        "-c:v",
+                        "copy",
+                        "-c:a",
+                        "aac",
+                        "-b:a",
+                        "128k",
+                        "-ar",
+                        "44100",
+                        "-ac",
+                        "2",
+                        "-af",
+                        "aresample=async=1:first_pts=0",
+                    ]);
+                }
+            }
+
+            cmd.args([
+                "-max_muxing_queue_size",
+                "2048",
                 "-f",
                 "hls",
                 "-hls_time",
-                "2",
-                "-hls_init_time",
-                "1",
+                "4",
                 "-hls_list_size",
                 "0",
                 "-hls_flags",
-                "omit_endlist+program_date_time+independent_segments+temp_file",
+                "omit_endlist+program_date_time+temp_file",
                 "-hls_segment_filename",
             ]);
 
@@ -1676,10 +1701,6 @@ impl TrooznLive {
             "TROOZN_LIVE_SEGMENT_SERVED item={} segment={} file={}",
             item_index, segment_number, relative
         );
-
-        if let Some(current_item_index) = parse_item_index_from_live_filename(relative) {
-            self.consume_cleanup_before_item(current_item_index).await;
-        }
     }
 
     pub async fn current_now(&self) -> TrooznLiveNow {
@@ -2496,7 +2517,7 @@ fn best_youtube_fast_format_from_list_formats(text: &str) -> Option<&'static str
     // 95 = 720p HLS
     // 94 = 480p HLS
     // 22 = 720p MP4 progressif
-    let allowed = ["95", "94", "22"];
+    let allowed = ["22", "95", "94"];
 
     for wanted in allowed {
         for line in text.lines() {
@@ -2715,8 +2736,8 @@ fn best_dash_av_format_from_list_formats(text: &str) -> Option<&'static str> {
         })
     };
 
-    // Profil rapide Radxa :
-    // pas de 137+140, car le 1080p DASH séparé ralentit trop le producer.
+    // Profil Radxa stable : 720p DASH puis 480p DASH.
+    // On évite 137+140/1080p pour que le producer reste en avance.
     if has("136") && has("140") {
         return Some("136+140");
     }
@@ -2806,22 +2827,42 @@ async fn resolve_youtube_separate_av_with_format(
 
 async fn resolve_media_input(source_url: &str) -> anyhow::Result<ResolvedMediaInput> {
     if is_youtube_url(source_url) {
-        match resolve_youtube_720_url(source_url).await {
-            Ok(url) => {
-                return Ok(ResolvedMediaInput::Single {
-                    url,
-                    format_selector: YTDLP_YOUTUBE_FAST_FORMAT.to_string(),
-                });
-            }
-            Err(first_err) => {
-                eprintln!(
-                    "TROOZN_LIVE_YOUTUBE_FAST_INPUT_FAIL url={} state={first_err:?}",
-                    source_url
-                );
-            }
+        return resolve_youtube_media_input(source_url).await;
+    }
+
+    resolve_generic_media_input(source_url).await
+}
+
+async fn resolve_youtube_media_input(source_url: &str) -> anyhow::Result<ResolvedMediaInput> {
+    match resolve_youtube_720_url(source_url).await {
+        Ok(url) => {
+            return Ok(ResolvedMediaInput::Single {
+                url,
+                format_selector: YTDLP_YOUTUBE_FAST_FORMAT.to_string(),
+            });
+        }
+        Err(first_err) => {
+            eprintln!(
+                "TROOZN_LIVE_YOUTUBE_FAST_INPUT_FAIL url={} state={first_err:?}",
+                source_url
+            );
         }
     }
 
+    let list_text = ytdlp_list_formats_text(source_url).await?;
+
+    let Some(format_selector) = best_dash_av_format_from_list_formats(&list_text) else {
+        anyhow::bail!(
+            "aucun format YouTube exploitable trouvé: muxé={} ou DASH={}",
+            YTDLP_YOUTUBE_FAST_FORMAT,
+            YTDLP_YOUTUBE_DASH_FORMAT
+        );
+    };
+
+    resolve_youtube_separate_av_with_format(source_url, format_selector).await
+}
+
+async fn resolve_generic_media_input(source_url: &str) -> anyhow::Result<ResolvedMediaInput> {
     match resolve_urls_with_format(source_url, YTDLP_GENERIC_SINGLE_FORMAT, 40).await {
         Ok(urls) if urls.len() == 1 => {
             return Ok(ResolvedMediaInput::Single {
@@ -2868,15 +2909,7 @@ async fn resolve_media_input(source_url: &str) -> anyhow::Result<ResolvedMediaIn
         }
     }
 
-    // Dernier recours: certains extracteurs exposent seulement un format exact
-    // visible via --list-formats.
-    let list_text = ytdlp_list_formats_text(source_url).await?;
-
-    let Some(format_selector) = best_dash_av_format_from_list_formats(&list_text) else {
-        anyhow::bail!("aucun format yt-dlp exploitable trouvé pour ce lien");
-    };
-
-    resolve_youtube_separate_av_with_format(source_url, format_selector).await
+    anyhow::bail!("aucun format yt-dlp exploitable trouvé pour ce lien")
 }
 
 async fn resolve_youtube_720_url(source_url: &str) -> anyhow::Result<String> {
@@ -2992,7 +3025,10 @@ pub async fn troozn_live_health() -> impl IntoResponse {
         "build_tag": TROOZN_LIVE_BUILD_TAG,
         "mode": "hls",
         "yt_dlp_bin": YTDLP_BIN,
-        "target_format": YTDLP_GENERIC_SINGLE_FORMAT,
+        "target_format": YTDLP_YOUTUBE_FAST_FORMAT,
+        "youtube_dash_fallback": YTDLP_YOUTUBE_DASH_FORMAT,
+        "generic_single_format": YTDLP_GENERIC_SINGLE_FORMAT,
+        "generic_separate_format": YTDLP_GENERIC_SEPARATE_FORMAT,
         "actual_resolution": null,
         "note": "La résolution réelle est celle du flux choisi par yt-dlp puis décodé par Kodi.",
         "hls_url": PUBLIC_HLS_URL
