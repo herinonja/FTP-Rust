@@ -254,6 +254,10 @@ enum RadxaRequest {
     },
     #[serde(rename = "proxy.list")]
     ProxyList { path: String },
+    #[serde(rename = "troozn.live.now")]
+    TrooznLiveNow,
+    #[serde(rename = "troozn.live.producer")]
+    TrooznLiveProducer,
 }
 
 #[derive(Debug)]
@@ -635,6 +639,7 @@ async fn main() -> anyhow::Result<()> {
         password: std::env::var("TROOZN_KODI_PASSWORD").unwrap_or_default(),
     };
     let registry: Registry = Arc::new(PhoneRegistry::default());
+    let live = Arc::new(troozn_live::TrooznLive::new_default());
     let head_cache = Arc::new(HeadCache {
         dir: head_cache_dir.clone(),
         file_bytes: head_cache_file_bytes,
@@ -644,6 +649,7 @@ async fn main() -> anyhow::Result<()> {
     });
 
     let wt_registry = registry.clone();
+    let wt_live = live.clone();
     let wt_kodi = kodi.clone();
     let wt_bind = webtransport_bind.clone();
     let wt_cert_dir = webtransport_cert_dir.clone();
@@ -654,6 +660,7 @@ async fn main() -> anyhow::Result<()> {
             &wt_cert_dir,
             &wt_status_path,
             wt_registry,
+            wt_live,
             wt_kodi,
         )
         .await
@@ -664,10 +671,11 @@ async fn main() -> anyhow::Result<()> {
 
     let http_registry = registry.clone();
     let http_cache = head_cache.clone();
+    let http_live = live.clone();
     let http_bind_for_task = http_bind.clone();
     tokio::spawn(async move {
         if let Err(error) =
-            run_http_media_gateway(&http_bind_for_task, http_registry, http_cache).await
+            run_http_media_gateway(&http_bind_for_task, http_registry, http_cache, http_live).await
         {
             eprintln!("Erreur serveur HTTP media TROOZN: {error:?}");
         }
@@ -729,6 +737,7 @@ async fn run_webtransport_server(
     cert_dir: &Path,
     status_path: &Path,
     registry: Registry,
+    live: Arc<troozn_live::TrooznLive>,
     kodi: KodiConfig,
 ) -> anyhow::Result<()> {
     let identity = load_or_create_webtransport_identity(cert_dir).await?;
@@ -753,9 +762,12 @@ async fn run_webtransport_server(
     loop {
         let incoming_session = endpoint.accept().await;
         let registry = registry.clone();
+        let live = live.clone();
         let kodi = kodi.clone();
         tokio::spawn(async move {
-            if let Err(error) = handle_webtransport_client(incoming_session, registry, kodi).await {
+            if let Err(error) =
+                handle_webtransport_client(incoming_session, registry, live, kodi).await
+            {
                 eprintln!("Session WebTransport terminee: {error:?}");
             }
         });
@@ -766,12 +778,12 @@ async fn run_http_media_gateway(
     bind: &str,
     registry: Registry,
     cache: Arc<HeadCache>,
+    live: Arc<troozn_live::TrooznLive>,
 ) -> anyhow::Result<()> {
     tokio::fs::create_dir_all(&cache.dir)
         .await
         .with_context(|| format!("creation cache media {}", cache.dir.display()))?;
     let youtube = Arc::new(youtube_library::YoutubeLibrary::new_default(bind));
-    let live = Arc::new(troozn_live::TrooznLive::new_default());
     let state = HttpGatewayState {
         registry,
         cache,
@@ -2476,6 +2488,7 @@ async fn write_proxy_status(status_path: &Path, bind: &str, cert_hash: &str) -> 
 async fn handle_webtransport_client(
     incoming_session: wtransport::endpoint::IncomingSession,
     registry: Registry,
+    live: Arc<troozn_live::TrooznLive>,
     kodi: KodiConfig,
 ) -> anyhow::Result<()> {
     let session_request = incoming_session.await?;
@@ -2491,6 +2504,7 @@ async fn handle_webtransport_client(
         };
 
         let registry = registry.clone();
+        let live = live.clone();
         let kodi = kodi.clone();
         let connection = connection.clone();
         tokio::spawn(async move {
@@ -2547,6 +2561,20 @@ async fn handle_webtransport_client(
                     }
                     RadxaRequest::ProxyList { path } => {
                         let response = proxy_list(&registry, &path).await?;
+                        tx.write_all(response.to_string().as_bytes()).await?;
+                    }
+                    RadxaRequest::TrooznLiveNow => {
+                        let response = json!({
+                            "ok": true,
+                            "now": live.current_now().await
+                        });
+                        tx.write_all(response.to_string().as_bytes()).await?;
+                    }
+                    RadxaRequest::TrooznLiveProducer => {
+                        let response = json!({
+                            "ok": true,
+                            "producer": live.producer_now().await
+                        });
                         tx.write_all(response.to_string().as_bytes()).await?;
                     }
                 }

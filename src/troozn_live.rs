@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -19,7 +19,7 @@ use tokio::time::{sleep, timeout, Duration};
 use crate::HttpGatewayState;
 
 const LIVE_DIR: &str = "/home/troozn/.kodi/userdata/TROOZN/live";
-const TROOZN_LIVE_BUILD_TAG: &str = "v1-quality-strict-95-94-22-ignore-config-2026-05-29";
+const TROOZN_LIVE_BUILD_TAG: &str = "v2-generic-ytdlp-prewarm-2026-06-01";
 
 const YTDLP_BIN: &str = "/home/troozn/.local/bin/yt-dlp";
 const LIVE_KEEP_BEHIND_ITEMS: usize = 2;
@@ -30,11 +30,16 @@ const LIVE_CONSUME_MODE: bool = false;
 const LIVE_CONSUME_KEEP_BEHIND_ITEMS: usize = 2;
 const MAX_ITEMS: usize = 20;
 const MAX_PRODUCER_AHEAD_ITEMS: usize = 20;
+const PREWARM_AHEAD_ITEMS: usize = 4;
 
 const PUBLIC_HLS_URL: &str = "http://127.0.0.1:8787/troozn-live/playlist-youtube.m3u8";
 
 const YTDLP_COOKIES_FILE: &str = "/home/troozn/.config/troozn/youtube-cookies.txt";
-const YTDLP_720_FORMAT: &str = "22/95/94";
+const YTDLP_YOUTUBE_FAST_FORMAT: &str = "22/95/94";
+const YTDLP_GENERIC_SINGLE_FORMAT: &str =
+    "best[height<=720][vcodec!=none][acodec!=none]/best[vcodec!=none][acodec!=none]/best";
+const YTDLP_GENERIC_SEPARATE_FORMAT: &str =
+    "bv*[height<=720][vcodec!=none]+ba[acodec!=none]/bv*[vcodec!=none]+ba[acodec!=none]/bestvideo+bestaudio";
 
 #[derive(Debug, Clone)]
 struct PlaylistRefillState {
@@ -44,7 +49,6 @@ struct PlaylistRefillState {
     active: bool,
 }
 
-
 pub struct TrooznLive {
     pub root_dir: PathBuf,
     ffmpeg_child: Mutex<Option<Child>>,
@@ -53,6 +57,8 @@ pub struct TrooznLive {
     queue: Mutex<Vec<TrooznLiveItem>>,
     master_entries: Mutex<Vec<MasterEntry>>,
     playlist_refill: Mutex<Option<PlaylistRefillState>>,
+    resolved_inputs: Mutex<HashMap<String, ResolvedMediaInput>>,
+    resolving_inputs: Mutex<HashSet<String>>,
     session_id: Mutex<String>,
     worker_running: Mutex<bool>,
     generation_id: Mutex<u64>,
@@ -133,13 +139,15 @@ struct FullVideoMetadata {
     uploader: Option<String>,
 }
 
-
 async fn live_audit(root_dir: &Path, line: impl AsRef<str>) {
     use tokio::io::AsyncWriteExt;
 
     let path = root_dir.join("audit.log");
-    let msg = format!("{}
-", line.as_ref());
+    let msg = format!(
+        "{}
+",
+        line.as_ref()
+    );
 
     match fs::OpenOptions::new()
         .create(true)
@@ -149,11 +157,17 @@ async fn live_audit(root_dir: &Path, line: impl AsRef<str>) {
     {
         Ok(mut file) => {
             if let Err(err) = file.write_all(msg.as_bytes()).await {
-                eprintln!("TROOZN_LIVE_AUDIT_WRITE_ERROR path={} state={err:?}", path.display());
+                eprintln!(
+                    "TROOZN_LIVE_AUDIT_WRITE_ERROR path={} state={err:?}",
+                    path.display()
+                );
             }
         }
         Err(err) => {
-            eprintln!("TROOZN_LIVE_AUDIT_OPEN_ERROR path={} state={err:?}", path.display());
+            eprintln!(
+                "TROOZN_LIVE_AUDIT_OPEN_ERROR path={} state={err:?}",
+                path.display()
+            );
         }
     }
 }
@@ -198,8 +212,6 @@ fn count_manifest_ts_lines(path: &Path) -> usize {
         .count()
 }
 
-
-
 #[derive(Debug, Clone)]
 enum ResolvedMediaInput {
     Single {
@@ -229,6 +241,8 @@ impl TrooznLive {
             queue: Mutex::new(Vec::new()),
             master_entries: Mutex::new(Vec::new()),
             playlist_refill: Mutex::new(None),
+            resolved_inputs: Mutex::new(HashMap::new()),
+            resolving_inputs: Mutex::new(HashSet::new()),
             session_id: Mutex::new(unix_timestamp().to_string()),
             worker_running: Mutex::new(false),
             generation_id: Mutex::new(0),
@@ -300,10 +314,7 @@ impl TrooznLive {
 
         eprintln!(
             "TROOZN_LIVE_REFILL_START current_index={} remaining={} start={} end={}",
-            current_index,
-            remaining,
-            start,
-            end
+            current_index, remaining, start, end
         );
 
         let result = extract_youtube_items_range_with_retry(&source_url, start, end).await;
@@ -350,8 +361,7 @@ impl TrooznLive {
 
                 eprintln!(
                     "TROOZN_LIVE_REFILL_ERROR start={} end={} state={err:?}",
-                    start,
-                    end
+                    start, end
                 );
             }
         }
@@ -364,6 +374,80 @@ impl TrooznLive {
             .iter()
             .find(|candidate| candidate.index > index)
             .map(|candidate| candidate.title.clone())
+    }
+
+    async fn cached_or_resolve_media_input(
+        self: std::sync::Arc<Self>,
+        item: &TrooznLiveItem,
+    ) -> anyhow::Result<ResolvedMediaInput> {
+        if let Some(input) = self.resolved_inputs.lock().await.remove(&item.item_id) {
+            eprintln!(
+                "TROOZN_LIVE_RESOLVE_CACHE_HIT index={} title={}",
+                item.index, item.title
+            );
+            return Ok(input);
+        }
+
+        resolve_media_input(&item.source_url).await
+    }
+
+    async fn spawn_prewarm_after(self: std::sync::Arc<Self>, index: usize) {
+        let candidates = {
+            let queue = self.queue.lock().await;
+            queue
+                .iter()
+                .filter(|candidate| candidate.index > index)
+                .take(PREWARM_AHEAD_ITEMS)
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+
+        for item in candidates {
+            {
+                let cache = self.resolved_inputs.lock().await;
+                if cache.contains_key(&item.item_id) {
+                    continue;
+                }
+            }
+
+            {
+                let mut resolving = self.resolving_inputs.lock().await;
+                if !resolving.insert(item.item_id.clone()) {
+                    continue;
+                }
+            }
+
+            let live = self.clone();
+            tokio::spawn(async move {
+                eprintln!(
+                    "TROOZN_LIVE_PREWARM_START index={} title={}",
+                    item.index, item.title
+                );
+                let result = resolve_media_input(&item.source_url).await;
+                let mut resolving = live.resolving_inputs.lock().await;
+                resolving.remove(&item.item_id);
+                drop(resolving);
+
+                match result {
+                    Ok(input) => {
+                        live.resolved_inputs
+                            .lock()
+                            .await
+                            .insert(item.item_id.clone(), input);
+                        eprintln!(
+                            "TROOZN_LIVE_PREWARM_DONE index={} title={}",
+                            item.index, item.title
+                        );
+                    }
+                    Err(err) => {
+                        eprintln!(
+                            "TROOZN_LIVE_PREWARM_FAILED index={} title={} state={err:?}",
+                            item.index, item.title
+                        );
+                    }
+                }
+            });
+        }
     }
 
     async fn extract_items_for_live(
@@ -414,8 +498,7 @@ impl TrooznLive {
         if let Some(item) = fallback_single_item_from_url(source_url) {
             eprintln!(
                 "TROOZN_LIVE_EXTRACT_FALLBACK_SINGLE source_url={} item_url={}",
-                source_url,
-                item.source_url
+                source_url, item.source_url
             );
             return Ok(vec![item]);
         }
@@ -451,10 +534,7 @@ impl TrooznLive {
         let worker_generation = self.current_generation().await;
 
         tokio::spawn(async move {
-            eprintln!(
-                "TROOZN_LIVE_WORKER_SPAWN generation={}",
-                worker_generation
-            );
+            eprintln!("TROOZN_LIVE_WORKER_SPAWN generation={}", worker_generation);
 
             if let Err(err) = live.clone().run_hls_worker(worker_generation).await {
                 eprintln!("TROOZN_LIVE_WORKER_ERROR: {err:?}");
@@ -467,10 +547,7 @@ impl TrooznLive {
             let mut running = live.worker_running.lock().await;
             *running = false;
 
-            eprintln!(
-                "TROOZN_LIVE_WORKER_EXIT generation={}",
-                worker_generation
-            );
+            eprintln!("TROOZN_LIVE_WORKER_EXIT generation={}", worker_generation);
         });
     }
 
@@ -485,6 +562,8 @@ impl TrooznLive {
             let mut entries = self.master_entries.lock().await;
             entries.clear();
         }
+        self.resolved_inputs.lock().await.clear();
+        self.resolving_inputs.lock().await.clear();
 
         Ok(())
     }
@@ -505,7 +584,6 @@ impl TrooznLive {
         title: Option<String>,
         limit: usize,
     ) -> anyhow::Result<TrooznLiveSubmitResponse> {
-
         self.stop_current_ffmpeg().await;
 
         self.bump_generation().await;
@@ -528,7 +606,7 @@ impl TrooznLive {
         }
 
         let limit = limit.clamp(1, MAX_ITEMS);
-        let playlist_like = is_youtube_playlist_like_url(source_url);
+        let playlist_like = is_probably_playlist_url(source_url);
         let mut extraction_urls: Vec<String> = vec![source_url.to_string()];
 
         if let Some(normalized) = normalize_rd_playlist_to_watch_url(source_url) {
@@ -548,7 +626,7 @@ impl TrooznLive {
             match extract_youtube_items_with_retry(candidate_url, limit).await {
                 Ok(found) if !found.is_empty() => {
                     eprintln!(
-                        "TROOZN_LIVE_PLAYLIST_EXTRACT_OK url={} count={}",
+                        "TROOZN_LIVE_EXTRACT_OK url={} count={}",
                         candidate_url,
                         found.len()
                     );
@@ -557,12 +635,12 @@ impl TrooznLive {
                 }
                 Ok(_) => {
                     last_error = Some(format!("Extraction vide pour {}", candidate_url));
-                    eprintln!("TROOZN_LIVE_PLAYLIST_EMPTY url={}", candidate_url);
+                    eprintln!("TROOZN_LIVE_EXTRACT_EMPTY url={}", candidate_url);
                 }
                 Err(err) => {
                     last_error = Some(err.to_string());
                     eprintln!(
-                        "TROOZN_LIVE_PLAYLIST_EXTRACT_FAILED url={} state={err:?}",
+                        "TROOZN_LIVE_EXTRACT_FAILED url={} state={err:?}",
                         candidate_url
                     );
                 }
@@ -571,26 +649,20 @@ impl TrooznLive {
 
         if items.is_empty() {
             if playlist_like {
-                anyhow::bail!(
-                    "Playlist/mix YouTube non extractible. Aucun flux playlist ne sera lancé. Dernière erreur: {}",
-                    last_error.unwrap_or_else(|| "inconnue".to_string())
+                eprintln!(
+                    "TROOZN_LIVE_PLAYLIST_FALLBACK_SINGLE source_url={} last_error={}",
+                    source_url,
+                    last_error.clone().unwrap_or_else(|| "inconnue".to_string())
                 );
             }
 
             items = fallback_single_item_from_url(source_url)
                 .map(|item| vec![item])
-                .ok_or_else(|| anyhow::anyhow!("Aucun item YouTube trouvé"))?;
-        }
-
-        if playlist_like && items.len() <= 1 {
-            anyhow::bail!(
-                "Le lien partagé ressemble à une playlist/mix, mais yt-dlp n'a retourné qu'un seul item. \
-Lecture annulée pour éviter l'arrêt après une seule vidéo. Partage une vraie URL watch?v=... ou une playlist PL extractible."
-            );
+                .ok_or_else(|| anyhow::anyhow!("Aucun item yt-dlp trouvé"))?;
         }
 
         if items.is_empty() {
-            anyhow::bail!("Aucun item YouTube trouvé");
+            anyhow::bail!("Aucun item yt-dlp trouvé");
         }
 
         {
@@ -617,7 +689,7 @@ Lecture annulée pour éviter l'arrêt après une seule vidéo. Partage une vrai
             *guard = now.clone();
         }
 
-        if is_probably_youtube_playlist_url(source_url) && items.len() >= PLAYLIST_PAGE_SIZE {
+        if is_probably_playlist_url(source_url) && items.len() >= PLAYLIST_PAGE_SIZE {
             let mut refill = self.playlist_refill.lock().await;
             *refill = Some(PlaylistRefillState {
                 source_url: source_url.to_string(),
@@ -660,8 +732,7 @@ Lecture annulée pour éviter l'arrêt après une seule vidéo. Partage une vrai
         let items = self.extract_items_for_live(source_url, limit).await?;
         let added = self.append_items_to_queue(items).await;
 
-        
-        if is_probably_youtube_playlist_url(source_url) && added.len() >= PLAYLIST_PAGE_SIZE {
+        if is_probably_playlist_url(source_url) && added.len() >= PLAYLIST_PAGE_SIZE {
             let mut refill = self.playlist_refill.lock().await;
             *refill = Some(PlaylistRefillState {
                 source_url: source_url.to_string(),
@@ -677,7 +748,7 @@ Lecture annulée pour éviter l'arrêt après une seule vidéo. Partage une vrai
             );
         }
 
-if let Some(first_added) = added.first() {
+        if let Some(first_added) = added.first() {
             let mut anchor = self.playback_anchor_item.lock().await;
             *anchor = first_added.index;
         }
@@ -767,6 +838,7 @@ if let Some(first_added) = added.first() {
             .await;
 
             self.wait_until_future_buffer_needed(item.index).await;
+            self.clone().spawn_prewarm_after(item.index).await;
 
             let next_title = self.next_title_after(item.index).await;
 
@@ -797,22 +869,19 @@ if let Some(first_added) = added.first() {
             // On clone l'item flat-playlist pour démarrer vite, puis on enrichit en arrière-plan.
             let item = item.clone();
 
-
             {
                 let mut guard = self.producer_now.lock().await;
                 guard.last_error = Some("Résolution URL vidéo 720p en cours".to_string());
             }
 
-            let media_input = match resolve_youtube_media_input(&item.source_url).await {
+            let media_input = match self.clone().cached_or_resolve_media_input(&item).await {
                 Ok(input) => input,
                 Err(err) => {
                     // Échec silencieux par item :
                     // on n'arrête pas le producer, on passe simplement à l'item suivant.
                     eprintln!(
                         "TROOZN_LIVE_SKIP_ITEM index={} title={} source_url={} state={err:?}",
-                        item.index,
-                        item.title,
-                        item.source_url
+                        item.index, item.title, item.source_url
                     );
 
                     live_audit(
@@ -853,11 +922,26 @@ if let Some(first_added) = added.first() {
                     item.index,
                     item.title,
                     match &media_input {
-                        ResolvedMediaInput::Single { url, format_selector } => {
-                            format!("single format={} url={}", format_selector, url.chars().take(80).collect::<String>())
+                        ResolvedMediaInput::Single {
+                            url,
+                            format_selector,
+                        } => {
+                            format!(
+                                "single format={} url={}",
+                                format_selector,
+                                url.chars().take(80).collect::<String>()
+                            )
                         }
-                        ResolvedMediaInput::SeparateAv { video_url, audio_url: _, format_selector } => {
-                            format!("dash-av format={} video={}", format_selector, video_url.chars().take(80).collect::<String>())
+                        ResolvedMediaInput::SeparateAv {
+                            video_url,
+                            audio_url: _,
+                            format_selector,
+                        } => {
+                            format!(
+                                "dash-av format={} video={}",
+                                format_selector,
+                                video_url.chars().take(80).collect::<String>()
+                            )
                         }
                     }
                 ),
@@ -902,23 +986,29 @@ if let Some(first_added) = added.first() {
 
             let mut cmd = Command::new("ffmpeg");
 
-            cmd.args([
-                "-hide_banner",
-                "-nostdin",
-                "-loglevel",
-                "warning",
-                "-y",
-            ]);
+            cmd.args(["-hide_banner", "-nostdin", "-loglevel", "warning", "-y"]);
 
             match &media_input {
-                ResolvedMediaInput::Single { url, format_selector } => {
+                ResolvedMediaInput::Single {
+                    url,
+                    format_selector,
+                } => {
                     eprintln!(
                         "TROOZN_LIVE_FFMPEG_INPUT_SINGLE index={} format={}",
-                        item.index,
-                        format_selector
+                        item.index, format_selector
                     );
 
                     cmd.args([
+                        "-reconnect",
+                        "1",
+                        "-reconnect_streamed",
+                        "1",
+                        "-reconnect_on_network_error",
+                        "1",
+                        "-reconnect_delay_max",
+                        "4",
+                        "-rw_timeout",
+                        "15000000",
                         "-i",
                         url,
                     ]);
@@ -930,13 +1020,32 @@ if let Some(first_added) = added.first() {
                 } => {
                     eprintln!(
                         "TROOZN_LIVE_FFMPEG_INPUT_DASH_AV index={} format={}",
-                        item.index,
-                        format_selector
+                        item.index, format_selector
                     );
 
                     cmd.args([
+                        "-reconnect",
+                        "1",
+                        "-reconnect_streamed",
+                        "1",
+                        "-reconnect_on_network_error",
+                        "1",
+                        "-reconnect_delay_max",
+                        "4",
+                        "-rw_timeout",
+                        "15000000",
                         "-i",
                         video_url,
+                        "-reconnect",
+                        "1",
+                        "-reconnect_streamed",
+                        "1",
+                        "-reconnect_on_network_error",
+                        "1",
+                        "-reconnect_delay_max",
+                        "4",
+                        "-rw_timeout",
+                        "15000000",
                         "-i",
                         audio_url,
                         "-map",
@@ -959,11 +1068,13 @@ if let Some(first_added) = added.first() {
                 "-f",
                 "hls",
                 "-hls_time",
-                "4",
+                "2",
+                "-hls_init_time",
+                "1",
                 "-hls_list_size",
                 "0",
                 "-hls_flags",
-                "omit_endlist+program_date_time",
+                "omit_endlist+program_date_time+independent_segments+temp_file",
                 "-hls_segment_filename",
             ]);
 
@@ -1000,7 +1111,6 @@ if let Some(first_added) = added.first() {
             // Métadonnées complètes en arrière-plan seulement après démarrage FFmpeg.
             // Elles ne doivent jamais retarder les premiers segments HLS.
 
-
             let mut imported_segments = 0_usize;
 
             loop {
@@ -1036,9 +1146,8 @@ if let Some(first_added) = added.first() {
                                     item.index, item.title
                                 );
 
-                                
                                 self.maybe_refill_playlist_queue(item.index).await;
-live_audit(
+                                live_audit(
                                     &self.root_dir,
                                     format!(
                                         "ITEM_FFMPEG_DONE index={} title={} status={} ts_files={} manifest_lines={}",
@@ -1085,7 +1194,6 @@ live_audit(
 
         // Worker persistant : il attend de nouveaux items jusqu'à génération obsolète.
     }
-
 
     async fn enrich_item_metadata(&self, item: &TrooznLiveItem) -> TrooznLiveItem {
         let meta = match extract_full_video_metadata(&item.source_url).await {
@@ -1274,8 +1382,7 @@ live_audit(
                     Ok(_) => {
                         eprintln!(
                             "TROOZN_LIVE_CLEANUP_REMOVE keep_from={} file={}",
-                            keep_from,
-                            name
+                            keep_from, name
                         );
                     }
                     Err(err) => {
@@ -1385,8 +1492,7 @@ live_audit(
 
         eprintln!(
             "TROOZN_LIVE_CONSUME_CLEANUP current_item={} keep_from={}",
-            current_item_index,
-            keep_from
+            current_item_index, keep_from
         );
 
         let mut removed_count: usize = 0;
@@ -1407,10 +1513,7 @@ live_audit(
                 continue;
             };
 
-            if name == "index.m3u8"
-                || name == "playlist-youtube.m3u8"
-                || name == "audit.log"
-            {
+            if name == "index.m3u8" || name == "playlist-youtube.m3u8" || name == "audit.log" {
                 continue;
             }
 
@@ -1437,9 +1540,7 @@ live_audit(
                     removed_bytes = removed_bytes.saturating_add(size);
                     eprintln!(
                         "TROOZN_LIVE_CONSUME_REMOVE item={} file={} bytes={}",
-                        item_index,
-                        name,
-                        size
+                        item_index, name, size
                     );
                 }
                 Err(err) => {
@@ -1485,6 +1586,7 @@ live_audit(
         let mut out = String::new();
         out.push_str("#EXTM3U\n");
         out.push_str("#EXT-X-VERSION:3\n");
+        out.push_str("#EXT-X-PLAYLIST-TYPE:EVENT\n");
         out.push_str(&format!("#EXT-X-TARGETDURATION:{target_duration}\n"));
         out.push_str("#EXT-X-MEDIA-SEQUENCE:0\n");
 
@@ -1574,11 +1676,11 @@ live_audit(
             "TROOZN_LIVE_SEGMENT_SERVED item={} segment={} file={}",
             item_index, segment_number, relative
         );
-    
+
         if let Some(current_item_index) = parse_item_index_from_live_filename(relative) {
             self.consume_cleanup_before_item(current_item_index).await;
         }
-}
+    }
 
     pub async fn current_now(&self) -> TrooznLiveNow {
         let playback = self.playback_now.lock().await.clone();
@@ -1685,21 +1787,22 @@ async fn write_empty_master_playlist(index_path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-
-fn is_youtube_playlist_like_url(source_url: &str) -> bool {
-    query_param(source_url, "list").is_some()
-        || source_url.contains("/playlist?")
-        || source_url.contains("youtube.com/playlist")
-}
-
-fn is_probably_youtube_playlist_url(source_url: &str) -> bool {
+fn is_probably_playlist_url(source_url: &str) -> bool {
     let lower = source_url.to_lowercase();
 
     lower.contains("list=")
         || lower.contains("/playlist?")
         || lower.contains("youtube.com/playlist")
+        || lower.contains("/sets/")
+        || lower.contains("/album/")
+        || lower.contains("/channel/")
+        || lower.contains("/playlist/")
 }
 
+fn is_youtube_url(source_url: &str) -> bool {
+    let lower = source_url.to_lowercase();
+    lower.contains("youtube.com/") || lower.contains("youtu.be/")
+}
 
 fn is_youtube_mix_list(source_url: &str) -> bool {
     let Some(list) = query_param(source_url, "list") else {
@@ -1737,8 +1840,13 @@ fn normalize_rd_playlist_to_watch_url(source_url: &str) -> Option<String> {
 }
 
 fn fallback_single_item_from_url(source_url: &str) -> Option<TrooznLiveItem> {
-    let video_id = extract_youtube_video_id(source_url)?;
-    let watch_url = format!("https://www.youtube.com/watch?v={}", video_id);
+    let watch_url = if let Some(video_id) = extract_youtube_video_id(source_url) {
+        format!("https://www.youtube.com/watch?v={}", video_id)
+    } else if source_url.starts_with("http://") || source_url.starts_with("https://") {
+        source_url.to_string()
+    } else {
+        return None;
+    };
 
     eprintln!(
         "TROOZN_LIVE_FALLBACK_SINGLE source_url={} watch_url={}",
@@ -1748,7 +1856,7 @@ fn fallback_single_item_from_url(source_url: &str) -> Option<TrooznLiveItem> {
     Some(TrooznLiveItem {
         item_id: item_id_for_url(&watch_url),
         index: 1,
-        title: "Playlist Youtube".to_string(),
+        title: fallback_title_for_url(&watch_url),
         source_url: watch_url.clone(),
         webpage_url: Some(watch_url),
         duration: None,
@@ -1839,6 +1947,24 @@ fn query_param(source_url: &str, key: &str) -> Option<String> {
     None
 }
 
+fn fallback_title_for_url(source_url: &str) -> String {
+    let without_query = source_url
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(source_url)
+        .trim_end_matches('/');
+    let last = without_query
+        .rsplit('/')
+        .next()
+        .unwrap_or("media")
+        .replace(['-', '_'], " ");
+    if last.trim().is_empty() {
+        "Media TROOZN".to_string()
+    } else {
+        last
+    }
+}
+
 fn percent_decode_minimal(input: &str) -> String {
     let mut out = String::new();
     let bytes = input.as_bytes();
@@ -1874,7 +2000,6 @@ fn looks_like_youtube_id(value: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
-
 async fn extract_youtube_items_range_with_retry(
     source_url: &str,
     start: usize,
@@ -1885,8 +2010,7 @@ async fn extract_youtube_items_range_with_retry(
         Err(err) => {
             eprintln!(
                 "TROOZN_LIVE_RANGE_EXTRACT_FAIL start={} end={} state={err:?}",
-                start,
-                end
+                start, end
             );
             Err(err)
         }
@@ -1916,9 +2040,7 @@ async fn extract_youtube_items_range(
 
     eprintln!(
         "TROOZN_LIVE_RANGE_EXTRACT_START start={} end={} url={}",
-        start,
-        end,
-        source_url
+        start, end, source_url
     );
 
     let output = timeout(Duration::from_secs(45), cmd.output())
@@ -1932,8 +2054,8 @@ async fn extract_youtube_items_range(
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let root: serde_json::Value = serde_json::from_str(&stdout)
-        .context("parse yt-dlp range json")?;
+    let root: serde_json::Value =
+        serde_json::from_str(&stdout).context("parse yt-dlp range json")?;
 
     let mut items = Vec::new();
 
@@ -1966,10 +2088,7 @@ fn stable_item_id(source_url: &str) -> String {
     hasher.update(source_url.as_bytes());
     let digest = hasher.finalize();
 
-    format!("{:x}", digest)
-        .chars()
-        .take(16)
-        .collect::<String>()
+    format!("{:x}", digest).chars().take(16).collect::<String>()
 }
 
 fn troozn_live_item_from_ytdlp_entry(entry: &serde_json::Value) -> Option<TrooznLiveItem> {
@@ -1994,12 +2113,20 @@ fn troozn_live_item_from_ytdlp_entry(entry: &serde_json::Value) -> Option<Troozn
 
     let source_url = if let Some(webpage_url) = webpage_url.clone() {
         webpage_url
-    } else if !id.is_empty() && !id.starts_with("http://") && !id.starts_with("https://") {
-        format!("https://www.youtube.com/watch?v={}", id)
     } else if url.starts_with("http://") || url.starts_with("https://") {
         url
+    } else if !id.is_empty() && !id.starts_with("http://") && !id.starts_with("https://") {
+        if looks_like_youtube_id(&id) {
+            format!("https://www.youtube.com/watch?v={}", id)
+        } else {
+            return None;
+        }
     } else if !url.is_empty() {
-        format!("https://www.youtube.com/watch?v={}", url)
+        if looks_like_youtube_id(&url) {
+            format!("https://www.youtube.com/watch?v={}", url)
+        } else {
+            return None;
+        }
     } else {
         return None;
     };
@@ -2040,7 +2167,6 @@ fn troozn_live_item_from_ytdlp_entry(entry: &serde_json::Value) -> Option<Troozn
         uploader: None,
     })
 }
-
 
 async fn extract_youtube_items_with_retry(
     source_url: &str,
@@ -2166,8 +2292,14 @@ fn item_from_ytdlp_value(index: usize, v: &Value) -> Option<TrooznLiveItem> {
     let id = v
         .get("id")
         .and_then(Value::as_str)
-        .or_else(|| v.get("url").and_then(Value::as_str))
         .unwrap_or(&title)
+        .to_string();
+
+    let flat_url = v
+        .get("url")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
         .to_string();
 
     let webpage_url = v
@@ -2177,10 +2309,18 @@ fn item_from_ytdlp_value(index: usize, v: &Value) -> Option<TrooznLiveItem> {
 
     let source_url = if let Some(url) = webpage_url.clone() {
         url
+    } else if flat_url.starts_with("http://") || flat_url.starts_with("https://") {
+        flat_url.clone()
     } else if id.starts_with("http://") || id.starts_with("https://") {
         id.clone()
-    } else {
+    } else if looks_like_youtube_id(&id) {
         format!("https://www.youtube.com/watch?v={id}")
+    } else {
+        eprintln!(
+            "TROOZN_LIVE_FLAT_SKIP_NO_URL index={} title={} id={} url={}",
+            index, title, id, flat_url
+        );
+        return None;
     };
 
     let duration = v.get("duration").and_then(Value::as_u64);
@@ -2264,7 +2404,7 @@ async fn extract_full_video_metadata(source_url: &str) -> anyhow::Result<FullVid
                 "yt-dlp command failed: build_tag={} bin={} ignore_config=true format={} url={} status={} stderr={} stdout={}",
                 TROOZN_LIVE_BUILD_TAG,
                 YTDLP_BIN,
-                YTDLP_720_FORMAT,
+                YTDLP_GENERIC_SINGLE_FORMAT,
                 source_url,
                 output.status,
                 stderr.trim(),
@@ -2345,16 +2485,13 @@ fn is_youtube_auth_or_bot_error(text: &str) -> bool {
         || lower.contains("confirm you’re not a bot")
 }
 
-
 fn add_ytdlp_cookies_if_available(_cmd: &mut Command) {
     // TROOZN Live v1: cookies désactivés par défaut.
     // Un fichier cookies invalide peut provoquer des erreurs YouTube difficiles à diagnostiquer.
     // On réactivera plus tard via une option explicite si nécessaire.
 }
 
-
-
-fn best_allowed_format_from_list_formats(text: &str) -> Option<&'static str> {
+fn best_youtube_fast_format_from_list_formats(text: &str) -> Option<&'static str> {
     // Formats autorisés, dans l'ordre de préférence :
     // 95 = 720p HLS
     // 94 = 480p HLS
@@ -2393,8 +2530,7 @@ async fn ytdlp_list_formats_text(source_url: &str) -> anyhow::Result<String> {
 
     eprintln!(
         "TROOZN_LIVE_LIST_FORMATS_CMD bin={} url={}",
-        YTDLP_BIN,
-        source_url
+        YTDLP_BIN, source_url
     );
 
     let output = timeout(Duration::from_secs(30), cmd.output())
@@ -2408,8 +2544,11 @@ async fn ytdlp_list_formats_text(source_url: &str) -> anyhow::Result<String> {
     let combined = if stderr.trim().is_empty() {
         stdout
     } else {
-        format!("{}
-{}", stdout, stderr)
+        format!(
+            "{}
+{}",
+            stdout, stderr
+        )
     };
 
     if !output.status.success() {
@@ -2449,9 +2588,7 @@ async fn resolve_youtube_url_with_format(
 
     eprintln!(
         "TROOZN_LIVE_YTDLP_RESOLVE_FORMAT bin={} format={} url={}",
-        YTDLP_BIN,
-        format_selector,
-        source_url
+        YTDLP_BIN, format_selector, source_url
     );
 
     let output = timeout(Duration::from_secs(30), cmd.output())
@@ -2501,6 +2638,72 @@ async fn resolve_youtube_url_with_format(
     Ok(url.to_string())
 }
 
+async fn resolve_urls_with_format(
+    source_url: &str,
+    format_selector: &str,
+    timeout_seconds: u64,
+) -> anyhow::Result<Vec<String>> {
+    let mut cmd = Command::new(YTDLP_BIN);
+    add_ytdlp_cookies_if_available(&mut cmd);
+
+    cmd.args([
+        "--ignore-config",
+        "--no-playlist",
+        "--no-warnings",
+        "--force-ipv4",
+        "--socket-timeout",
+        "20",
+        "--retries",
+        "2",
+        "--fragment-retries",
+        "2",
+        "-f",
+        format_selector,
+        "-g",
+        source_url,
+    ]);
+
+    eprintln!(
+        "TROOZN_LIVE_YTDLP_RESOLVE_GENERIC bin={} format={} url={}",
+        YTDLP_BIN, format_selector, source_url
+    );
+
+    let output = timeout(Duration::from_secs(timeout_seconds), cmd.output())
+        .await
+        .context("timeout yt-dlp generic -g")?
+        .context("spawn yt-dlp generic -g")?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    if !output.status.success() {
+        anyhow::bail!(
+            "yt-dlp generic -g failed: format={} url={} status={} stderr={} stdout={}",
+            format_selector,
+            source_url,
+            output.status,
+            stderr.trim(),
+            stdout.trim()
+        );
+    }
+
+    let urls = stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("http://") || line.starts_with("https://"))
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+
+    if urls.is_empty() {
+        anyhow::bail!(
+            "yt-dlp generic -g OK mais aucune URL: format={} stdout={}",
+            format_selector,
+            stdout.trim()
+        );
+    }
+
+    Ok(urls)
+}
 
 fn best_dash_av_format_from_list_formats(text: &str) -> Option<&'static str> {
     let has = |wanted: &str| -> bool {
@@ -2551,9 +2754,7 @@ async fn resolve_youtube_separate_av_with_format(
 
     eprintln!(
         "TROOZN_LIVE_YTDLP_DASH_AV_CMD bin={} format={} url={}",
-        YTDLP_BIN,
-        format_selector,
-        source_url
+        YTDLP_BIN, format_selector, source_url
     );
 
     let output = timeout(Duration::from_secs(35), cmd.output())
@@ -2603,28 +2804,76 @@ async fn resolve_youtube_separate_av_with_format(
     })
 }
 
-async fn resolve_youtube_media_input(source_url: &str) -> anyhow::Result<ResolvedMediaInput> {
-    match resolve_youtube_720_url(source_url).await {
-        Ok(url) => {
+async fn resolve_media_input(source_url: &str) -> anyhow::Result<ResolvedMediaInput> {
+    if is_youtube_url(source_url) {
+        match resolve_youtube_720_url(source_url).await {
+            Ok(url) => {
+                return Ok(ResolvedMediaInput::Single {
+                    url,
+                    format_selector: YTDLP_YOUTUBE_FAST_FORMAT.to_string(),
+                });
+            }
+            Err(first_err) => {
+                eprintln!(
+                    "TROOZN_LIVE_YOUTUBE_FAST_INPUT_FAIL url={} state={first_err:?}",
+                    source_url
+                );
+            }
+        }
+    }
+
+    match resolve_urls_with_format(source_url, YTDLP_GENERIC_SINGLE_FORMAT, 40).await {
+        Ok(urls) if urls.len() == 1 => {
             return Ok(ResolvedMediaInput::Single {
-                url,
-                format_selector: YTDLP_720_FORMAT.to_string(),
+                url: urls[0].clone(),
+                format_selector: YTDLP_GENERIC_SINGLE_FORMAT.to_string(),
             });
         }
-        Err(first_err) => {
+        Ok(urls) if urls.len() >= 2 => {
+            return Ok(ResolvedMediaInput::SeparateAv {
+                video_url: urls[0].clone(),
+                audio_url: urls[1].clone(),
+                format_selector: YTDLP_GENERIC_SINGLE_FORMAT.to_string(),
+            });
+        }
+        Ok(_) => {}
+        Err(err) => {
             eprintln!(
-                "TROOZN_LIVE_SINGLE_INPUT_FAIL url={} state={first_err:?}",
+                "TROOZN_LIVE_GENERIC_SINGLE_INPUT_FAIL url={} state={err:?}",
                 source_url
             );
         }
     }
 
+    match resolve_urls_with_format(source_url, YTDLP_GENERIC_SEPARATE_FORMAT, 45).await {
+        Ok(urls) if urls.len() >= 2 => {
+            return Ok(ResolvedMediaInput::SeparateAv {
+                video_url: urls[0].clone(),
+                audio_url: urls[1].clone(),
+                format_selector: YTDLP_GENERIC_SEPARATE_FORMAT.to_string(),
+            });
+        }
+        Ok(urls) if urls.len() == 1 => {
+            return Ok(ResolvedMediaInput::Single {
+                url: urls[0].clone(),
+                format_selector: YTDLP_GENERIC_SEPARATE_FORMAT.to_string(),
+            });
+        }
+        Ok(_) => {}
+        Err(err) => {
+            eprintln!(
+                "TROOZN_LIVE_GENERIC_SEPARATE_INPUT_FAIL url={} state={err:?}",
+                source_url
+            );
+        }
+    }
+
+    // Dernier recours: certains extracteurs exposent seulement un format exact
+    // visible via --list-formats.
     let list_text = ytdlp_list_formats_text(source_url).await?;
 
     let Some(format_selector) = best_dash_av_format_from_list_formats(&list_text) else {
-        anyhow::bail!(
-            "aucun format muxé 95/94/22 ni DASH séparé 137+140/136+140/135+140 disponible"
-        );
+        anyhow::bail!("aucun format yt-dlp exploitable trouvé pour ce lien");
     };
 
     resolve_youtube_separate_av_with_format(source_url, format_selector).await
@@ -2633,23 +2882,20 @@ async fn resolve_youtube_media_input(source_url: &str) -> anyhow::Result<Resolve
 async fn resolve_youtube_720_url(source_url: &str) -> anyhow::Result<String> {
     let mut last_error = String::new();
 
-    // 1) Tentative directe stricte : 1080p HLS, 720p HLS, 480p HLS, 720p MP4.
-    match resolve_youtube_url_with_format(source_url, YTDLP_720_FORMAT).await {
-        Ok(url) => return Ok(url),
+    match resolve_youtube_url_with_format(source_url, YTDLP_YOUTUBE_FAST_FORMAT).await {
+        Ok(url) => {
+            return Ok(url);
+        }
         Err(err) => {
             last_error = err.to_string();
 
             eprintln!(
                 "TROOZN_LIVE_YTDLP_STRICT_FAIL url={} state={}",
-                source_url,
-                last_error
+                source_url, last_error
             );
 
             if is_youtube_auth_or_bot_error(&last_error) {
-                anyhow::bail!(
-                    "yt-dlp a échoué après 1 tentative(s): {}",
-                    last_error
-                );
+                anyhow::bail!("yt-dlp a échoué après 1 tentative(s): {}", last_error);
             }
         }
     }
@@ -2667,7 +2913,7 @@ async fn resolve_youtube_720_url(source_url: &str) -> anyhow::Result<String> {
         }
     };
 
-    let Some(best_format) = best_allowed_format_from_list_formats(&list_text) else {
+    let Some(best_format) = best_youtube_fast_format_from_list_formats(&list_text) else {
         let interesting_formats = list_text
             .lines()
             .map(str::trim)
@@ -2682,7 +2928,7 @@ async fn resolve_youtube_720_url(source_url: &str) -> anyhow::Result<String> {
             .join(" | ");
 
         anyhow::bail!(
-            "yt-dlp a échoué: aucun format autorisé 95/94/22 trouvé. premier_error={} formats_detectes={}",
+            "yt-dlp a échoué: aucun format YouTube rapide 95/94/22 trouvé. premier_error={} formats_detectes={}",
             last_error,
             interesting_formats
         );
@@ -2690,8 +2936,7 @@ async fn resolve_youtube_720_url(source_url: &str) -> anyhow::Result<String> {
 
     eprintln!(
         "TROOZN_LIVE_YTDLP_LIST_FORMATS_PICK format={} url={}",
-        best_format,
-        source_url
+        best_format, source_url
     );
 
     // 3) Relance avec le format exact détecté.
@@ -2747,13 +2992,12 @@ pub async fn troozn_live_health() -> impl IntoResponse {
         "build_tag": TROOZN_LIVE_BUILD_TAG,
         "mode": "hls",
         "yt_dlp_bin": YTDLP_BIN,
-        "target_format": YTDLP_720_FORMAT,
+        "target_format": YTDLP_GENERIC_SINGLE_FORMAT,
         "actual_resolution": null,
         "note": "La résolution réelle est celle du flux choisi par yt-dlp puis décodé par Kodi.",
         "hls_url": PUBLIC_HLS_URL
     }))
 }
-
 
 pub async fn troozn_live_start(
     State(state): State<HttpGatewayState>,
