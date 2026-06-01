@@ -42,6 +42,9 @@ const YTDLP_GENERIC_SINGLE_FORMAT: &str =
 const YTDLP_GENERIC_SEPARATE_FORMAT: &str =
     "bv*[height<=720][height>=480][vcodec!=none]+ba[acodec!=none]/bv*[height=720][vcodec!=none]+ba[acodec!=none]/bv*[height=480][vcodec!=none]+ba[acodec!=none]";
 
+const YTDLP_GENERIC_AUDIO_FORMAT: &str =
+    "bestaudio[acodec!=none]/best[acodec!=none]/bestaudio/best";
+
 #[derive(Debug, Clone)]
 struct PlaylistRefillState {
     source_url: String,
@@ -222,6 +225,10 @@ enum ResolvedMediaInput {
     SeparateAv {
         video_url: String,
         audio_url: String,
+        format_selector: String,
+    },
+    AudioOnly {
+        url: String,
         format_selector: String,
     },
 }
@@ -944,6 +951,16 @@ impl TrooznLive {
                                 video_url.chars().take(80).collect::<String>()
                             )
                         }
+                        ResolvedMediaInput::AudioOnly {
+                            url,
+                            format_selector,
+                        } => {
+                            format!(
+                                "audio-only format={} url={}",
+                                format_selector,
+                                url.chars().take(80).collect::<String>()
+                            )
+                        }
                     }
                 ),
             )
@@ -1055,6 +1072,30 @@ impl TrooznLive {
                         "1:a:0",
                     ]);
                 }
+                ResolvedMediaInput::AudioOnly {
+                    url,
+                    format_selector,
+                } => {
+                    eprintln!(
+                        "TROOZN_LIVE_FFMPEG_INPUT_AUDIO_ONLY index={} format={}",
+                        item.index, format_selector
+                    );
+
+                    cmd.args([
+                        "-reconnect",
+                        "1",
+                        "-reconnect_streamed",
+                        "1",
+                        "-reconnect_on_network_error",
+                        "1",
+                        "-reconnect_delay_max",
+                        "4",
+                        "-rw_timeout",
+                        "15000000",
+                        "-i",
+                        url,
+                    ]);
+                }
             }
 
             cmd.args([
@@ -1090,8 +1131,49 @@ impl TrooznLive {
             }
 
             cmd.args([
-                "-max_muxing_queue_size",
-                "2048",
+                "-fflags",
+                "+genpts",
+                "-avoid_negative_ts",
+                "make_zero",
+            ]);
+
+            match &media_input {
+                ResolvedMediaInput::AudioOnly { .. } => {
+                    cmd.args([
+                        "-vn",
+                        "-c:a",
+                        "aac",
+                        "-b:a",
+                        "160k",
+                        "-ac",
+                        "2",
+                        "-ar",
+                        "44100",
+                    ]);
+                }
+                ResolvedMediaInput::SeparateAv { .. } => {
+                    cmd.args([
+                        "-c:v",
+                        "copy",
+                        "-c:a",
+                        "aac",
+                        "-b:a",
+                        "160k",
+                        "-ac",
+                        "2",
+                        "-ar",
+                        "44100",
+                    ]);
+                }
+                ResolvedMediaInput::Single { .. } => {
+                    cmd.args([
+                        "-c",
+                        "copy",
+                    ]);
+                }
+            }
+
+            cmd.args([
                 "-f",
                 "hls",
                 "-hls_time",
