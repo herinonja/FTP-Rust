@@ -961,6 +961,16 @@ impl TrooznLive {
                                 url.chars().take(80).collect::<String>()
                             )
                         }
+                        ResolvedMediaInput::AudioOnly {
+                            url,
+                            format_selector,
+                        } => {
+                            format!(
+                                "audio-only format={} url={}",
+                                format_selector,
+                                url.chars().take(80).collect::<String>()
+                            )
+                        }
                     }
                 ),
             )
