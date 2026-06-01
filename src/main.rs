@@ -247,6 +247,8 @@ enum RadxaRequest {
     },
     #[serde(rename = "kodi.command")]
     KodiCommand { command: String },
+    #[serde(rename = "kodi.status")]
+    KodiStatus,
     #[serde(rename = "kodi.jsonrpc")]
     KodiJsonRpc {
         method: String,
@@ -2554,6 +2556,10 @@ async fn handle_webtransport_client(
                         let response = run_kodi_command(&kodi, &command).await?;
                         tx.write_all(response.to_string().as_bytes()).await?;
                     }
+                    RadxaRequest::KodiStatus => {
+                        let response = kodi_status(&kodi).await;
+                        tx.write_all(response.to_string().as_bytes()).await?;
+                    }
                     RadxaRequest::KodiJsonRpc { method, params } => {
                         let response =
                             kodi_json_rpc(&kodi, &method, params.unwrap_or(Value::Null)).await?;
@@ -2796,6 +2802,22 @@ async fn active_player_id(kodi: &KodiConfig) -> anyhow::Result<Option<i64>> {
         .first()
         .and_then(|player| player.get("playerid"))
         .and_then(Value::as_i64))
+}
+
+async fn kodi_status(kodi: &KodiConfig) -> Value {
+    match active_player_id(kodi).await {
+        Ok(player_id) => json!({
+            "ok": true,
+            "connected": true,
+            "activePlayerId": player_id,
+        }),
+        Err(error) => json!({
+            "ok": true,
+            "connected": false,
+            "activePlayerId": Value::Null,
+            "error": error.to_string(),
+        }),
+    }
 }
 
 async fn kodi_json_rpc(kodi: &KodiConfig, method: &str, params: Value) -> anyhow::Result<Value> {

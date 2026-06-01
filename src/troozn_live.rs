@@ -233,6 +233,43 @@ enum ResolvedMediaInput {
     },
 }
 
+
+fn media_input_summary(input: &ResolvedMediaInput) -> String {
+    match input {
+        ResolvedMediaInput::Single {
+            url,
+            format_selector,
+        } => {
+            format!(
+                "single format={} url={}",
+                format_selector,
+                url.chars().take(80).collect::<String>()
+            )
+        }
+        ResolvedMediaInput::SeparateAv {
+            video_url,
+            audio_url: _,
+            format_selector,
+        } => {
+            format!(
+                "dash-av format={} video={}",
+                format_selector,
+                video_url.chars().take(80).collect::<String>()
+            )
+        }
+        ResolvedMediaInput::AudioOnly {
+            url,
+            format_selector,
+        } => {
+            format!(
+                "audio-only format={} url={}",
+                format_selector,
+                url.chars().take(80).collect::<String>()
+            )
+        }
+    }
+}
+
 impl TrooznLive {
     pub fn new_default() -> Self {
         let idle = TrooznLiveNow {
@@ -929,49 +966,7 @@ impl TrooznLive {
                     "ITEM_YTDLP_OK index={} title={} play_url_prefix={}",
                     item.index,
                     item.title,
-                    match &media_input {
-                        ResolvedMediaInput::Single {
-                            url,
-                            format_selector,
-                        } => {
-                            format!(
-                                "single format={} url={}",
-                                format_selector,
-                                url.chars().take(80).collect::<String>()
-                            )
-                        }
-                        ResolvedMediaInput::SeparateAv {
-                            video_url,
-                            audio_url: _,
-                            format_selector,
-                        } => {
-                            format!(
-                                "dash-av format={} video={}",
-                                format_selector,
-                                video_url.chars().take(80).collect::<String>()
-                            )
-                        }
-                        ResolvedMediaInput::AudioOnly {
-                            url,
-                            format_selector,
-                        } => {
-                            format!(
-                                "audio-only format={} url={}",
-                                format_selector,
-                                url.chars().take(80).collect::<String>()
-                            )
-                        }
-                        ResolvedMediaInput::AudioOnly {
-                            url,
-                            format_selector,
-                        } => {
-                            format!(
-                                "audio-only format={} url={}",
-                                format_selector,
-                                url.chars().take(80).collect::<String>()
-                            )
-                        }
-                    }
+                    media_input_summary(&media_input)
                 ),
             )
             .await;
@@ -1136,6 +1131,50 @@ impl TrooznLive {
                         "2",
                         "-af",
                         "aresample=async=1:first_pts=0",
+                    ]);
+                }
+                ResolvedMediaInput::AudioOnly { .. } => {}
+            }
+
+            cmd.args([
+                "-fflags",
+                "+genpts",
+                "-avoid_negative_ts",
+                "make_zero",
+            ]);
+
+            match &media_input {
+                ResolvedMediaInput::AudioOnly { .. } => {
+                    cmd.args([
+                        "-vn",
+                        "-c:a",
+                        "aac",
+                        "-b:a",
+                        "160k",
+                        "-ac",
+                        "2",
+                        "-ar",
+                        "44100",
+                    ]);
+                }
+                ResolvedMediaInput::SeparateAv { .. } => {
+                    cmd.args([
+                        "-c:v",
+                        "copy",
+                        "-c:a",
+                        "aac",
+                        "-b:a",
+                        "160k",
+                        "-ac",
+                        "2",
+                        "-ar",
+                        "44100",
+                    ]);
+                }
+                ResolvedMediaInput::Single { .. } => {
+                    cmd.args([
+                        "-c",
+                        "copy",
                     ]);
                 }
             }
