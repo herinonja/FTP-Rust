@@ -3106,6 +3106,19 @@ fn is_youtube_auth_or_bot_error(text: &str) -> bool {
         || lower.contains("confirm you’re not a bot")
 }
 
+fn is_youtube_terminal_unavailable_error(text: &str) -> bool {
+    let lower = text.to_lowercase();
+
+    lower.contains("video unavailable")
+        || lower.contains("this video is not available")
+        || lower.contains("private video")
+        || lower.contains("deleted video")
+        || lower.contains("has been removed")
+        || lower.contains("copyright claim")
+        || lower.contains("blocked in your country")
+        || lower.contains("not available in your country")
+}
+
 fn add_ytdlp_cookies_if_available(_cmd: &mut Command) {
     // TROOZN Live v1: cookies désactivés par défaut.
     // Un fichier cookies invalide peut provoquer des erreurs YouTube difficiles à diagnostiquer.
@@ -3448,6 +3461,8 @@ async fn resolve_media_input(source_url: &str) -> anyhow::Result<ResolvedMediaIn
 }
 
 async fn resolve_youtube_media_input(source_url: &str) -> anyhow::Result<ResolvedMediaInput> {
+    let mut errors = Vec::new();
+
     match resolve_youtube_preferred_single_url(source_url).await {
         Ok(url) => {
             return Ok(ResolvedMediaInput::Single {
@@ -3460,20 +3475,98 @@ async fn resolve_youtube_media_input(source_url: &str) -> anyhow::Result<Resolve
                 "TROOZN_LIVE_YOUTUBE_FAST_INPUT_FAIL url={} state={first_err:?}",
                 source_url
             );
+
+            let message = first_err.to_string();
+            if is_youtube_terminal_unavailable_error(&message)
+                || is_youtube_auth_or_bot_error(&message)
+            {
+                anyhow::bail!("yt-dlp YouTube indisponible: {}", message);
+            }
+
+            errors.push(format!("fast={message}"));
         }
     }
 
-    let list_text = ytdlp_list_formats_text(source_url).await?;
+    match resolve_youtube_separate_av_with_format(source_url, YTDLP_YOUTUBE_DASH_FORMAT).await {
+        Ok(input) => return Ok(input),
+        Err(err) => {
+            let message = err.to_string();
+            eprintln!(
+                "TROOZN_LIVE_YOUTUBE_DASH_DIRECT_FAIL url={} state={message}",
+                source_url
+            );
 
-    let Some(format_selector) = best_dash_av_format_from_list_formats(&list_text) else {
-        anyhow::bail!(
-            "aucun format YouTube exploitable trouvé: muxé={} ou DASH={}",
-            YTDLP_YOUTUBE_FAST_FORMAT,
-            YTDLP_YOUTUBE_DASH_FORMAT
-        );
-    };
+            if is_youtube_terminal_unavailable_error(&message)
+                || is_youtube_auth_or_bot_error(&message)
+            {
+                anyhow::bail!("yt-dlp YouTube indisponible: {}", message);
+            }
 
-    resolve_youtube_separate_av_with_format(source_url, format_selector).await
+            errors.push(format!("dash_direct={message}"));
+        }
+    }
+
+    match ytdlp_list_formats_text(source_url).await {
+        Ok(list_text) => {
+            if let Some(best_format) = best_youtube_fast_format_from_list_formats(&list_text) {
+                eprintln!(
+                    "TROOZN_LIVE_YTDLP_LIST_FORMATS_PICK_SINGLE format={} url={}",
+                    best_format, source_url
+                );
+
+                match resolve_youtube_url_with_format(source_url, best_format).await {
+                    Ok(url) => {
+                        return Ok(ResolvedMediaInput::Single {
+                            url,
+                            format_selector: best_format.to_string(),
+                        });
+                    }
+                    Err(err) => {
+                        let message = err.to_string();
+                        eprintln!(
+                            "TROOZN_LIVE_YOUTUBE_LIST_SINGLE_FAIL url={} format={} state={message}",
+                            source_url, best_format
+                        );
+                        errors.push(format!("list_single_{best_format}={message}"));
+                    }
+                }
+            }
+
+            if let Some(format_selector) = best_dash_av_format_from_list_formats(&list_text) {
+                eprintln!(
+                    "TROOZN_LIVE_YTDLP_LIST_FORMATS_PICK_DASH format={} url={}",
+                    format_selector, source_url
+                );
+
+                match resolve_youtube_separate_av_with_format(source_url, format_selector).await {
+                    Ok(input) => return Ok(input),
+                    Err(err) => {
+                        let message = err.to_string();
+                        eprintln!(
+                            "TROOZN_LIVE_YOUTUBE_LIST_DASH_FAIL url={} format={} state={message}",
+                            source_url, format_selector
+                        );
+                        errors.push(format!("list_dash_{format_selector}={message}"));
+                    }
+                }
+            }
+        }
+        Err(err) => {
+            let message = err.to_string();
+            eprintln!(
+                "TROOZN_LIVE_YOUTUBE_LIST_FORMATS_FAIL url={} state={message}",
+                source_url
+            );
+            errors.push(format!("list_formats={message}"));
+        }
+    }
+
+    anyhow::bail!(
+        "aucun format YouTube exploitable trouvé: muxé={} DASH={} erreurs={}",
+        YTDLP_YOUTUBE_FAST_FORMAT,
+        YTDLP_YOUTUBE_DASH_FORMAT,
+        errors.join(" | ")
+    )
 }
 
 async fn resolve_generic_media_input(source_url: &str) -> anyhow::Result<ResolvedMediaInput> {
@@ -3543,77 +3636,7 @@ async fn resolve_generic_media_input(source_url: &str) -> anyhow::Result<Resolve
 }
 
 async fn resolve_youtube_preferred_single_url(source_url: &str) -> anyhow::Result<String> {
-    let mut last_error = String::new();
-
-    match resolve_youtube_url_with_format(source_url, YTDLP_YOUTUBE_FAST_FORMAT).await {
-        Ok(url) => {
-            return Ok(url);
-        }
-        Err(err) => {
-            last_error = err.to_string();
-
-            eprintln!(
-                "TROOZN_LIVE_YTDLP_STRICT_FAIL url={} state={}",
-                source_url, last_error
-            );
-
-            if is_youtube_auth_or_bot_error(&last_error) {
-                anyhow::bail!("yt-dlp a échoué après 1 tentative(s): {}", last_error);
-            }
-        }
-    }
-
-    // 2) Si yt-dlp a dit format indisponible, on vérifie les formats réels.
-    // Certains appels -g sont intermittents alors que --list-formats voit bien 96/22/95/94.
-    let list_text = match ytdlp_list_formats_text(source_url).await {
-        Ok(text) => text,
-        Err(err) => {
-            anyhow::bail!(
-                "yt-dlp a échoué après fallback list-formats: premier_error={} list_error={}",
-                last_error,
-                err
-            );
-        }
-    };
-
-    let Some(best_format) = best_youtube_fast_format_from_list_formats(&list_text) else {
-        let interesting_formats = list_text
-            .lines()
-            .map(str::trim)
-            .filter(|line| {
-                let first = line.split_whitespace().next().unwrap_or("");
-                matches!(
-                    first,
-                    "96" | "95" | "94" | "93" | "22" | "18" | "137" | "136" | "135" | "134" | "140"
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(" | ");
-
-        anyhow::bail!(
-            "yt-dlp a échoué: aucun format YouTube rapide 96/22/95/94 trouvé. premier_error={} formats_detectes={}",
-            last_error,
-            interesting_formats
-        );
-    };
-
-    eprintln!(
-        "TROOZN_LIVE_YTDLP_LIST_FORMATS_PICK format={} url={}",
-        best_format, source_url
-    );
-
-    // 3) Relance avec le format exact détecté.
-    match resolve_youtube_url_with_format(source_url, best_format).await {
-        Ok(url) => Ok(url),
-        Err(err) => {
-            anyhow::bail!(
-                "yt-dlp a échoué après fallback format exact {}: premier_error={} final_error={}",
-                best_format,
-                last_error,
-                err
-            );
-        }
-    }
+    resolve_youtube_url_with_format(source_url, YTDLP_YOUTUBE_FAST_FORMAT).await
 }
 
 async fn add_ytdlp_common_args(cmd: &mut Command) {
