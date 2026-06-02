@@ -36,10 +36,12 @@ const PLAYLIST_PAGE_SIZE: usize = 20;
 const PLAYLIST_REFILL_THRESHOLD: usize = 5;
 const MAX_ITEMS: usize = 20;
 const PREWARM_AHEAD_ITEMS: usize = 3;
-const PLAYLIST_ACTIVE_SCAN_EXTRA: usize = 12;
-const PLAYLIST_ACTIVE_SCAN_MAX: usize = 40;
-const YOUTUBE_QUICK_VALIDATE_CONCURRENCY: usize = 4;
-const YOUTUBE_QUICK_VALIDATE_TIMEOUT_SECONDS: u64 = 8;
+const PLAYLIST_ACTIVE_SCAN_EXTRA: usize = 6;
+const PLAYLIST_ACTIVE_SCAN_MAX: usize = 26;
+const PLAYLIST_INITIAL_ACTIVE_TARGET: usize = 2;
+const YOUTUBE_QUICK_VALIDATE_CONCURRENCY: usize = 6;
+const YOUTUBE_QUICK_VALIDATE_TIMEOUT_SECONDS: u64 = 4;
+const YTDLP_PLAYLIST_EXTRACT_TIMEOUT_SECONDS: u64 = 30;
 const HLS_SEGMENT_SECONDS: &str = "2";
 const PREFERRED_VIDEO_HEIGHT: u64 = 1080;
 const FALLBACK_VIDEO_HEIGHT: u64 = 720;
@@ -2884,7 +2886,7 @@ async fn extract_youtube_items_with_retry(
 ) -> anyhow::Result<Vec<TrooznLiveItem>> {
     let mut last_error: Option<anyhow::Error> = None;
 
-    for attempt in 1..=3 {
+    for attempt in 1..=1 {
         match extract_youtube_items(source_url, limit).await {
             Ok(items) if !items.is_empty() => {
                 if attempt > 1 {
@@ -2913,7 +2915,7 @@ async fn extract_youtube_items_with_retry(
             }
         }
 
-        sleep(Duration::from_millis(1200 * attempt)).await;
+        sleep(Duration::from_millis(700 * attempt)).await;
     }
 
     match last_error {
@@ -2947,10 +2949,13 @@ async fn extract_youtube_items(
         source_url,
     ]);
 
-    let output = timeout(Duration::from_secs(90), cmd.output())
-        .await
-        .context("timeout yt-dlp playlist")?
-        .context("exécution yt-dlp playlist")?;
+    let output = timeout(
+        Duration::from_secs(YTDLP_PLAYLIST_EXTRACT_TIMEOUT_SECONDS),
+        cmd.output(),
+    )
+    .await
+    .context("timeout yt-dlp playlist")?
+    .context("exécution yt-dlp playlist")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -2992,11 +2997,13 @@ async fn filter_active_youtube_items(
         return items;
     }
 
+    let original = items.clone();
     let total = items.len();
     let mut active = Vec::new();
     let mut iter = items.into_iter();
+    let target_active = wanted.min(PLAYLIST_INITIAL_ACTIVE_TARGET).max(1);
 
-    while active.len() < wanted {
+    while active.len() < target_active {
         let chunk = iter
             .by_ref()
             .take(YOUTUBE_QUICK_VALIDATE_CONCURRENCY)
@@ -3037,20 +3044,33 @@ async fn filter_active_youtube_items(
         }
     }
 
-    active.truncate(wanted);
+    let mut merged = if active.is_empty() {
+        eprintln!(
+            "TROOZN_LIVE_PLAYLIST_VALIDATE_NO_FAST_ACTIVE fallback=unvalidated wanted={}",
+            wanted
+        );
+        original.into_iter().take(wanted).collect::<Vec<_>>()
+    } else {
+        active
+            .into_iter()
+            .chain(iter)
+            .take(wanted)
+            .collect::<Vec<_>>()
+    };
 
-    for (idx, item) in active.iter_mut().enumerate() {
+    for (idx, item) in merged.iter_mut().enumerate() {
         item.index = idx + 1;
     }
 
     eprintln!(
-        "TROOZN_LIVE_PLAYLIST_VALIDATE_DONE scanned={} kept={} wanted={}",
+        "TROOZN_LIVE_PLAYLIST_VALIDATE_DONE scanned={} kept={} wanted={} target_active={}",
         total,
-        active.len(),
-        wanted
+        merged.len(),
+        wanted,
+        target_active
     );
 
-    active
+    merged
 }
 
 async fn quick_validate_youtube_item(item: &TrooznLiveItem) -> bool {
