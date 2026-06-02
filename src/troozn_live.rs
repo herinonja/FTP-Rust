@@ -39,7 +39,8 @@ const PREWARM_AHEAD_ITEMS: usize = 3;
 const PLAYLIST_ACTIVE_SCAN_EXTRA: usize = 6;
 const PLAYLIST_ACTIVE_SCAN_MAX: usize = 26;
 const PLAYLIST_INITIAL_ACTIVE_TARGET: usize = 2;
-const YOUTUBE_QUICK_VALIDATE_CONCURRENCY: usize = 6;
+const YOUTUBE_QUICK_VALIDATE_CONCURRENCY: usize = 2;
+const YOUTUBE_QUICK_VALIDATE_BATCH_PAUSE_MS: u64 = 250;
 const YOUTUBE_QUICK_VALIDATE_TIMEOUT_SECONDS: u64 = 4;
 const YTDLP_PLAYLIST_EXTRACT_TIMEOUT_SECONDS: u64 = 30;
 const HLS_SEGMENT_SECONDS: &str = "2";
@@ -3041,6 +3042,10 @@ async fn filter_active_youtube_items(
                     eprintln!("TROOZN_LIVE_PLAYLIST_VALIDATE_JOIN_ERROR state={err:?}");
                 }
             }
+        }
+
+        if active.len() < target_active {
+            sleep(Duration::from_millis(YOUTUBE_QUICK_VALIDATE_BATCH_PAUSE_MS)).await;
         }
     }
 
