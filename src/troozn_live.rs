@@ -71,7 +71,7 @@ struct PlaylistRefillState {
 
 pub struct TrooznLive {
     pub root_dir: PathBuf,
-    ffmpeg_child: Mutex<Option<Child>>,
+    ffmpeg_child: Mutex<Option<ActiveFfmpegChild>>,
     producer_now: Mutex<TrooznLiveNow>,
     playback_now: Mutex<TrooznLiveNow>,
     queue: Mutex<Vec<TrooznLiveItem>>,
@@ -88,6 +88,12 @@ pub struct TrooznLive {
     generation_id: Mutex<u64>,
     playback_anchor_item: Mutex<usize>,
     playlist_name: Mutex<String>,
+}
+
+struct ActiveFfmpegChild {
+    generation: u64,
+    item_id: String,
+    child: Child,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -949,8 +955,10 @@ impl TrooznLive {
                 producer.last_error = Some(err.to_string());
             }
 
-            let mut running = live.worker_running.lock().await;
-            *running = false;
+            if live.current_generation().await == worker_generation {
+                let mut running = live.worker_running.lock().await;
+                *running = false;
+            }
 
             eprintln!("TROOZN_LIVE_WORKER_EXIT generation={}", worker_generation);
         });
@@ -979,13 +987,47 @@ impl TrooznLive {
     }
 
     async fn stop_current_ffmpeg(&self) {
-        let mut guard = self.ffmpeg_child.lock().await;
+        let active = {
+            let mut guard = self.ffmpeg_child.lock().await;
+            guard.take()
+        };
 
-        if let Some(child) = guard.as_mut() {
-            child.start_kill().ok();
+        if let Some(mut active) = active {
+            eprintln!(
+                "TROOZN_LIVE_FFMPEG_STOP generation={} item_id={}",
+                active.generation, active.item_id
+            );
+            active.child.start_kill().ok();
+            timeout(Duration::from_secs(2), active.child.wait())
+                .await
+                .ok();
         }
+    }
 
-        *guard = None;
+    async fn stop_ffmpeg_for_generation(&self, generation: u64) {
+        let active = {
+            let mut guard = self.ffmpeg_child.lock().await;
+            if guard
+                .as_ref()
+                .map(|active| active.generation == generation)
+                .unwrap_or(false)
+            {
+                guard.take()
+            } else {
+                None
+            }
+        };
+
+        if let Some(mut active) = active {
+            eprintln!(
+                "TROOZN_LIVE_FFMPEG_STOP_STALE generation={} item_id={}",
+                active.generation, active.item_id
+            );
+            active.child.start_kill().ok();
+            timeout(Duration::from_secs(2), active.child.wait())
+                .await
+                .ok();
+        }
     }
 
     pub async fn start_youtube_live_queue(
@@ -1561,7 +1603,11 @@ impl TrooznLive {
 
             {
                 let mut guard = self.ffmpeg_child.lock().await;
-                *guard = Some(child);
+                *guard = Some(ActiveFfmpegChild {
+                    generation: worker_generation,
+                    item_id: item.item_id.clone(),
+                    child,
+                });
             }
 
             // Métadonnées complètes en arrière-plan seulement après démarrage FFmpeg.
@@ -1571,6 +1617,15 @@ impl TrooznLive {
 
             loop {
                 sleep(Duration::from_millis(500)).await;
+
+                if self.current_generation().await != worker_generation {
+                    eprintln!(
+                        "TROOZN_LIVE_WORKER_STALE_EXIT_IN_FFMPEG generation={} item={}",
+                        worker_generation, item.index
+                    );
+                    self.stop_ffmpeg_for_generation(worker_generation).await;
+                    return Ok(());
+                }
 
                 {
                     let mut producer = self.producer_now.lock().await;
@@ -1597,15 +1652,19 @@ impl TrooznLive {
                     let mut guard = self.ffmpeg_child.lock().await;
 
                     match guard.as_mut() {
-                        Some(child) => match child.try_wait() {
-                            Ok(Some(status)) => {
-                                eprintln!(
-                                    "TROOZN_LIVE_FFMPEG_DONE index={} title={} status={status}",
-                                    item.index, item.title
-                                );
+                        Some(active)
+                            if active.generation == worker_generation
+                                && active.item_id == item.item_id =>
+                        {
+                            match active.child.try_wait() {
+                                Ok(Some(status)) => {
+                                    eprintln!(
+                                        "TROOZN_LIVE_FFMPEG_DONE index={} title={} status={status}",
+                                        item.index, item.title
+                                    );
 
-                                self.maybe_refill_playlist_queue(item.index).await;
-                                live_audit(
+                                    self.maybe_refill_playlist_queue(item.index).await;
+                                    live_audit(
                                     &self.root_dir,
                                     format!(
                                         "ITEM_FFMPEG_DONE index={} title={} status={} ts_files={} manifest_lines={}",
@@ -1617,24 +1676,42 @@ impl TrooznLive {
                                     ),
                                 )
                                 .await;
-                                *guard = None;
-                                true
-                            }
-                            Ok(None) => false,
-                            Err(err) => {
-                                eprintln!(
+                                    *guard = None;
+                                    true
+                                }
+                                Ok(None) => false,
+                                Err(err) => {
+                                    eprintln!(
                                     "TROOZN_LIVE_FFMPEG_WAIT_ERROR index={} title={} state={err:?}",
                                     item.index, item.title
                                 );
-                                *guard = None;
-                                true
+                                    *guard = None;
+                                    true
+                                }
                             }
-                        },
+                        }
+                        Some(active) => {
+                            eprintln!(
+                                "TROOZN_LIVE_FFMPEG_OWNERSHIP_CHANGED worker_generation={} active_generation={} item={}",
+                                worker_generation,
+                                active.generation,
+                                item.index
+                            );
+                            return Ok(());
+                        }
                         None => true,
                     }
                 };
 
                 if finished {
+                    if self.current_generation().await != worker_generation {
+                        eprintln!(
+                            "TROOZN_LIVE_WORKER_STALE_SKIP_FINAL_IMPORT generation={} item={}",
+                            worker_generation, item.index
+                        );
+                        return Ok(());
+                    }
+
                     let final_count = self
                         .import_item_manifest_incremental(item.index, &item_manifest, appended_any)
                         .await
