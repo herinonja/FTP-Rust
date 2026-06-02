@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
@@ -13,13 +14,13 @@ use serde_json::{json, Value};
 use sha1::{Digest, Sha1};
 use tokio::fs;
 use tokio::process::{Child, Command};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore, SemaphorePermit};
 use tokio::time::{sleep, timeout, Duration};
 
 use crate::HttpGatewayState;
 
 const LIVE_DIR: &str = "/home/troozn/.kodi/userdata/TROOZN/live";
-const TROOZN_LIVE_BUILD_TAG: &str = "v2.4-source-named-hls1080-buffered-cleanup-2026-06-02";
+const TROOZN_LIVE_BUILD_TAG: &str = "v2.5-ytdlp-throttle-killdrop-2026-06-02";
 
 const YTDLP_BIN: &str = "/home/troozn/.local/bin/yt-dlp";
 const LIVE_MAX_DIR_BYTES: u64 = 512 * 1024 * 1024;
@@ -35,14 +36,19 @@ const LIVE_AHEAD_WAIT_MAX_SECONDS: u64 = 90;
 const PLAYLIST_PAGE_SIZE: usize = 20;
 const PLAYLIST_REFILL_THRESHOLD: usize = 5;
 const MAX_ITEMS: usize = 20;
-const PREWARM_AHEAD_ITEMS: usize = 3;
+const PREWARM_AHEAD_ITEMS: usize = 1;
 const PLAYLIST_ACTIVE_SCAN_EXTRA: usize = 6;
 const PLAYLIST_ACTIVE_SCAN_MAX: usize = 26;
 const PLAYLIST_INITIAL_ACTIVE_TARGET: usize = 2;
 const YOUTUBE_QUICK_VALIDATE_CONCURRENCY: usize = 2;
 const YOUTUBE_QUICK_VALIDATE_BATCH_PAUSE_MS: u64 = 250;
 const YOUTUBE_QUICK_VALIDATE_TIMEOUT_SECONDS: u64 = 4;
+const YTDLP_MAX_PARALLEL_PROCESSES: usize = 2;
+const YTDLP_SLOT_WAIT_TIMEOUT_SECONDS: u64 = 20;
 const YTDLP_PLAYLIST_EXTRACT_TIMEOUT_SECONDS: u64 = 30;
+const YTDLP_YOUTUBE_FAST_RESOLVE_TIMEOUT_SECONDS: u64 = 12;
+const YTDLP_YOUTUBE_DASH_RESOLVE_TIMEOUT_SECONDS: u64 = 14;
+const YTDLP_YOUTUBE_LIST_FORMATS_TIMEOUT_SECONDS: u64 = 15;
 const HLS_SEGMENT_SECONDS: &str = "2";
 const PREFERRED_VIDEO_HEIGHT: u64 = 1080;
 const FALLBACK_VIDEO_HEIGHT: u64 = 720;
@@ -232,6 +238,36 @@ async fn live_audit(root_dir: &Path, line: impl AsRef<str>) {
             );
         }
     }
+}
+
+fn ytdlp_semaphore() -> &'static Semaphore {
+    static YTDLP_SEMAPHORE: OnceLock<Semaphore> = OnceLock::new();
+
+    YTDLP_SEMAPHORE.get_or_init(|| Semaphore::new(YTDLP_MAX_PARALLEL_PROCESSES))
+}
+
+async fn acquire_ytdlp_slot(label: &'static str) -> anyhow::Result<SemaphorePermit<'static>> {
+    timeout(
+        Duration::from_secs(YTDLP_SLOT_WAIT_TIMEOUT_SECONDS),
+        ytdlp_semaphore().acquire(),
+    )
+    .await
+    .with_context(|| format!("timeout attente slot {label}"))?
+    .with_context(|| format!("acquisition slot {label}"))
+}
+
+async fn run_ytdlp_output(
+    mut cmd: Command,
+    label: &'static str,
+    timeout_seconds: u64,
+) -> anyhow::Result<std::process::Output> {
+    let _permit = acquire_ytdlp_slot(label).await?;
+    cmd.kill_on_drop(true);
+
+    timeout(Duration::from_secs(timeout_seconds), cmd.output())
+        .await
+        .with_context(|| format!("timeout {label}"))?
+        .with_context(|| format!("spawn {label}"))
 }
 
 fn parse_item_index_from_live_filename(name: &str) -> Option<usize> {
@@ -1297,7 +1333,6 @@ impl TrooznLive {
             .await;
 
             self.wait_until_future_buffer_needed(item.index).await;
-            self.clone().spawn_prewarm_after(item.index).await;
 
             let next_title = self.next_title_after(item.index).await;
             let public_hls_url = self.current_public_hls_url().await;
@@ -1617,6 +1652,7 @@ impl TrooznLive {
             // Elles ne doivent jamais retarder les premiers segments HLS.
 
             let mut imported_segments = 0_usize;
+            let mut prewarm_started = false;
 
             loop {
                 sleep(Duration::from_millis(500)).await;
@@ -1649,6 +1685,11 @@ impl TrooznLive {
                     self.rewrite_master_playlist(false).await.ok();
                     self.refresh_buffer_status().await;
                     self.maybe_cleanup_live_files(false).await.ok();
+
+                    if !prewarm_started {
+                        prewarm_started = true;
+                        self.clone().spawn_prewarm_after(item.index).await;
+                    }
                 }
 
                 let finished = {
@@ -2756,10 +2797,7 @@ async fn extract_youtube_items_range(
         start, end, source_url
     );
 
-    let output = timeout(Duration::from_secs(45), cmd.output())
-        .await
-        .context("timeout yt-dlp range extract")?
-        .context("spawn yt-dlp range extract")?;
+    let output = run_ytdlp_output(cmd, "yt-dlp range extract", 45).await?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -2950,13 +2988,12 @@ async fn extract_youtube_items(
         source_url,
     ]);
 
-    let output = timeout(
-        Duration::from_secs(YTDLP_PLAYLIST_EXTRACT_TIMEOUT_SECONDS),
-        cmd.output(),
+    let output = run_ytdlp_output(
+        cmd,
+        "yt-dlp playlist",
+        YTDLP_PLAYLIST_EXTRACT_TIMEOUT_SECONDS,
     )
-    .await
-    .context("timeout yt-dlp playlist")?
-    .context("exécution yt-dlp playlist")?;
+    .await?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -3001,6 +3038,7 @@ async fn filter_active_youtube_items(
     let original = items.clone();
     let total = items.len();
     let mut active = Vec::new();
+    let mut rejected_ids = HashSet::new();
     let mut iter = items.into_iter();
     let target_active = wanted.min(PLAYLIST_INITIAL_ACTIVE_TARGET).max(1);
 
@@ -3033,6 +3071,7 @@ async fn filter_active_youtube_items(
             match handle.await {
                 Ok((item, true)) => active.push(item),
                 Ok((item, false)) => {
+                    rejected_ids.insert(item.item_id.clone());
                     eprintln!(
                         "TROOZN_LIVE_PLAYLIST_SKIP_INACTIVE index={} title={} url={}",
                         item.index, item.title, item.source_url
@@ -3054,7 +3093,18 @@ async fn filter_active_youtube_items(
             "TROOZN_LIVE_PLAYLIST_VALIDATE_NO_FAST_ACTIVE fallback=unvalidated wanted={}",
             wanted
         );
-        original.into_iter().take(wanted).collect::<Vec<_>>()
+        let filtered = original
+            .iter()
+            .filter(|item| !rejected_ids.contains(&item.item_id))
+            .take(wanted)
+            .cloned()
+            .collect::<Vec<_>>();
+
+        if filtered.is_empty() {
+            original.into_iter().take(wanted).collect::<Vec<_>>()
+        } else {
+            filtered
+        }
     } else {
         active
             .into_iter()
@@ -3099,24 +3149,18 @@ async fn quick_validate_youtube_item(item: &TrooznLiveItem) -> bool {
         &item.source_url,
     ]);
 
-    let output = match timeout(
-        Duration::from_secs(YOUTUBE_QUICK_VALIDATE_TIMEOUT_SECONDS),
-        cmd.output(),
+    let output = match run_ytdlp_output(
+        cmd,
+        "yt-dlp quick validate",
+        YOUTUBE_QUICK_VALIDATE_TIMEOUT_SECONDS,
     )
     .await
     {
-        Ok(Ok(output)) => output,
-        Ok(Err(err)) => {
+        Ok(output) => output,
+        Err(err) => {
             eprintln!(
-                "TROOZN_LIVE_PLAYLIST_VALIDATE_SPAWN_FAIL index={} title={} state={err:?}",
+                "TROOZN_LIVE_PLAYLIST_VALIDATE_ERROR index={} title={} state={err:?}",
                 item.index, item.title
-            );
-            return false;
-        }
-        Err(_) => {
-            eprintln!(
-                "TROOZN_LIVE_PLAYLIST_VALIDATE_TIMEOUT index={} title={} timeout_s={}",
-                item.index, item.title, YOUTUBE_QUICK_VALIDATE_TIMEOUT_SECONDS
             );
             return false;
         }
@@ -3285,15 +3329,10 @@ async fn extract_full_video_metadata(source_url: &str) -> anyhow::Result<FullVid
             source_url,
         ]);
 
-        let output = match timeout(Duration::from_secs(8), cmd.output()).await {
-            Ok(Ok(output)) => output,
-            Ok(Err(err)) => {
-                last_error = format!("exécution yt-dlp metadata: {err}");
-                sleep(Duration::from_millis(500 * attempt)).await;
-                continue;
-            }
-            Err(_) => {
-                last_error = "timeout yt-dlp metadata".to_string();
+        let output = match run_ytdlp_output(cmd, "yt-dlp metadata", 8).await {
+            Ok(output) => output,
+            Err(err) => {
+                last_error = format!("yt-dlp metadata: {err:?}");
                 sleep(Duration::from_millis(500 * attempt)).await;
                 continue;
             }
@@ -3401,6 +3440,14 @@ fn is_youtube_terminal_unavailable_error(text: &str) -> bool {
         || lower.contains("not available in your country")
 }
 
+fn is_ytdlp_timeout_error(text: &str) -> bool {
+    let lower = text.to_lowercase();
+
+    lower.contains("timeout yt-dlp")
+        || lower.contains("deadline has elapsed")
+        || lower.contains("timeout attente slot")
+}
+
 fn add_ytdlp_cookies_if_available(_cmd: &mut Command) {
     // TROOZN Live v1: cookies désactivés par défaut.
     // Un fichier cookies invalide peut provoquer des erreurs YouTube difficiles à diagnostiquer.
@@ -3440,7 +3487,7 @@ async fn ytdlp_list_formats_text(source_url: &str) -> anyhow::Result<String> {
         "--force-ipv4",
         "--no-warnings",
         "--socket-timeout",
-        "20",
+        "10",
         "--list-formats",
         source_url,
     ]);
@@ -3450,10 +3497,12 @@ async fn ytdlp_list_formats_text(source_url: &str) -> anyhow::Result<String> {
         YTDLP_BIN, source_url
     );
 
-    let output = timeout(Duration::from_secs(30), cmd.output())
-        .await
-        .context("timeout yt-dlp list-formats")?
-        .context("spawn yt-dlp list-formats")?;
+    let output = run_ytdlp_output(
+        cmd,
+        "yt-dlp list-formats",
+        YTDLP_YOUTUBE_LIST_FORMATS_TIMEOUT_SECONDS,
+    )
+    .await?;
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -3492,11 +3541,11 @@ async fn resolve_youtube_url_with_format(
         "--no-warnings",
         "--force-ipv4",
         "--socket-timeout",
-        "20",
+        "8",
         "--retries",
-        "1",
+        "0",
         "--fragment-retries",
-        "1",
+        "0",
         "-f",
         format_selector,
         "-g",
@@ -3508,10 +3557,8 @@ async fn resolve_youtube_url_with_format(
         YTDLP_BIN, format_selector, source_url
     );
 
-    let output = timeout(Duration::from_secs(30), cmd.output())
-        .await
-        .context("timeout yt-dlp -g")?
-        .context("spawn yt-dlp -g")?;
+    let output =
+        run_ytdlp_output(cmd, "yt-dlp -g", YTDLP_YOUTUBE_FAST_RESOLVE_TIMEOUT_SECONDS).await?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -3585,10 +3632,7 @@ async fn resolve_urls_with_format(
         YTDLP_BIN, format_selector, source_url
     );
 
-    let output = timeout(Duration::from_secs(timeout_seconds), cmd.output())
-        .await
-        .context("timeout yt-dlp generic -g")?
-        .context("spawn yt-dlp generic -g")?;
+    let output = run_ytdlp_output(cmd, "yt-dlp generic -g", timeout_seconds).await?;
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -3662,11 +3706,11 @@ async fn resolve_youtube_separate_av_with_format(
         "--no-warnings",
         "--force-ipv4",
         "--socket-timeout",
-        "20",
+        "8",
         "--retries",
-        "1",
+        "0",
         "--fragment-retries",
-        "1",
+        "0",
         "-f",
         format_selector,
         "-g",
@@ -3678,10 +3722,12 @@ async fn resolve_youtube_separate_av_with_format(
         YTDLP_BIN, format_selector, source_url
     );
 
-    let output = timeout(Duration::from_secs(35), cmd.output())
-        .await
-        .context("timeout yt-dlp dash av -g")?
-        .context("spawn yt-dlp dash av -g")?;
+    let output = run_ytdlp_output(
+        cmd,
+        "yt-dlp dash av -g",
+        YTDLP_YOUTUBE_DASH_RESOLVE_TIMEOUT_SECONDS,
+    )
+    .await?;
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -3763,6 +3809,10 @@ async fn resolve_youtube_media_input(source_url: &str) -> anyhow::Result<Resolve
                 || is_youtube_auth_or_bot_error(&message)
             {
                 anyhow::bail!("yt-dlp YouTube indisponible: {}", message);
+            }
+
+            if is_ytdlp_timeout_error(&message) {
+                anyhow::bail!("yt-dlp YouTube timeout rapide: {}", message);
             }
 
             errors.push(format!("fast={message}"));
