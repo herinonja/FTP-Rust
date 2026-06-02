@@ -20,7 +20,7 @@ use tokio::time::{sleep, timeout, Duration};
 use crate::HttpGatewayState;
 
 const LIVE_DIR: &str = "/home/troozn/.kodi/userdata/TROOZN/live";
-const TROOZN_LIVE_BUILD_TAG: &str = "v2.5-ytdlp-throttle-killdrop-2026-06-02";
+const TROOZN_LIVE_BUILD_TAG: &str = "v2.6-ytdlp-deno-fallback-2026-06-02";
 
 const YTDLP_BIN: &str = "/home/troozn/.local/bin/yt-dlp";
 const LIVE_MAX_DIR_BYTES: u64 = 512 * 1024 * 1024;
@@ -37,6 +37,8 @@ const PLAYLIST_PAGE_SIZE: usize = 20;
 const PLAYLIST_REFILL_THRESHOLD: usize = 5;
 const MAX_ITEMS: usize = 20;
 const PREWARM_AHEAD_ITEMS: usize = 1;
+const PREWARM_CACHE_WAIT_MAX_MS: u64 = 12_000;
+const PREWARM_CACHE_WAIT_STEP_MS: u64 = 300;
 const PLAYLIST_ACTIVE_SCAN_EXTRA: usize = 6;
 const PLAYLIST_ACTIVE_SCAN_MAX: usize = 26;
 const PLAYLIST_INITIAL_ACTIVE_TARGET: usize = 2;
@@ -49,6 +51,8 @@ const YTDLP_PLAYLIST_EXTRACT_TIMEOUT_SECONDS: u64 = 30;
 const YTDLP_YOUTUBE_FAST_RESOLVE_TIMEOUT_SECONDS: u64 = 12;
 const YTDLP_YOUTUBE_DASH_RESOLVE_TIMEOUT_SECONDS: u64 = 14;
 const YTDLP_YOUTUBE_LIST_FORMATS_TIMEOUT_SECONDS: u64 = 15;
+const YTDLP_YOUTUBE_DENO_RESOLVE_TIMEOUT_SECONDS: u64 = 32;
+const YTDLP_YOUTUBE_DENO_LIST_FORMATS_TIMEOUT_SECONDS: u64 = 35;
 const HLS_SEGMENT_SECONDS: &str = "2";
 const PREFERRED_VIDEO_HEIGHT: u64 = 1080;
 const FALLBACK_VIDEO_HEIGHT: u64 = 720;
@@ -836,6 +840,47 @@ impl TrooznLive {
                 item.index, item.title
             );
             return Ok(input);
+        }
+
+        let is_being_prewarmed = {
+            let resolving = self.resolving_inputs.lock().await;
+            resolving.contains(&item.item_id)
+        };
+
+        if is_being_prewarmed {
+            eprintln!(
+                "TROOZN_LIVE_RESOLVE_WAIT_PREWARM index={} title={}",
+                item.index, item.title
+            );
+
+            let mut waited_ms = 0_u64;
+
+            while waited_ms < PREWARM_CACHE_WAIT_MAX_MS {
+                sleep(Duration::from_millis(PREWARM_CACHE_WAIT_STEP_MS)).await;
+                waited_ms = waited_ms.saturating_add(PREWARM_CACHE_WAIT_STEP_MS);
+
+                if let Some(input) = self.resolved_inputs.lock().await.remove(&item.item_id) {
+                    eprintln!(
+                        "TROOZN_LIVE_RESOLVE_PREWARM_READY index={} title={} waited_ms={}",
+                        item.index, item.title, waited_ms
+                    );
+                    return Ok(input);
+                }
+
+                let still_resolving = {
+                    let resolving = self.resolving_inputs.lock().await;
+                    resolving.contains(&item.item_id)
+                };
+
+                if !still_resolving {
+                    break;
+                }
+            }
+
+            eprintln!(
+                "TROOZN_LIVE_RESOLVE_PREWARM_MISS index={} title={} waited_ms={}",
+                item.index, item.title, waited_ms
+            );
         }
 
         resolve_media_input(&item.source_url).await
@@ -3454,6 +3499,27 @@ fn add_ytdlp_cookies_if_available(_cmd: &mut Command) {
     // On réactivera plus tard via une option explicite si nécessaire.
 }
 
+fn ytdlp_deno_available() -> bool {
+    Path::new("/home/troozn/.deno/bin/deno").exists()
+}
+
+fn add_ytdlp_deno_args_if_available(cmd: &mut Command, reason: &str) -> anyhow::Result<()> {
+    if !ytdlp_deno_available() {
+        anyhow::bail!("deno indisponible pour fallback yt-dlp");
+    }
+
+    eprintln!("TROOZN_LIVE_YTDLP_DENO_FALLBACK reason={reason}");
+
+    cmd.args([
+        "--js-runtimes",
+        "deno:/home/troozn/.deno/bin/deno",
+        "--remote-components",
+        "ejs:github",
+    ]);
+
+    Ok(())
+}
+
 fn best_youtube_fast_format_from_list_formats(text: &str) -> Option<&'static str> {
     // Formats autorisés, dans l'ordre de préférence :
     // 96 = 1080p HLS
@@ -3479,30 +3545,41 @@ fn best_youtube_fast_format_from_list_formats(text: &str) -> Option<&'static str
     None
 }
 
-async fn ytdlp_list_formats_text(source_url: &str) -> anyhow::Result<String> {
+async fn ytdlp_list_formats_text(source_url: &str, use_deno: bool) -> anyhow::Result<String> {
     let mut cmd = Command::new(YTDLP_BIN);
+    let socket_timeout = if use_deno { "20" } else { "10" };
+
+    if use_deno {
+        add_ytdlp_deno_args_if_available(&mut cmd, "list-formats")?;
+    }
 
     cmd.args([
         "--ignore-config",
         "--force-ipv4",
         "--no-warnings",
         "--socket-timeout",
-        "10",
+        socket_timeout,
         "--list-formats",
         source_url,
     ]);
 
     eprintln!(
-        "TROOZN_LIVE_LIST_FORMATS_CMD bin={} url={}",
-        YTDLP_BIN, source_url
+        "TROOZN_LIVE_LIST_FORMATS_CMD bin={} deno={} url={}",
+        YTDLP_BIN, use_deno, source_url
     );
 
-    let output = run_ytdlp_output(
-        cmd,
-        "yt-dlp list-formats",
-        YTDLP_YOUTUBE_LIST_FORMATS_TIMEOUT_SECONDS,
-    )
-    .await?;
+    let timeout_seconds = if use_deno {
+        YTDLP_YOUTUBE_DENO_LIST_FORMATS_TIMEOUT_SECONDS
+    } else {
+        YTDLP_YOUTUBE_LIST_FORMATS_TIMEOUT_SECONDS
+    };
+    let label = if use_deno {
+        "yt-dlp list-formats deno"
+    } else {
+        "yt-dlp list-formats"
+    };
+
+    let output = run_ytdlp_output(cmd, label, timeout_seconds).await?;
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -3531,9 +3608,16 @@ async fn ytdlp_list_formats_text(source_url: &str) -> anyhow::Result<String> {
 async fn resolve_youtube_url_with_format(
     source_url: &str,
     format_selector: &str,
+    use_deno: bool,
 ) -> anyhow::Result<String> {
     let mut cmd = Command::new(YTDLP_BIN);
     add_ytdlp_cookies_if_available(&mut cmd);
+    let socket_timeout = if use_deno { "20" } else { "8" };
+    let retries = if use_deno { "1" } else { "0" };
+
+    if use_deno {
+        add_ytdlp_deno_args_if_available(&mut cmd, "single-url")?;
+    }
 
     cmd.args([
         "--ignore-config",
@@ -3541,11 +3625,11 @@ async fn resolve_youtube_url_with_format(
         "--no-warnings",
         "--force-ipv4",
         "--socket-timeout",
-        "8",
+        socket_timeout,
         "--retries",
-        "0",
+        retries,
         "--fragment-retries",
-        "0",
+        retries,
         "-f",
         format_selector,
         "-g",
@@ -3553,12 +3637,22 @@ async fn resolve_youtube_url_with_format(
     ]);
 
     eprintln!(
-        "TROOZN_LIVE_YTDLP_RESOLVE_FORMAT bin={} format={} url={}",
-        YTDLP_BIN, format_selector, source_url
+        "TROOZN_LIVE_YTDLP_RESOLVE_FORMAT bin={} deno={} format={} url={}",
+        YTDLP_BIN, use_deno, format_selector, source_url
     );
 
-    let output =
-        run_ytdlp_output(cmd, "yt-dlp -g", YTDLP_YOUTUBE_FAST_RESOLVE_TIMEOUT_SECONDS).await?;
+    let timeout_seconds = if use_deno {
+        YTDLP_YOUTUBE_DENO_RESOLVE_TIMEOUT_SECONDS
+    } else {
+        YTDLP_YOUTUBE_FAST_RESOLVE_TIMEOUT_SECONDS
+    };
+    let label = if use_deno {
+        "yt-dlp -g deno"
+    } else {
+        "yt-dlp -g"
+    };
+
+    let output = run_ytdlp_output(cmd, label, timeout_seconds).await?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -3696,9 +3790,16 @@ fn best_dash_av_format_from_list_formats(text: &str) -> Option<&'static str> {
 async fn resolve_youtube_separate_av_with_format(
     source_url: &str,
     format_selector: &str,
+    use_deno: bool,
 ) -> anyhow::Result<ResolvedMediaInput> {
     let mut cmd = Command::new(YTDLP_BIN);
     add_ytdlp_cookies_if_available(&mut cmd);
+    let socket_timeout = if use_deno { "20" } else { "8" };
+    let retries = if use_deno { "1" } else { "0" };
+
+    if use_deno {
+        add_ytdlp_deno_args_if_available(&mut cmd, "dash-av")?;
+    }
 
     cmd.args([
         "--ignore-config",
@@ -3706,11 +3807,11 @@ async fn resolve_youtube_separate_av_with_format(
         "--no-warnings",
         "--force-ipv4",
         "--socket-timeout",
-        "8",
+        socket_timeout,
         "--retries",
-        "0",
+        retries,
         "--fragment-retries",
-        "0",
+        retries,
         "-f",
         format_selector,
         "-g",
@@ -3718,16 +3819,22 @@ async fn resolve_youtube_separate_av_with_format(
     ]);
 
     eprintln!(
-        "TROOZN_LIVE_YTDLP_DASH_AV_CMD bin={} format={} url={}",
-        YTDLP_BIN, format_selector, source_url
+        "TROOZN_LIVE_YTDLP_DASH_AV_CMD bin={} deno={} format={} url={}",
+        YTDLP_BIN, use_deno, format_selector, source_url
     );
 
-    let output = run_ytdlp_output(
-        cmd,
-        "yt-dlp dash av -g",
-        YTDLP_YOUTUBE_DASH_RESOLVE_TIMEOUT_SECONDS,
-    )
-    .await?;
+    let timeout_seconds = if use_deno {
+        YTDLP_YOUTUBE_DENO_RESOLVE_TIMEOUT_SECONDS
+    } else {
+        YTDLP_YOUTUBE_DASH_RESOLVE_TIMEOUT_SECONDS
+    };
+    let label = if use_deno {
+        "yt-dlp dash av -g deno"
+    } else {
+        "yt-dlp dash av -g"
+    };
+
+    let output = run_ytdlp_output(cmd, label, timeout_seconds).await?;
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -3790,6 +3897,7 @@ async fn resolve_media_input(source_url: &str) -> anyhow::Result<ResolvedMediaIn
 
 async fn resolve_youtube_media_input(source_url: &str) -> anyhow::Result<ResolvedMediaInput> {
     let mut errors = Vec::new();
+    let mut fast_timed_out = false;
 
     match resolve_youtube_preferred_single_url(source_url).await {
         Ok(url) => {
@@ -3812,14 +3920,22 @@ async fn resolve_youtube_media_input(source_url: &str) -> anyhow::Result<Resolve
             }
 
             if is_ytdlp_timeout_error(&message) {
-                anyhow::bail!("yt-dlp YouTube timeout rapide: {}", message);
+                fast_timed_out = true;
             }
 
             errors.push(format!("fast={message}"));
         }
     }
 
-    match resolve_youtube_separate_av_with_format(source_url, YTDLP_YOUTUBE_DASH_FORMAT).await {
+    if fast_timed_out {
+        if let Some(input) = try_youtube_deno_resolution(source_url, &mut errors).await? {
+            return Ok(input);
+        }
+    }
+
+    match resolve_youtube_separate_av_with_format(source_url, YTDLP_YOUTUBE_DASH_FORMAT, false)
+        .await
+    {
         Ok(input) => return Ok(input),
         Err(err) => {
             let message = err.to_string();
@@ -3838,7 +3954,15 @@ async fn resolve_youtube_media_input(source_url: &str) -> anyhow::Result<Resolve
         }
     }
 
-    match ytdlp_list_formats_text(source_url).await {
+    if !fast_timed_out {
+        if let Some(input) = try_youtube_deno_resolution(source_url, &mut errors).await? {
+            return Ok(input);
+        }
+    }
+
+    let list_with_deno = ytdlp_deno_available();
+
+    match ytdlp_list_formats_text(source_url, list_with_deno).await {
         Ok(list_text) => {
             if let Some(best_format) = best_youtube_fast_format_from_list_formats(&list_text) {
                 eprintln!(
@@ -3846,7 +3970,8 @@ async fn resolve_youtube_media_input(source_url: &str) -> anyhow::Result<Resolve
                     best_format, source_url
                 );
 
-                match resolve_youtube_url_with_format(source_url, best_format).await {
+                match resolve_youtube_url_with_format(source_url, best_format, list_with_deno).await
+                {
                     Ok(url) => {
                         return Ok(ResolvedMediaInput::Single {
                             url,
@@ -3870,7 +3995,13 @@ async fn resolve_youtube_media_input(source_url: &str) -> anyhow::Result<Resolve
                     format_selector, source_url
                 );
 
-                match resolve_youtube_separate_av_with_format(source_url, format_selector).await {
+                match resolve_youtube_separate_av_with_format(
+                    source_url,
+                    format_selector,
+                    list_with_deno,
+                )
+                .await
+                {
                     Ok(input) => return Ok(input),
                     Err(err) => {
                         let message = err.to_string();
@@ -3899,6 +4030,63 @@ async fn resolve_youtube_media_input(source_url: &str) -> anyhow::Result<Resolve
         YTDLP_YOUTUBE_DASH_FORMAT,
         errors.join(" | ")
     )
+}
+
+async fn try_youtube_deno_resolution(
+    source_url: &str,
+    errors: &mut Vec<String>,
+) -> anyhow::Result<Option<ResolvedMediaInput>> {
+    if !ytdlp_deno_available() {
+        errors.push("deno_fallback=deno indisponible".to_string());
+        return Ok(None);
+    }
+
+    eprintln!("TROOZN_LIVE_YOUTUBE_DENO_RESOLVE_START url={source_url}");
+
+    match resolve_youtube_url_with_format(source_url, YTDLP_YOUTUBE_FAST_FORMAT, true).await {
+        Ok(url) => {
+            return Ok(Some(ResolvedMediaInput::Single {
+                url,
+                format_selector: YTDLP_YOUTUBE_FAST_FORMAT.to_string(),
+            }));
+        }
+        Err(err) => {
+            let message = err.to_string();
+            eprintln!(
+                "TROOZN_LIVE_YOUTUBE_DENO_SINGLE_FAIL url={} state={message}",
+                source_url
+            );
+
+            if is_youtube_terminal_unavailable_error(&message)
+                || is_youtube_auth_or_bot_error(&message)
+            {
+                anyhow::bail!("yt-dlp YouTube indisponible: {}", message);
+            }
+
+            errors.push(format!("deno_single={message}"));
+        }
+    }
+
+    match resolve_youtube_separate_av_with_format(source_url, YTDLP_YOUTUBE_DASH_FORMAT, true).await
+    {
+        Ok(input) => Ok(Some(input)),
+        Err(err) => {
+            let message = err.to_string();
+            eprintln!(
+                "TROOZN_LIVE_YOUTUBE_DENO_DASH_FAIL url={} state={message}",
+                source_url
+            );
+
+            if is_youtube_terminal_unavailable_error(&message)
+                || is_youtube_auth_or_bot_error(&message)
+            {
+                anyhow::bail!("yt-dlp YouTube indisponible: {}", message);
+            }
+
+            errors.push(format!("deno_dash={message}"));
+            Ok(None)
+        }
+    }
 }
 
 async fn resolve_generic_media_input(source_url: &str) -> anyhow::Result<ResolvedMediaInput> {
@@ -3968,7 +4156,7 @@ async fn resolve_generic_media_input(source_url: &str) -> anyhow::Result<Resolve
 }
 
 async fn resolve_youtube_preferred_single_url(source_url: &str) -> anyhow::Result<String> {
-    resolve_youtube_url_with_format(source_url, YTDLP_YOUTUBE_FAST_FORMAT).await
+    resolve_youtube_url_with_format(source_url, YTDLP_YOUTUBE_FAST_FORMAT, false).await
 }
 
 async fn add_ytdlp_common_args(cmd: &mut Command) {
