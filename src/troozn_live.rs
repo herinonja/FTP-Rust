@@ -36,6 +36,10 @@ const PLAYLIST_PAGE_SIZE: usize = 20;
 const PLAYLIST_REFILL_THRESHOLD: usize = 5;
 const MAX_ITEMS: usize = 20;
 const PREWARM_AHEAD_ITEMS: usize = 3;
+const PLAYLIST_ACTIVE_SCAN_EXTRA: usize = 12;
+const PLAYLIST_ACTIVE_SCAN_MAX: usize = 40;
+const YOUTUBE_QUICK_VALIDATE_CONCURRENCY: usize = 4;
+const YOUTUBE_QUICK_VALIDATE_TIMEOUT_SECONDS: u64 = 8;
 const HLS_SEGMENT_SECONDS: &str = "2";
 const PREFERRED_VIDEO_HEIGHT: u64 = 1080;
 const FALLBACK_VIDEO_HEIGHT: u64 = 720;
@@ -48,6 +52,7 @@ const DEFAULT_PUBLIC_HLS_URL: &str = "http://127.0.0.1:8787/troozn-live/Playlist
 const YTDLP_COOKIES_FILE: &str = "/home/troozn/.config/troozn/youtube-cookies.txt";
 const YTDLP_YOUTUBE_FAST_FORMAT: &str = "96/22/95/94";
 const YTDLP_YOUTUBE_DASH_FORMAT: &str = "137+140/136+140/135+140";
+const YTDLP_YOUTUBE_VALIDATE_FORMAT: &str = "96/22/95/94/137+140/136+140/135+140";
 const YTDLP_GENERIC_SINGLE_FORMAT: &str =
     "best[height<=1080][height>=720][vcodec!=none][acodec!=none]/best[height=1080][vcodec!=none][acodec!=none]/best[height=720][vcodec!=none][acodec!=none]/best[height<=720][height>=480][vcodec!=none][acodec!=none]/best[height=480][vcodec!=none][acodec!=none]";
 const YTDLP_GENERIC_SEPARATE_FORMAT: &str =
@@ -2841,11 +2846,19 @@ async fn extract_youtube_items(
 
     add_ytdlp_common_args(&mut cmd).await;
 
+    let scan_limit = if is_youtube_url(source_url) && is_probably_playlist_url(source_url) {
+        limit
+            .saturating_add(PLAYLIST_ACTIVE_SCAN_EXTRA)
+            .min(PLAYLIST_ACTIVE_SCAN_MAX)
+    } else {
+        limit
+    };
+
     cmd.args([
         "--flat-playlist",
         "--no-warnings",
         "--playlist-end",
-        &limit.to_string(),
+        &scan_limit.to_string(),
         "-J",
         source_url,
     ]);
@@ -2865,7 +2878,7 @@ async fn extract_youtube_items(
     let mut out = Vec::new();
 
     if let Some(entries) = root.get("entries").and_then(Value::as_array) {
-        for (idx, entry) in entries.iter().take(limit).enumerate() {
+        for (idx, entry) in entries.iter().take(scan_limit).enumerate() {
             if let Some(item) = item_from_ytdlp_value(idx + 1, entry) {
                 out.push(item);
             }
@@ -2874,7 +2887,167 @@ async fn extract_youtube_items(
         out.push(item);
     }
 
+    let out = filter_active_youtube_items(out, limit).await;
+
+    eprintln!(
+        "TROOZN_LIVE_PLAYLIST_ACTIVE_FILTER source_url={} wanted={} scanned={} active={}",
+        source_url,
+        limit,
+        scan_limit,
+        out.len()
+    );
+
     Ok(out)
+}
+
+async fn filter_active_youtube_items(
+    items: Vec<TrooznLiveItem>,
+    wanted: usize,
+) -> Vec<TrooznLiveItem> {
+    if items.is_empty() {
+        return items;
+    }
+
+    let total = items.len();
+    let mut active = Vec::new();
+    let mut iter = items.into_iter();
+
+    while active.len() < wanted {
+        let chunk = iter
+            .by_ref()
+            .take(YOUTUBE_QUICK_VALIDATE_CONCURRENCY)
+            .collect::<Vec<_>>();
+
+        if chunk.is_empty() {
+            break;
+        }
+
+        let handles = chunk
+            .into_iter()
+            .map(|item| {
+                tokio::spawn(async move {
+                    let is_active = if is_youtube_url(&item.source_url) {
+                        quick_validate_youtube_item(&item).await
+                    } else {
+                        true
+                    };
+
+                    (item, is_active)
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for handle in handles {
+            match handle.await {
+                Ok((item, true)) => active.push(item),
+                Ok((item, false)) => {
+                    eprintln!(
+                        "TROOZN_LIVE_PLAYLIST_SKIP_INACTIVE index={} title={} url={}",
+                        item.index, item.title, item.source_url
+                    );
+                }
+                Err(err) => {
+                    eprintln!("TROOZN_LIVE_PLAYLIST_VALIDATE_JOIN_ERROR state={err:?}");
+                }
+            }
+        }
+    }
+
+    active.truncate(wanted);
+
+    for (idx, item) in active.iter_mut().enumerate() {
+        item.index = idx + 1;
+    }
+
+    eprintln!(
+        "TROOZN_LIVE_PLAYLIST_VALIDATE_DONE scanned={} kept={} wanted={}",
+        total,
+        active.len(),
+        wanted
+    );
+
+    active
+}
+
+async fn quick_validate_youtube_item(item: &TrooznLiveItem) -> bool {
+    let mut cmd = Command::new(YTDLP_BIN);
+    add_ytdlp_cookies_if_available(&mut cmd);
+
+    cmd.args([
+        "--ignore-config",
+        "--no-playlist",
+        "--no-warnings",
+        "--force-ipv4",
+        "--socket-timeout",
+        "5",
+        "--retries",
+        "0",
+        "--fragment-retries",
+        "0",
+        "-f",
+        YTDLP_YOUTUBE_VALIDATE_FORMAT,
+        "-g",
+        &item.source_url,
+    ]);
+
+    let output = match timeout(
+        Duration::from_secs(YOUTUBE_QUICK_VALIDATE_TIMEOUT_SECONDS),
+        cmd.output(),
+    )
+    .await
+    {
+        Ok(Ok(output)) => output,
+        Ok(Err(err)) => {
+            eprintln!(
+                "TROOZN_LIVE_PLAYLIST_VALIDATE_SPAWN_FAIL index={} title={} state={err:?}",
+                item.index, item.title
+            );
+            return false;
+        }
+        Err(_) => {
+            eprintln!(
+                "TROOZN_LIVE_PLAYLIST_VALIDATE_TIMEOUT index={} title={} timeout_s={}",
+                item.index, item.title, YOUTUBE_QUICK_VALIDATE_TIMEOUT_SECONDS
+            );
+            return false;
+        }
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = if stderr.trim().is_empty() {
+        stdout.to_string()
+    } else {
+        format!("{}\n{}", stdout.trim(), stderr.trim())
+    };
+
+    if output.status.success()
+        && stdout
+            .lines()
+            .any(|line| line.starts_with("http://") || line.starts_with("https://"))
+    {
+        return true;
+    }
+
+    if is_youtube_terminal_unavailable_error(&combined) {
+        eprintln!(
+            "TROOZN_LIVE_PLAYLIST_VALIDATE_UNAVAILABLE index={} title={} state={}",
+            item.index,
+            item.title,
+            combined.trim()
+        );
+        return false;
+    }
+
+    eprintln!(
+        "TROOZN_LIVE_PLAYLIST_VALIDATE_FAIL index={} title={} status={} state={}",
+        item.index,
+        item.title,
+        output.status,
+        combined.trim()
+    );
+
+    false
 }
 
 fn item_from_ytdlp_value(index: usize, v: &Value) -> Option<TrooznLiveItem> {
