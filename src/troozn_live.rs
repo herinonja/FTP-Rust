@@ -1829,6 +1829,7 @@ impl TrooznLive {
         out.push_str(&format!(
             "#EXT-X-DISCONTINUITY-SEQUENCE:{discontinuity_sequence}\n"
         ));
+        out.push_str("#EXT-X-START:TIME-OFFSET=0,PRECISE=YES\n");
 
         let mut last_item: Option<usize> = None;
 
@@ -1921,10 +1922,14 @@ impl TrooznLive {
                 return Ok(CleanupStats::default());
             };
 
-            let mut keep_from = served_pos;
+            let current_item_first_pos = entries
+                .iter()
+                .position(|entry| entry.item_index == served_item)
+                .unwrap_or(served_pos);
+            let mut keep_from = current_item_first_pos;
             let mut retained_seconds = 0.0_f64;
 
-            for idx in (0..=served_pos).rev() {
+            for idx in (0..current_item_first_pos).rev() {
                 retained_seconds += entry_duration_seconds(&entries[idx]);
                 keep_from = idx;
 
@@ -2142,6 +2147,7 @@ impl TrooznLive {
         out.push_str(&format!(
             "#EXT-X-DISCONTINUITY-SEQUENCE:{discontinuity_sequence}\n"
         ));
+        out.push_str("#EXT-X-START:TIME-OFFSET=0,PRECISE=YES\n");
 
         let mut discontinuity_seen_for_item = HashSet::new();
 
@@ -2406,6 +2412,7 @@ async fn write_empty_master_playlist(index_path: &Path) -> anyhow::Result<()> {
 #EXT-X-VERSION:3
 #EXT-X-TARGETDURATION:{target_duration}
 #EXT-X-MEDIA-SEQUENCE:0
+#EXT-X-START:TIME-OFFSET=0,PRECISE=YES
 "
     );
 
