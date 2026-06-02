@@ -19,28 +19,39 @@ use tokio::time::{sleep, timeout, Duration};
 use crate::HttpGatewayState;
 
 const LIVE_DIR: &str = "/home/troozn/.kodi/userdata/TROOZN/live";
-const TROOZN_LIVE_BUILD_TAG: &str = "v2.1-generic-ytdlp-hls720-stable-2026-06-01";
+const TROOZN_LIVE_BUILD_TAG: &str = "v2.4-source-named-hls1080-buffered-cleanup-2026-06-02";
 
 const YTDLP_BIN: &str = "/home/troozn/.local/bin/yt-dlp";
-const LIVE_KEEP_BEHIND_ITEMS: usize = 2;
-const LIVE_MAX_DIR_BYTES: u64 = 1500 * 1024 * 1024;
+const LIVE_MAX_DIR_BYTES: u64 = 512 * 1024 * 1024;
+const LIVE_TARGET_DIR_BYTES: u64 = 384 * 1024 * 1024;
+const LIVE_KEEP_BEHIND_SECONDS: f64 = 75.0;
+const LIVE_PRESSURE_KEEP_BEHIND_SECONDS: f64 = 30.0;
+const LIVE_CLEANUP_INTERVAL_SECONDS: u64 = 3;
+const LIVE_ORPHAN_GRACE_SECONDS: u64 = 45;
+const LIVE_TMP_GRACE_SECONDS: u64 = 20;
+const LIVE_MAX_PRODUCER_AHEAD_SECONDS: f64 = 240.0;
+const LIVE_RESUME_PRODUCER_AHEAD_SECONDS: f64 = 160.0;
+const LIVE_AHEAD_WAIT_MAX_SECONDS: u64 = 90;
 const PLAYLIST_PAGE_SIZE: usize = 20;
 const PLAYLIST_REFILL_THRESHOLD: usize = 5;
-const LIVE_CONSUME_MODE: bool = false;
-const LIVE_CONSUME_KEEP_BEHIND_ITEMS: usize = 2;
 const MAX_ITEMS: usize = 20;
-const MAX_PRODUCER_AHEAD_ITEMS: usize = 20;
-const PREWARM_AHEAD_ITEMS: usize = 2;
+const PREWARM_AHEAD_ITEMS: usize = 3;
+const HLS_SEGMENT_SECONDS: &str = "2";
+const PREFERRED_VIDEO_HEIGHT: u64 = 1080;
+const FALLBACK_VIDEO_HEIGHT: u64 = 720;
+const MIN_SELECTED_VIDEO_HEIGHT: u64 = 480;
 
-const PUBLIC_HLS_URL: &str = "http://127.0.0.1:8787/troozn-live/playlist-youtube.m3u8";
+const PUBLIC_HLS_BASE_URL: &str = "http://127.0.0.1:8787/troozn-live";
+const DEFAULT_PLAYLIST_NAME: &str = "Playlist_Troozn.m3u8";
+const DEFAULT_PUBLIC_HLS_URL: &str = "http://127.0.0.1:8787/troozn-live/Playlist_Troozn.m3u8";
 
 const YTDLP_COOKIES_FILE: &str = "/home/troozn/.config/troozn/youtube-cookies.txt";
-const YTDLP_YOUTUBE_FAST_FORMAT: &str = "22/95/94";
-const YTDLP_YOUTUBE_DASH_FORMAT: &str = "136+140/135+140";
+const YTDLP_YOUTUBE_FAST_FORMAT: &str = "96/22/95/94";
+const YTDLP_YOUTUBE_DASH_FORMAT: &str = "137+140/136+140/135+140";
 const YTDLP_GENERIC_SINGLE_FORMAT: &str =
-    "best[height<=720][height>=480][vcodec!=none][acodec!=none]/best[height=720][vcodec!=none][acodec!=none]/best[height=480][vcodec!=none][acodec!=none]";
+    "best[height<=1080][height>=720][vcodec!=none][acodec!=none]/best[height=1080][vcodec!=none][acodec!=none]/best[height=720][vcodec!=none][acodec!=none]/best[height<=720][height>=480][vcodec!=none][acodec!=none]/best[height=480][vcodec!=none][acodec!=none]";
 const YTDLP_GENERIC_SEPARATE_FORMAT: &str =
-    "bv*[height<=720][height>=480][vcodec!=none]+ba[acodec!=none]/bv*[height=720][vcodec!=none]+ba[acodec!=none]/bv*[height=480][vcodec!=none]+ba[acodec!=none]";
+    "bv*[height<=1080][height>=720][vcodec!=none]+ba[acodec!=none]/bv*[height=1080][vcodec!=none]+ba[acodec!=none]/bv*[height=720][vcodec!=none]+ba[acodec!=none]/bv*[height<=720][height>=480][vcodec!=none]+ba[acodec!=none]/bv*[height=480][vcodec!=none]+ba[acodec!=none]";
 
 const YTDLP_GENERIC_AUDIO_FORMAT: &str =
     "bestaudio[acodec!=none]/best[acodec!=none]/bestaudio/best";
@@ -60,6 +71,10 @@ pub struct TrooznLive {
     playback_now: Mutex<TrooznLiveNow>,
     queue: Mutex<Vec<TrooznLiveItem>>,
     master_entries: Mutex<Vec<MasterEntry>>,
+    last_served_segment: Mutex<Option<(usize, usize)>>,
+    media_sequence_base: Mutex<u64>,
+    discontinuity_sequence_base: Mutex<u64>,
+    last_cleanup_at: Mutex<u64>,
     playlist_refill: Mutex<Option<PlaylistRefillState>>,
     resolved_inputs: Mutex<HashMap<String, ResolvedMediaInput>>,
     resolving_inputs: Mutex<HashSet<String>>,
@@ -67,6 +82,7 @@ pub struct TrooznLive {
     worker_running: Mutex<bool>,
     generation_id: Mutex<u64>,
     playback_anchor_item: Mutex<usize>,
+    playlist_name: Mutex<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -88,6 +104,12 @@ pub struct TrooznLiveNow {
     pub item_started_at: u64,
     pub next_title: Option<String>,
     pub last_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub media_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub buffer_seconds: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub buffer_segments: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -112,6 +134,28 @@ struct MasterEntry {
     program_date_time: Option<String>,
     segment: String,
     discontinuity_before: bool,
+}
+
+#[derive(Debug, Default)]
+struct LiveDirUsage {
+    bytes: u64,
+    files: usize,
+    ts_files: usize,
+}
+
+#[derive(Debug, Default)]
+struct CleanupStats {
+    removed_files: usize,
+    removed_bytes: u64,
+    removed_playlist_entries: usize,
+}
+
+impl CleanupStats {
+    fn merge(&mut self, other: CleanupStats) {
+        self.removed_files += other.removed_files;
+        self.removed_bytes = self.removed_bytes.saturating_add(other.removed_bytes);
+        self.removed_playlist_entries += other.removed_playlist_entries;
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -233,7 +277,6 @@ enum ResolvedMediaInput {
     },
 }
 
-
 fn media_input_summary(input: &ResolvedMediaInput) -> String {
     match input {
         ResolvedMediaInput::Single {
@@ -270,11 +313,242 @@ fn media_input_summary(input: &ResolvedMediaInput) -> String {
     }
 }
 
+fn media_type_for_input(input: &ResolvedMediaInput) -> &'static str {
+    match input {
+        ResolvedMediaInput::AudioOnly { .. } => "audio",
+        ResolvedMediaInput::Single { url, .. } => infer_media_type_from_url(url).unwrap_or("video"),
+        ResolvedMediaInput::SeparateAv { .. } => "video",
+    }
+}
+
+fn infer_media_type_from_url(source_url: &str) -> Option<&'static str> {
+    let ext = url_extension(source_url)?;
+
+    if matches!(
+        ext.as_str(),
+        "mp3" | "m4a" | "aac" | "flac" | "wav" | "ogg" | "oga" | "opus" | "wma" | "aiff"
+    ) {
+        return Some("audio");
+    }
+
+    if matches!(
+        ext.as_str(),
+        "mp4"
+            | "mkv"
+            | "webm"
+            | "mov"
+            | "m4v"
+            | "avi"
+            | "ts"
+            | "m2ts"
+            | "mpg"
+            | "mpeg"
+            | "3gp"
+            | "flv"
+            | "m3u8"
+    ) {
+        return Some("video");
+    }
+
+    None
+}
+
+async fn direct_media_input(source_url: &str) -> Option<ResolvedMediaInput> {
+    if !source_url.starts_with("http://") && !source_url.starts_with("https://") {
+        return None;
+    }
+
+    match infer_media_type_from_url(source_url)? {
+        "audio" => Some(ResolvedMediaInput::AudioOnly {
+            url: source_url.to_string(),
+            format_selector: "direct-audio".to_string(),
+        }),
+        "video" => match probe_direct_video_height(source_url).await {
+            Ok(Some(height)) if height >= MIN_SELECTED_VIDEO_HEIGHT => {
+                Some(ResolvedMediaInput::Single {
+                    url: source_url.to_string(),
+                    format_selector: format!("direct-video-{height}p"),
+                })
+            }
+            Ok(Some(height)) => {
+                eprintln!(
+                    "TROOZN_LIVE_DIRECT_VIDEO_TOO_LOW height={} min={} url={}",
+                    height, MIN_SELECTED_VIDEO_HEIGHT, source_url
+                );
+                None
+            }
+            Ok(None) => {
+                eprintln!(
+                    "TROOZN_LIVE_DIRECT_VIDEO_UNKNOWN_HEIGHT min={} url={}",
+                    MIN_SELECTED_VIDEO_HEIGHT, source_url
+                );
+                None
+            }
+            Err(err) => {
+                eprintln!(
+                    "TROOZN_LIVE_DIRECT_VIDEO_PROBE_FAILED min={} url={} state={err:?}",
+                    MIN_SELECTED_VIDEO_HEIGHT, source_url
+                );
+                None
+            }
+        },
+        _ => None,
+    }
+}
+
+fn url_extension(source_url: &str) -> Option<String> {
+    let clean = source_url
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(source_url)
+        .trim_end_matches('/');
+    let ext = clean.rsplit('.').next()?.to_ascii_lowercase();
+
+    if ext.len() > 6 || ext == clean {
+        return None;
+    }
+
+    Some(ext)
+}
+
+async fn probe_direct_video_height(source_url: &str) -> anyhow::Result<Option<u64>> {
+    let mut cmd = Command::new("ffprobe");
+
+    cmd.args([
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=height",
+        "-of",
+        "json",
+        source_url,
+    ]);
+
+    let output = timeout(Duration::from_secs(8), cmd.output())
+        .await
+        .context("timeout ffprobe direct video")?
+        .context("spawn ffprobe direct video")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("ffprobe direct video failed: {}", stderr.trim());
+    }
+
+    let root: Value =
+        serde_json::from_slice(&output.stdout).context("parse ffprobe direct video JSON")?;
+    let height = root
+        .get("streams")
+        .and_then(Value::as_array)
+        .and_then(|streams| streams.first())
+        .and_then(|stream| stream.get("height"))
+        .and_then(Value::as_u64);
+
+    Ok(height)
+}
+
+fn playlist_name_for_source(source_url: &str) -> String {
+    let host = source_host(source_url).unwrap_or_else(|| source_url.to_ascii_lowercase());
+    let label = if host.contains("youtube.com") || host.contains("youtu.be") {
+        "Youtube".to_string()
+    } else if host.contains("soundcloud.com") {
+        "Soundcloud".to_string()
+    } else if host.contains("vimeo.com") {
+        "Vimeo".to_string()
+    } else if host.contains("dailymotion.com") || host.contains("dai.ly") {
+        "Dailymotion".to_string()
+    } else if host.contains("twitch.tv") {
+        "Twitch".to_string()
+    } else if host.contains("spotify.com") {
+        "Spotify".to_string()
+    } else if host.contains("deezer.com") {
+        "Deezer".to_string()
+    } else if host.contains("mixcloud.com") {
+        "Mixcloud".to_string()
+    } else if host.contains("bandcamp.com") {
+        "Bandcamp".to_string()
+    } else {
+        let base = host
+            .trim_start_matches("www.")
+            .split('.')
+            .next()
+            .unwrap_or("Troozn");
+        title_case_ascii(base)
+    };
+
+    format!("Playlist_{}.m3u8", sanitize_playlist_label(&label))
+}
+
+fn source_host(source_url: &str) -> Option<String> {
+    let lower = source_url.to_ascii_lowercase();
+    let after_scheme = lower
+        .strip_prefix("https://")
+        .or_else(|| lower.strip_prefix("http://"))?;
+    let host = after_scheme.split(['/', '?', '#']).next()?.trim();
+
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_string())
+    }
+}
+
+fn title_case_ascii(value: &str) -> String {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return "Troozn".to_string();
+    };
+
+    format!(
+        "{}{}",
+        first.to_ascii_uppercase(),
+        chars.collect::<String>().to_ascii_lowercase()
+    )
+}
+
+fn sanitize_playlist_label(value: &str) -> String {
+    let mut out = String::new();
+
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch);
+        } else if ch == '-' || ch == '_' {
+            out.push('_');
+        }
+    }
+
+    if out.is_empty() {
+        "Troozn".to_string()
+    } else {
+        out
+    }
+}
+
+fn is_public_playlist_alias(requested: &str, current_playlist_name: &str) -> bool {
+    let lower = requested.to_ascii_lowercase();
+
+    requested == current_playlist_name
+        || lower == current_playlist_name.to_ascii_lowercase()
+        || lower == "playlist-youtube.m3u8"
+        || (requested.starts_with("Playlist_") && requested.ends_with(".m3u8"))
+}
+
+fn playlist_title_from_name(playlist_name: &str) -> String {
+    let label = playlist_name
+        .strip_prefix("Playlist_")
+        .unwrap_or("Troozn")
+        .trim_end_matches(".m3u8")
+        .replace('_', " ");
+
+    format!("Playlist {label}")
+}
+
 impl TrooznLive {
     pub fn new_default() -> Self {
         let idle = TrooznLiveNow {
             state: "idle".to_string(),
-            hls_url: PUBLIC_HLS_URL.to_string(),
+            hls_url: DEFAULT_PUBLIC_HLS_URL.to_string(),
             ..Default::default()
         };
 
@@ -285,6 +559,10 @@ impl TrooznLive {
             playback_now: Mutex::new(idle),
             queue: Mutex::new(Vec::new()),
             master_entries: Mutex::new(Vec::new()),
+            last_served_segment: Mutex::new(None),
+            media_sequence_base: Mutex::new(0),
+            discontinuity_sequence_base: Mutex::new(0),
+            last_cleanup_at: Mutex::new(0),
             playlist_refill: Mutex::new(None),
             resolved_inputs: Mutex::new(HashMap::new()),
             resolving_inputs: Mutex::new(HashSet::new()),
@@ -292,12 +570,30 @@ impl TrooznLive {
             worker_running: Mutex::new(false),
             generation_id: Mutex::new(0),
             playback_anchor_item: Mutex::new(1),
+            playlist_name: Mutex::new(DEFAULT_PLAYLIST_NAME.to_string()),
         }
+    }
+
+    async fn current_public_hls_url(&self) -> String {
+        let playlist_name = self.playlist_name.lock().await.clone();
+        format!("{PUBLIC_HLS_BASE_URL}/{playlist_name}")
     }
 
     async fn current_hls_url(&self) -> String {
         let session_id = self.session_id.lock().await.clone();
-        format!("{}?session={}", PUBLIC_HLS_URL, session_id)
+        let public_hls_url = self.current_public_hls_url().await;
+        format!("{}?session={}", public_hls_url, session_id)
+    }
+
+    async fn current_playlist_name(&self) -> String {
+        self.playlist_name.lock().await.clone()
+    }
+
+    async fn set_playlist_name_for_source(&self, source_url: &str) -> String {
+        let name = playlist_name_for_source(source_url);
+        let mut guard = self.playlist_name.lock().await;
+        *guard = name.clone();
+        name
     }
 
     async fn new_session_id(&self) -> String {
@@ -419,6 +715,65 @@ impl TrooznLive {
             .iter()
             .find(|candidate| candidate.index > index)
             .map(|candidate| candidate.title.clone())
+    }
+
+    async fn current_buffer_stats(&self) -> (f64, usize) {
+        let last_served = *self.last_served_segment.lock().await;
+        let playback = self.playback_now.lock().await.clone();
+        let anchor_item = if playback.index > 0 {
+            playback.index
+        } else {
+            *self.playback_anchor_item.lock().await
+        };
+        let entries = self.master_entries.lock().await.clone();
+
+        let mut seconds = 0.0_f64;
+        let mut segments = 0_usize;
+
+        for entry in entries {
+            if entry.item_index < anchor_item {
+                continue;
+            }
+
+            if let Some((served_item, served_segment)) = last_served {
+                if entry.item_index < served_item {
+                    continue;
+                }
+
+                if entry.item_index == served_item {
+                    let Some((_, entry_segment)) = parse_item_segment_name(&entry.segment) else {
+                        continue;
+                    };
+
+                    if entry_segment <= served_segment {
+                        continue;
+                    }
+                }
+            }
+
+            if let Ok(duration) = entry.duration.parse::<f64>() {
+                seconds += duration;
+                segments += 1;
+            }
+        }
+
+        (seconds, segments)
+    }
+
+    async fn refresh_buffer_status(&self) {
+        let (buffer_seconds, buffer_segments) = self.current_buffer_stats().await;
+
+        {
+            let mut producer = self.producer_now.lock().await;
+            producer.buffer_seconds = Some(buffer_seconds);
+            producer.buffer_segments = Some(buffer_segments);
+        }
+
+        {
+            let mut playback = self.playback_now.lock().await;
+            playback.buffer_seconds = Some(buffer_seconds);
+            playback.buffer_segments = Some(buffer_segments);
+        }
     }
 
     async fn cached_or_resolve_media_input(
@@ -609,6 +964,11 @@ impl TrooznLive {
         }
         self.resolved_inputs.lock().await.clear();
         self.resolving_inputs.lock().await.clear();
+        *self.last_served_segment.lock().await = None;
+        *self.media_sequence_base.lock().await = 0;
+        *self.discontinuity_sequence_base.lock().await = 0;
+        *self.last_cleanup_at.lock().await = 0;
+        *self.playlist_name.lock().await = DEFAULT_PLAYLIST_NAME.to_string();
 
         Ok(())
     }
@@ -639,6 +999,9 @@ impl TrooznLive {
 
         self.ensure_clean_dir().await?;
         self.new_session_id().await;
+        let playlist_name = self.set_playlist_name_for_source(source_url).await;
+        let default_title = playlist_title_from_name(&playlist_name);
+        let public_hls_url = self.current_public_hls_url().await;
 
         {
             let mut anchor = self.playback_anchor_item.lock().await;
@@ -717,10 +1080,11 @@ impl TrooznLive {
 
         let now = TrooznLiveNow {
             state: "starting".to_string(),
-            title: title.unwrap_or_else(|| "Playlist Youtube".to_string()),
+            title: title.unwrap_or(default_title),
             source_url: source_url.to_string(),
-            hls_url: PUBLIC_HLS_URL.to_string(),
+            hls_url: public_hls_url,
             started_at: unix_timestamp(),
+            media_type: infer_media_type_from_url(source_url).map(str::to_string),
             ..Default::default()
         };
 
@@ -886,19 +1250,24 @@ impl TrooznLive {
             self.clone().spawn_prewarm_after(item.index).await;
 
             let next_title = self.next_title_after(item.index).await;
+            let public_hls_url = self.current_public_hls_url().await;
 
             {
                 let mut guard = self.producer_now.lock().await;
                 guard.state = "preparing".to_string();
                 guard.title = item.title.clone();
                 guard.source_url = item.source_url.clone();
-                guard.hls_url = PUBLIC_HLS_URL.to_string();
+                guard.hls_url = public_hls_url.clone();
                 guard.item_id = item.item_id.clone();
                 guard.index = item.index;
                 guard.position = 0;
                 guard.duration = item.duration;
                 guard.thumbnail = item.thumbnail.clone();
                 guard.channel = item.channel.clone();
+                guard.description = item.description.clone();
+                guard.upload_date = item.upload_date.clone();
+                guard.uploader = item.uploader.clone();
+                guard.media_type = infer_media_type_from_url(&item.source_url).map(str::to_string);
                 guard.started_at = stream_started_at;
                 guard.item_started_at = 0;
                 guard.next_title = next_title.clone();
@@ -916,7 +1285,7 @@ impl TrooznLive {
 
             {
                 let mut guard = self.producer_now.lock().await;
-                guard.last_error = Some("Résolution URL vidéo 720p en cours".to_string());
+                guard.last_error = Some("Résolution URL vidéo 1080p/720p en cours".to_string());
             }
 
             let media_input = match self.clone().cached_or_resolve_media_input(&item).await {
@@ -952,6 +1321,10 @@ impl TrooznLive {
                         guard.description = item.description.clone();
                         guard.upload_date = item.upload_date.clone();
                         guard.uploader = item.uploader.clone();
+                        guard.media_type =
+                            infer_media_type_from_url(&item.source_url).map(str::to_string);
+                        guard.buffer_seconds = Some(0.0);
+                        guard.buffer_segments = Some(0);
                         guard.last_error = Some(format!("Item ignoré: {}", item.title));
                     }
 
@@ -979,7 +1352,7 @@ impl TrooznLive {
                     state: "preparing".to_string(),
                     title: item.title.clone(),
                     source_url: item.source_url.clone(),
-                    hls_url: PUBLIC_HLS_URL.to_string(),
+                    hls_url: public_hls_url,
                     item_id: item.item_id.clone(),
                     index: item.index,
                     position: 0,
@@ -993,6 +1366,9 @@ impl TrooznLive {
                     item_started_at,
                     next_title,
                     last_error: None,
+                    media_type: Some(media_type_for_input(&media_input).to_string()),
+                    buffer_seconds: Some(0.0),
+                    buffer_segments: Some(0),
                 };
             }
 
@@ -1108,16 +1484,15 @@ impl TrooznLive {
                 "+genpts",
                 "-avoid_negative_ts",
                 "make_zero",
+                "-max_muxing_queue_size",
+                "1024",
             ]);
 
             match &media_input {
                 ResolvedMediaInput::Single { .. } => {
-                    // Chemin rapide qui conservait la logique YouTube stable : remux pur.
                     cmd.args(["-map", "0:v:0?", "-map", "0:a:0?", "-c", "copy"]);
                 }
                 ResolvedMediaInput::SeparateAv { .. } => {
-                    // DASH séparé : on copie la vidéo et on normalise seulement l'audio.
-                    // Cela évite les coupures audio en fin d'item avec certains flux 136+140/135+140.
                     cmd.args([
                         "-c:v",
                         "copy",
@@ -1133,91 +1508,9 @@ impl TrooznLive {
                         "aresample=async=1:first_pts=0",
                     ]);
                 }
-                ResolvedMediaInput::AudioOnly { .. } => {}
-            }
-
-            cmd.args([
-                "-fflags",
-                "+genpts",
-                "-avoid_negative_ts",
-                "make_zero",
-            ]);
-
-            match &media_input {
                 ResolvedMediaInput::AudioOnly { .. } => {
                     cmd.args([
-                        "-vn",
-                        "-c:a",
-                        "aac",
-                        "-b:a",
-                        "160k",
-                        "-ac",
-                        "2",
-                        "-ar",
-                        "44100",
-                    ]);
-                }
-                ResolvedMediaInput::SeparateAv { .. } => {
-                    cmd.args([
-                        "-c:v",
-                        "copy",
-                        "-c:a",
-                        "aac",
-                        "-b:a",
-                        "160k",
-                        "-ac",
-                        "2",
-                        "-ar",
-                        "44100",
-                    ]);
-                }
-                ResolvedMediaInput::Single { .. } => {
-                    cmd.args([
-                        "-c",
-                        "copy",
-                    ]);
-                }
-            }
-
-            cmd.args([
-                "-fflags",
-                "+genpts",
-                "-avoid_negative_ts",
-                "make_zero",
-            ]);
-
-            match &media_input {
-                ResolvedMediaInput::AudioOnly { .. } => {
-                    cmd.args([
-                        "-vn",
-                        "-c:a",
-                        "aac",
-                        "-b:a",
-                        "160k",
-                        "-ac",
-                        "2",
-                        "-ar",
-                        "44100",
-                    ]);
-                }
-                ResolvedMediaInput::SeparateAv { .. } => {
-                    cmd.args([
-                        "-c:v",
-                        "copy",
-                        "-c:a",
-                        "aac",
-                        "-b:a",
-                        "160k",
-                        "-ac",
-                        "2",
-                        "-ar",
-                        "44100",
-                    ]);
-                }
-                ResolvedMediaInput::Single { .. } => {
-                    cmd.args([
-                        "-c",
-                        "copy",
+                        "-vn", "-c:a", "aac", "-b:a", "160k", "-ac", "2", "-ar", "44100",
                     ]);
                 }
             }
@@ -1226,7 +1519,9 @@ impl TrooznLive {
                 "-f",
                 "hls",
                 "-hls_time",
-                "4",
+                HLS_SEGMENT_SECONDS,
+                "-hls_init_time",
+                "1",
                 "-hls_list_size",
                 "0",
                 "-hls_flags",
@@ -1289,6 +1584,8 @@ impl TrooznLive {
                     imported_segments = new_count;
                     appended_any = true;
                     self.rewrite_master_playlist(false).await.ok();
+                    self.refresh_buffer_status().await;
+                    self.maybe_cleanup_live_files(false).await.ok();
                 }
 
                 let finished = {
@@ -1343,6 +1640,8 @@ impl TrooznLive {
                     }
 
                     self.rewrite_master_playlist(false).await.ok();
+                    self.refresh_buffer_status().await;
+                    self.maybe_cleanup_live_files(true).await.ok();
                     break;
                 }
             }
@@ -1408,10 +1707,52 @@ impl TrooznLive {
         enriched
     }
 
-    async fn wait_until_future_buffer_needed(&self, _next_item_index: usize) {
-        // TROOZN Live v1 : producer rapide.
-        // Ne dépend pas de l'item actuellement lu par Kodi.
-        return;
+    async fn wait_until_future_buffer_needed(&self, next_item_index: usize) {
+        let started = unix_timestamp();
+
+        loop {
+            self.maybe_cleanup_live_files(false).await.ok();
+
+            let (buffer_seconds, buffer_segments) = self.current_buffer_stats().await;
+            let usage = self.live_dir_usage().await.unwrap_or_default();
+            let too_far_ahead = buffer_seconds > LIVE_MAX_PRODUCER_AHEAD_SECONDS;
+            let disk_pressure = usage.bytes > LIVE_MAX_DIR_BYTES;
+
+            if !too_far_ahead && !disk_pressure {
+                return;
+            }
+
+            if unix_timestamp().saturating_sub(started) >= LIVE_AHEAD_WAIT_MAX_SECONDS {
+                eprintln!(
+                    "TROOZN_LIVE_PRODUCER_WAIT_TIMEOUT next_item={} buffer_seconds={:.1} buffer_segments={} usage_bytes={}",
+                    next_item_index,
+                    buffer_seconds,
+                    buffer_segments,
+                    usage.bytes
+                );
+                return;
+            }
+
+            eprintln!(
+                "TROOZN_LIVE_PRODUCER_WAIT next_item={} buffer_seconds={:.1} buffer_segments={} usage_bytes={} max_bytes={}",
+                next_item_index,
+                buffer_seconds,
+                buffer_segments,
+                usage.bytes,
+                LIVE_MAX_DIR_BYTES
+            );
+
+            sleep(Duration::from_millis(1000)).await;
+
+            let (buffer_seconds, _) = self.current_buffer_stats().await;
+            let usage = self.live_dir_usage().await.unwrap_or_default();
+
+            if buffer_seconds <= LIVE_RESUME_PRODUCER_AHEAD_SECONDS
+                && usage.bytes <= LIVE_TARGET_DIR_BYTES
+            {
+                return;
+            }
+        }
     }
 
     async fn import_item_manifest_incremental(
@@ -1452,6 +1793,8 @@ impl TrooznLive {
     async fn render_playback_playlist_from_anchor(&self) -> String {
         let anchor = *self.playback_anchor_item.lock().await;
         let entries = self.master_entries.lock().await.clone();
+        let media_sequence = *self.media_sequence_base.lock().await;
+        let discontinuity_sequence = *self.discontinuity_sequence_base.lock().await;
 
         let filtered: Vec<MasterEntry> = entries
             .into_iter()
@@ -1476,10 +1819,11 @@ impl TrooznLive {
 
         out.push_str("#EXTM3U\n");
         out.push_str("#EXT-X-VERSION:3\n");
-        out.push_str("#EXT-X-PLAYLIST-TYPE:EVENT\n");
         out.push_str(&format!("#EXT-X-TARGETDURATION:{}\n", target_duration));
-        out.push_str("#EXT-X-MEDIA-SEQUENCE:0\n");
-        out.push_str("#EXT-X-DISCONTINUITY-SEQUENCE:0\n");
+        out.push_str(&format!("#EXT-X-MEDIA-SEQUENCE:{media_sequence}\n"));
+        out.push_str(&format!(
+            "#EXT-X-DISCONTINUITY-SEQUENCE:{discontinuity_sequence}\n"
+        ));
 
         let mut last_item: Option<usize> = None;
 
@@ -1497,95 +1841,194 @@ impl TrooznLive {
         out
     }
 
-    async fn cleanup_old_live_files(&self) -> anyhow::Result<()> {
-        let current_index = {
-            let now = self.playback_now.lock().await;
-            now.index
+    async fn maybe_cleanup_live_files(&self, force: bool) -> anyhow::Result<CleanupStats> {
+        let now = unix_timestamp();
+
+        {
+            let mut last = self.last_cleanup_at.lock().await;
+
+            if !force && now.saturating_sub(*last) < LIVE_CLEANUP_INTERVAL_SECONDS {
+                return Ok(CleanupStats::default());
+            }
+
+            *last = now;
+        }
+
+        let mut stats = self
+            .prune_served_master_entries(LIVE_KEEP_BEHIND_SECONDS)
+            .await?;
+
+        let usage = self.live_dir_usage().await.unwrap_or_default();
+        let pressure = usage.bytes > LIVE_MAX_DIR_BYTES;
+
+        if pressure {
+            let extra = self
+                .prune_served_master_entries(LIVE_PRESSURE_KEEP_BEHIND_SECONDS)
+                .await?;
+            stats.merge(extra);
+        }
+
+        let extra = self.cleanup_unreferenced_live_files(pressure).await?;
+        stats.merge(extra);
+
+        if stats.removed_files > 0 || stats.removed_playlist_entries > 0 {
+            self.rewrite_master_playlist(false).await.ok();
+            self.refresh_buffer_status().await;
+
+            let usage_after = self.live_dir_usage().await.unwrap_or_default();
+            eprintln!(
+                "TROOZN_LIVE_CLEANUP_DONE removed_files={} removed_bytes={} removed_entries={} usage_bytes={} ts_files={}",
+                stats.removed_files,
+                stats.removed_bytes,
+                stats.removed_playlist_entries,
+                usage_after.bytes,
+                usage_after.ts_files
+            );
+
+            if usage_after.bytes > LIVE_MAX_DIR_BYTES {
+                eprintln!(
+                    "TROOZN_LIVE_CLEANUP_PRESSURE_REMAINS usage_bytes={} max_bytes={} protected_ahead=true",
+                    usage_after.bytes,
+                    LIVE_MAX_DIR_BYTES
+                );
+            }
+        }
+
+        Ok(stats)
+    }
+
+    async fn prune_served_master_entries(
+        &self,
+        keep_behind_seconds: f64,
+    ) -> anyhow::Result<CleanupStats> {
+        let Some((served_item, served_segment)) = *self.last_served_segment.lock().await else {
+            return Ok(CleanupStats::default());
         };
 
-        if current_index <= LIVE_KEEP_BEHIND_ITEMS + 1 {
-            return Ok(());
-        }
+        let (removed, remaining_items) = {
+            let mut entries = self.master_entries.lock().await;
 
-        let keep_from = current_index.saturating_sub(LIVE_KEEP_BEHIND_ITEMS);
-
-        self.cleanup_items_before(keep_from).await?;
-        self.cleanup_by_size_limit().await?;
-
-        Ok(())
-    }
-
-    async fn cleanup_items_before(&self, keep_from: usize) -> anyhow::Result<()> {
-        let mut rd = fs::read_dir(&self.root_dir).await?;
-
-        while let Some(entry) = rd.next_entry().await? {
-            let path = entry.path();
-
-            let Some(name) = path.file_name().map(|v| v.to_string_lossy().to_string()) else {
-                continue;
+            let Some(served_pos) = entries.iter().position(|entry| {
+                parse_item_segment_name(&entry.segment)
+                    .map(|(item, segment)| item == served_item && segment == served_segment)
+                    .unwrap_or(false)
+            }) else {
+                return Ok(CleanupStats::default());
             };
 
-            let Some(item_index) = parse_item_index_from_live_filename(&name) else {
-                continue;
-            };
+            let mut keep_from = served_pos;
+            let mut retained_seconds = 0.0_f64;
 
-            if item_index >= keep_from {
-                continue;
-            }
+            for idx in (0..=served_pos).rev() {
+                retained_seconds += entry_duration_seconds(&entries[idx]);
+                keep_from = idx;
 
-            if name.ends_with(".ts") || name.ends_with(".m3u8") {
-                match fs::remove_file(&path).await {
-                    Ok(_) => {
-                        eprintln!(
-                            "TROOZN_LIVE_CLEANUP_REMOVE keep_from={} file={}",
-                            keep_from, name
-                        );
-                    }
-                    Err(err) => {
-                        eprintln!(
-                            "TROOZN_LIVE_CLEANUP_REMOVE_FAILED file={} state={err:?}",
-                            name
-                        );
-                    }
+                if retained_seconds >= keep_behind_seconds {
+                    break;
                 }
             }
+
+            if keep_from == 0 {
+                return Ok(CleanupStats::default());
+            }
+
+            let removed = entries.drain(0..keep_from).collect::<Vec<_>>();
+            let remaining_items = entries
+                .iter()
+                .map(|entry| entry.item_index)
+                .collect::<HashSet<_>>();
+
+            (removed, remaining_items)
+        };
+
+        if removed.is_empty() {
+            return Ok(CleanupStats::default());
         }
 
-        // Supprimer aussi les entrées master en mémoire devenues trop anciennes.
         {
-            let mut entries = self.master_entries.lock().await;
-            entries.retain(|entry| entry.item_index >= keep_from);
+            let mut media_sequence = self.media_sequence_base.lock().await;
+            *media_sequence = media_sequence.saturating_add(removed.len() as u64);
         }
 
-        self.rewrite_master_playlist(false).await.ok();
+        {
+            let removed_discontinuities = removed
+                .iter()
+                .filter(|entry| entry.discontinuity_before)
+                .count() as u64;
+            let mut discontinuity_sequence = self.discontinuity_sequence_base.lock().await;
+            *discontinuity_sequence =
+                discontinuity_sequence.saturating_add(removed_discontinuities);
+        }
 
-        Ok(())
+        let mut stats = CleanupStats {
+            removed_playlist_entries: removed.len(),
+            ..Default::default()
+        };
+        let mut removed_items = HashSet::new();
+
+        for entry in removed {
+            removed_items.insert(entry.item_index);
+            let path = self.root_dir.join(entry.segment);
+
+            if let Some(bytes) = remove_live_file(&path).await {
+                stats.removed_files += 1;
+                stats.removed_bytes = stats.removed_bytes.saturating_add(bytes);
+            }
+        }
+
+        for item_index in removed_items {
+            if remaining_items.contains(&item_index) {
+                continue;
+            }
+
+            let path = self.root_dir.join(format!("item-{item_index:04}.m3u8"));
+
+            if let Some(bytes) = remove_live_file(&path).await {
+                stats.removed_files += 1;
+                stats.removed_bytes = stats.removed_bytes.saturating_add(bytes);
+            }
+        }
+
+        Ok(stats)
     }
 
-    async fn cleanup_by_size_limit(&self) -> anyhow::Result<()> {
-        let mut files: Vec<(usize, std::time::SystemTime, u64, PathBuf)> = Vec::new();
-        let mut total_size: u64 = 0;
+    async fn cleanup_unreferenced_live_files(
+        &self,
+        pressure: bool,
+    ) -> anyhow::Result<CleanupStats> {
+        let entries = self.master_entries.lock().await.clone();
+        let producer_index = self.producer_now.lock().await.index;
+        let mut protected = HashSet::new();
+
+        protected.insert("index.m3u8".to_string());
+        protected.insert("playlist-youtube.m3u8".to_string());
+        protected.insert("audit.log".to_string());
+
+        for entry in entries {
+            protected.insert(entry.segment);
+            protected.insert(format!("item-{:04}.m3u8", entry.item_index));
+        }
+
+        if producer_index > 0 {
+            protected.insert(format!("item-{producer_index:04}.m3u8"));
+        }
 
         let mut rd = fs::read_dir(&self.root_dir).await?;
+        let mut stats = CleanupStats::default();
+        let mut pressure_candidates: Vec<(std::time::SystemTime, u64, PathBuf)> = Vec::new();
 
         while let Some(entry) = rd.next_entry().await? {
             let path = entry.path();
-
             let Some(name) = path.file_name().map(|v| v.to_string_lossy().to_string()) else {
                 continue;
             };
 
-            if !name.ends_with(".ts") && !name.ends_with(".m3u8") {
+            let is_live_file =
+                name.ends_with(".ts") || name.ends_with(".m3u8") || name.ends_with(".tmp");
+
+            if !is_live_file || protected.contains(&name) {
                 continue;
             }
-
-            if name == "index.m3u8" || name == "playlist-youtube.m3u8" {
-                continue;
-            }
-
-            let Some(item_index) = parse_item_index_from_live_filename(&name) else {
-                continue;
-            };
 
             let Ok(meta) = entry.metadata().await else {
                 continue;
@@ -1593,142 +2036,89 @@ impl TrooznLive {
 
             let size = meta.len();
             let modified = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            let age = file_age_seconds(modified);
+            let is_current_producer_file = producer_index > 0
+                && name.starts_with(&format!("item-{producer_index:04}-"))
+                && age < LIVE_ORPHAN_GRACE_SECONDS;
 
-            total_size = total_size.saturating_add(size);
-            files.push((item_index, modified, size, path));
-        }
-
-        if total_size <= LIVE_MAX_DIR_BYTES {
-            return Ok(());
-        }
-
-        files.sort_by_key(|(_, modified, _, _)| *modified);
-
-        let current_index = {
-            let now = self.playback_now.lock().await;
-            now.index
-        };
-
-        let protected_from = current_index.saturating_sub(LIVE_KEEP_BEHIND_ITEMS);
-
-        for (item_index, _, size, path) in files {
-            if total_size <= LIVE_MAX_DIR_BYTES {
-                break;
-            }
-
-            if item_index >= protected_from {
+            if is_current_producer_file {
                 continue;
             }
 
-            if fs::remove_file(&path).await.is_ok() {
-                total_size = total_size.saturating_sub(size);
+            let stale_tmp = name.ends_with(".tmp") && age >= LIVE_TMP_GRACE_SECONDS;
+            let stale_orphan = age >= LIVE_ORPHAN_GRACE_SECONDS;
 
-                eprintln!(
-                    "TROOZN_LIVE_CLEANUP_SIZE_REMOVE item={} remaining_bytes={} file={}",
-                    item_index,
-                    total_size,
-                    path.display()
-                );
+            if stale_tmp || stale_orphan {
+                if let Some(bytes) = remove_live_file(&path).await {
+                    stats.removed_files += 1;
+                    stats.removed_bytes = stats.removed_bytes.saturating_add(bytes);
+                }
+                continue;
+            }
+
+            if pressure {
+                pressure_candidates.push((modified, size, path));
             }
         }
 
-        Ok(())
+        if pressure {
+            pressure_candidates.sort_by_key(|(modified, _, _)| *modified);
+
+            let mut usage = self.live_dir_usage().await.unwrap_or_default().bytes;
+
+            for (_, size, path) in pressure_candidates {
+                if usage <= LIVE_TARGET_DIR_BYTES {
+                    break;
+                }
+
+                if let Some(bytes) = remove_live_file(&path).await {
+                    stats.removed_files += 1;
+                    stats.removed_bytes = stats.removed_bytes.saturating_add(bytes);
+                    usage = usage.saturating_sub(size.max(bytes));
+                }
+            }
+        }
+
+        Ok(stats)
     }
 
-    async fn consume_cleanup_before_item(&self, current_item_index: usize) {
-        if !LIVE_CONSUME_MODE {
-            return;
-        }
+    async fn live_dir_usage(&self) -> anyhow::Result<LiveDirUsage> {
+        let mut usage = LiveDirUsage::default();
+        let mut rd = fs::read_dir(&self.root_dir).await?;
 
-        if current_item_index <= LIVE_CONSUME_KEEP_BEHIND_ITEMS + 1 {
-            return;
-        }
-
-        let keep_from = current_item_index.saturating_sub(LIVE_CONSUME_KEEP_BEHIND_ITEMS);
-
-        eprintln!(
-            "TROOZN_LIVE_CONSUME_CLEANUP current_item={} keep_from={}",
-            current_item_index, keep_from
-        );
-
-        let mut removed_count: usize = 0;
-        let mut removed_bytes: u64 = 0;
-
-        let mut rd = match fs::read_dir(&self.root_dir).await {
-            Ok(rd) => rd,
-            Err(err) => {
-                eprintln!("TROOZN_LIVE_CONSUME_READDIR_ERROR state={err:?}");
-                return;
-            }
-        };
-
-        while let Ok(Some(entry)) = rd.next_entry().await {
+        while let Some(entry) = rd.next_entry().await? {
             let path = entry.path();
 
-            let Some(name) = path.file_name().map(|v| v.to_string_lossy().to_string()) else {
+            let Ok(meta) = entry.metadata().await else {
                 continue;
             };
 
-            if name == "index.m3u8" || name == "playlist-youtube.m3u8" || name == "audit.log" {
+            if !meta.is_file() {
                 continue;
             }
 
-            if !name.ends_with(".ts") && !name.ends_with(".m3u8") {
-                continue;
-            }
+            usage.files += 1;
+            usage.bytes = usage.bytes.saturating_add(meta.len());
 
-            let Some(item_index) = parse_item_index_from_live_filename(&name) else {
-                continue;
-            };
-
-            if item_index >= keep_from {
-                continue;
-            }
-
-            let size = match entry.metadata().await {
-                Ok(meta) => meta.len(),
-                Err(_) => 0,
-            };
-
-            match fs::remove_file(&path).await {
-                Ok(_) => {
-                    removed_count += 1;
-                    removed_bytes = removed_bytes.saturating_add(size);
-                    eprintln!(
-                        "TROOZN_LIVE_CONSUME_REMOVE item={} file={} bytes={}",
-                        item_index, name, size
-                    );
-                }
-                Err(err) => {
-                    eprintln!(
-                        "TROOZN_LIVE_CONSUME_REMOVE_FAILED file={} state={err:?}",
-                        name
-                    );
-                }
+            if path
+                .file_name()
+                .map(|name| name.to_string_lossy().ends_with(".ts"))
+                .unwrap_or(false)
+            {
+                usage.ts_files += 1;
             }
         }
 
-        {
-            let mut entries = self.master_entries.lock().await;
-            entries.retain(|entry| entry.item_index >= keep_from);
-        }
-
-        self.rewrite_master_playlist(false).await.ok();
-
-        eprintln!(
-            "TROOZN_LIVE_CONSUME_DONE current_item={} keep_from={} removed_files={} removed_bytes={}",
-            current_item_index,
-            keep_from,
-            removed_count,
-            removed_bytes
-        );
+        Ok(usage)
     }
 
     async fn rewrite_master_playlist(&self, ended: bool) -> anyhow::Result<()> {
         let entries = self.master_entries.lock().await.clone();
+        let media_sequence = *self.media_sequence_base.lock().await;
+        let discontinuity_sequence = *self.discontinuity_sequence_base.lock().await;
         let index_path = self.root_dir.join("index.m3u8");
 
-        let mut target_duration = 4_u64;
+        let mut target_duration = HLS_SEGMENT_SECONDS.parse::<u64>().unwrap_or(2).max(2);
 
         for entry in &entries {
             if let Ok(v) = entry.duration.parse::<f64>() {
@@ -1742,9 +2132,11 @@ impl TrooznLive {
         let mut out = String::new();
         out.push_str("#EXTM3U\n");
         out.push_str("#EXT-X-VERSION:3\n");
-        out.push_str("#EXT-X-PLAYLIST-TYPE:EVENT\n");
         out.push_str(&format!("#EXT-X-TARGETDURATION:{target_duration}\n"));
-        out.push_str("#EXT-X-MEDIA-SEQUENCE:0\n");
+        out.push_str(&format!("#EXT-X-MEDIA-SEQUENCE:{media_sequence}\n"));
+        out.push_str(&format!(
+            "#EXT-X-DISCONTINUITY-SEQUENCE:{discontinuity_sequence}\n"
+        ));
 
         let mut discontinuity_seen_for_item = HashSet::new();
 
@@ -1767,7 +2159,7 @@ impl TrooznLive {
             out.push_str("#EXT-X-ENDLIST\n");
         }
 
-        fs::write(index_path, out).await?;
+        write_text_atomic(&index_path, out).await?;
         Ok(())
     }
 
@@ -1775,6 +2167,11 @@ impl TrooznLive {
         let Some((item_index, segment_number)) = parse_item_segment_name(relative) else {
             return;
         };
+
+        {
+            let mut served = self.last_served_segment.lock().await;
+            *served = Some((item_index, segment_number));
+        }
 
         let queue = self.queue.lock().await.clone();
         let Some(item) = queue.iter().find(|item| item.index == item_index).cloned() else {
@@ -1802,12 +2199,13 @@ impl TrooznLive {
             .iter()
             .find(|candidate| candidate.index > item.index)
             .map(|candidate| candidate.title.clone());
+        let public_hls_url = self.current_public_hls_url().await;
 
         let now = TrooznLiveNow {
             state: "playing".to_string(),
             title: item.title.clone(),
             source_url: item.source_url.clone(),
-            hls_url: PUBLIC_HLS_URL.to_string(),
+            hls_url: public_hls_url,
             item_id: item.item_id.clone(),
             index: item.index,
             position: position_f64.floor() as u64,
@@ -1821,12 +2219,20 @@ impl TrooznLive {
             item_started_at: unix_timestamp().saturating_sub(position_f64.floor() as u64),
             next_title,
             last_error: None,
+            media_type: infer_media_type_from_url(&item.source_url)
+                .or(Some("video"))
+                .map(str::to_string),
+            buffer_seconds: None,
+            buffer_segments: None,
         };
 
         {
             let mut guard = self.playback_now.lock().await;
             *guard = now;
         }
+
+        self.refresh_buffer_status().await;
+        self.maybe_cleanup_live_files(false).await.ok();
 
         eprintln!(
             "TROOZN_LIVE_SEGMENT_SERVED item={} segment={} file={}",
@@ -1835,6 +2241,7 @@ impl TrooznLive {
     }
 
     pub async fn current_now(&self) -> TrooznLiveNow {
+        self.refresh_buffer_status().await;
         let playback = self.playback_now.lock().await.clone();
 
         if playback.state == "playing" && playback.index > 0 {
@@ -1845,6 +2252,7 @@ impl TrooznLive {
     }
 
     pub async fn producer_now(&self) -> TrooznLiveNow {
+        self.refresh_buffer_status().await;
         self.producer_now.lock().await.clone()
     }
 
@@ -1927,15 +2335,76 @@ fn parse_item_segment_name(relative: &str) -> Option<(usize, usize)> {
     Some((item_index, segment_number))
 }
 
+fn entry_duration_seconds(entry: &MasterEntry) -> f64 {
+    entry
+        .duration
+        .parse::<f64>()
+        .unwrap_or_else(|_| HLS_SEGMENT_SECONDS.parse::<f64>().unwrap_or(2.0).max(1.0))
+}
+
+fn file_age_seconds(modified: std::time::SystemTime) -> u64 {
+    SystemTime::now()
+        .duration_since(modified)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+async fn remove_live_file(path: &Path) -> Option<u64> {
+    let bytes = fs::metadata(path).await.map(|meta| meta.len()).unwrap_or(0);
+
+    match fs::remove_file(path).await {
+        Ok(_) => {
+            eprintln!(
+                "TROOZN_LIVE_CLEANUP_REMOVE file={} bytes={}",
+                path.display(),
+                bytes
+            );
+            Some(bytes)
+        }
+        Err(err) => {
+            eprintln!(
+                "TROOZN_LIVE_CLEANUP_REMOVE_FAILED file={} state={err:?}",
+                path.display()
+            );
+            None
+        }
+    }
+}
+
+async fn write_text_atomic(path: &Path, content: String) -> anyhow::Result<()> {
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| "playlist.m3u8".to_string());
+    let tmp_path =
+        path.with_file_name(format!("{file_name}.{}.{}.tmp", std::process::id(), suffix));
+
+    fs::write(&tmp_path, content).await?;
+
+    if let Err(err) = fs::rename(&tmp_path, path).await {
+        fs::remove_file(&tmp_path).await.ok();
+        return Err(err.into());
+    }
+
+    Ok(())
+}
+
 async fn write_empty_master_playlist(index_path: &Path) -> anyhow::Result<()> {
-    let content = "\
+    let target_duration = HLS_SEGMENT_SECONDS.parse::<u64>().unwrap_or(2).max(2);
+    let content = format!(
+        "\
 #EXTM3U
 #EXT-X-VERSION:3
-#EXT-X-TARGETDURATION:4
+#EXT-X-TARGETDURATION:{target_duration}
 #EXT-X-MEDIA-SEQUENCE:0
-";
+"
+    );
 
-    fs::write(index_path, content).await?;
+    write_text_atomic(index_path, content).await?;
     Ok(())
 }
 
@@ -2645,10 +3114,11 @@ fn add_ytdlp_cookies_if_available(_cmd: &mut Command) {
 
 fn best_youtube_fast_format_from_list_formats(text: &str) -> Option<&'static str> {
     // Formats autorisés, dans l'ordre de préférence :
+    // 96 = 1080p HLS
     // 95 = 720p HLS
     // 94 = 480p HLS
     // 22 = 720p MP4 progressif
-    let allowed = ["22", "95", "94"];
+    let allowed = ["96", "22", "95", "94"];
 
     for wanted in allowed {
         for line in text.lines() {
@@ -2867,8 +3337,12 @@ fn best_dash_av_format_from_list_formats(text: &str) -> Option<&'static str> {
         })
     };
 
-    // Profil Radxa stable : 720p DASH puis 480p DASH.
-    // On évite 137+140/1080p pour que le producer reste en avance.
+    // Profil Radxa : 1080p H.264 si disponible, puis 720p, puis 480p.
+    // La vidéo est copiée, le Radxa décodera via l'accélération matérielle Kodi.
+    if has("137") && has("140") {
+        return Some("137+140");
+    }
+
     if has("136") && has("140") {
         return Some("136+140");
     }
@@ -2957,6 +3431,15 @@ async fn resolve_youtube_separate_av_with_format(
 }
 
 async fn resolve_media_input(source_url: &str) -> anyhow::Result<ResolvedMediaInput> {
+    if let Some(input) = direct_media_input(source_url).await {
+        eprintln!(
+            "TROOZN_LIVE_DIRECT_MEDIA_INPUT type={} url={}",
+            media_type_for_input(&input),
+            source_url
+        );
+        return Ok(input);
+    }
+
     if is_youtube_url(source_url) {
         return resolve_youtube_media_input(source_url).await;
     }
@@ -2965,7 +3448,7 @@ async fn resolve_media_input(source_url: &str) -> anyhow::Result<ResolvedMediaIn
 }
 
 async fn resolve_youtube_media_input(source_url: &str) -> anyhow::Result<ResolvedMediaInput> {
-    match resolve_youtube_720_url(source_url).await {
+    match resolve_youtube_preferred_single_url(source_url).await {
         Ok(url) => {
             return Ok(ResolvedMediaInput::Single {
                 url,
@@ -3040,10 +3523,26 @@ async fn resolve_generic_media_input(source_url: &str) -> anyhow::Result<Resolve
         }
     }
 
+    match resolve_urls_with_format(source_url, YTDLP_GENERIC_AUDIO_FORMAT, 35).await {
+        Ok(urls) if !urls.is_empty() => {
+            return Ok(ResolvedMediaInput::AudioOnly {
+                url: urls[0].clone(),
+                format_selector: YTDLP_GENERIC_AUDIO_FORMAT.to_string(),
+            });
+        }
+        Ok(_) => {}
+        Err(err) => {
+            eprintln!(
+                "TROOZN_LIVE_GENERIC_AUDIO_INPUT_FAIL url={} state={err:?}",
+                source_url
+            );
+        }
+    }
+
     anyhow::bail!("aucun format yt-dlp exploitable trouvé pour ce lien")
 }
 
-async fn resolve_youtube_720_url(source_url: &str) -> anyhow::Result<String> {
+async fn resolve_youtube_preferred_single_url(source_url: &str) -> anyhow::Result<String> {
     let mut last_error = String::new();
 
     match resolve_youtube_url_with_format(source_url, YTDLP_YOUTUBE_FAST_FORMAT).await {
@@ -3065,7 +3564,7 @@ async fn resolve_youtube_720_url(source_url: &str) -> anyhow::Result<String> {
     }
 
     // 2) Si yt-dlp a dit format indisponible, on vérifie les formats réels.
-    // Certains appels -g sont intermittents alors que --list-formats voit bien 95/94/22.
+    // Certains appels -g sont intermittents alors que --list-formats voit bien 96/22/95/94.
     let list_text = match ytdlp_list_formats_text(source_url).await {
         Ok(text) => text,
         Err(err) => {
@@ -3085,14 +3584,14 @@ async fn resolve_youtube_720_url(source_url: &str) -> anyhow::Result<String> {
                 let first = line.split_whitespace().next().unwrap_or("");
                 matches!(
                     first,
-                    "95" | "94" | "93" | "22" | "18" | "137" | "136" | "135" | "134" | "140"
+                    "96" | "95" | "94" | "93" | "22" | "18" | "137" | "136" | "135" | "134" | "140"
                 )
             })
             .collect::<Vec<_>>()
             .join(" | ");
 
         anyhow::bail!(
-            "yt-dlp a échoué: aucun format YouTube rapide 95/94/22 trouvé. premier_error={} formats_detectes={}",
+            "yt-dlp a échoué: aucun format YouTube rapide 96/22/95/94 trouvé. premier_error={} formats_detectes={}",
             last_error,
             interesting_formats
         );
@@ -3157,12 +3656,23 @@ pub async fn troozn_live_health() -> impl IntoResponse {
         "mode": "hls",
         "yt_dlp_bin": YTDLP_BIN,
         "target_format": YTDLP_YOUTUBE_FAST_FORMAT,
+        "preferred_video_height": PREFERRED_VIDEO_HEIGHT,
+        "fallback_video_height": FALLBACK_VIDEO_HEIGHT,
+        "minimum_selected_video_height": MIN_SELECTED_VIDEO_HEIGHT,
         "youtube_dash_fallback": YTDLP_YOUTUBE_DASH_FORMAT,
         "generic_single_format": YTDLP_GENERIC_SINGLE_FORMAT,
         "generic_separate_format": YTDLP_GENERIC_SEPARATE_FORMAT,
+        "generic_audio_format": YTDLP_GENERIC_AUDIO_FORMAT,
+        "hls_segment_seconds": HLS_SEGMENT_SECONDS,
+        "live_max_dir_bytes": LIVE_MAX_DIR_BYTES,
+        "live_target_dir_bytes": LIVE_TARGET_DIR_BYTES,
+        "live_keep_behind_seconds": LIVE_KEEP_BEHIND_SECONDS,
+        "live_pressure_keep_behind_seconds": LIVE_PRESSURE_KEEP_BEHIND_SECONDS,
+        "live_max_producer_ahead_seconds": LIVE_MAX_PRODUCER_AHEAD_SECONDS,
+        "dynamic_playlist_names": true,
         "actual_resolution": null,
         "note": "La résolution réelle est celle du flux choisi par yt-dlp puis décodé par Kodi.",
-        "hls_url": PUBLIC_HLS_URL
+        "hls_url": DEFAULT_PUBLIC_HLS_URL
     }))
 }
 
@@ -3263,11 +3773,12 @@ pub async fn troozn_live_file(
     AxumPath(path): AxumPath<String>,
 ) -> Response {
     let requested = path.trim_start_matches('/');
+    let current_playlist_name = state.live.current_playlist_name().await;
 
     let relative = match requested {
         "" => "index.m3u8",
         "index.m3u8" => "index.m3u8",
-        "playlist-youtube.m3u8" => "index.m3u8",
+        other if is_public_playlist_alias(other, &current_playlist_name) => "index.m3u8",
         other => other,
     };
 
