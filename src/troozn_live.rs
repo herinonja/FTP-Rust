@@ -3813,14 +3813,27 @@ async fn resolve_youtube_preferred_single_url(source_url: &str) -> anyhow::Resul
 }
 
 async fn add_ytdlp_common_args(cmd: &mut Command) {
-    if Path::new("/home/troozn/.deno/bin/deno").exists() {
-        cmd.args([
-            "--js-runtimes",
-            "deno:/home/troozn/.deno/bin/deno",
-            "--remote-components",
-            "ejs:github",
-        ]);
+    let deno_enabled = std::env::var("TROOZN_YTDLP_USE_DENO")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false);
+
+    if !deno_enabled {
+        return;
     }
+
+    if !Path::new("/home/troozn/.deno/bin/deno").exists() {
+        eprintln!("TROOZN_LIVE_YTDLP_DENO_SKIP reason=missing_deno_bin");
+        return;
+    }
+
+    eprintln!("TROOZN_LIVE_YTDLP_DENO_ENABLED");
+
+    cmd.args([
+        "--js-runtimes",
+        "deno:/home/troozn/.deno/bin/deno",
+        "--remote-components",
+        "ejs:github",
+    ]);
 }
 
 fn item_id_for_url(url: &str) -> String {
