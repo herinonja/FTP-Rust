@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -20,7 +21,7 @@ use tokio::time::{sleep, timeout, Duration};
 use crate::HttpGatewayState;
 
 const LIVE_DIR: &str = "/home/troozn/.kodi/userdata/TROOZN/live";
-const TROOZN_LIVE_BUILD_TAG: &str = "v2.7-ytdlp-process-group-serial-2026-06-02";
+const TROOZN_LIVE_BUILD_TAG: &str = "v2.8-startup-boost-continuity-2026-06-03";
 
 const YTDLP_BIN: &str = "/home/troozn/.local/bin/yt-dlp";
 const LIVE_MAX_DIR_BYTES: u64 = 512 * 1024 * 1024;
@@ -42,11 +43,13 @@ const PREWARM_CACHE_WAIT_STEP_MS: u64 = 300;
 const PLAYLIST_ACTIVE_SCAN_EXTRA: usize = 6;
 const PLAYLIST_ACTIVE_SCAN_MAX: usize = 26;
 const PLAYLIST_INITIAL_ACTIVE_TARGET: usize = 2;
-const YOUTUBE_QUICK_VALIDATE_CONCURRENCY: usize = 1;
+const YOUTUBE_QUICK_VALIDATE_CONCURRENCY: usize = 2;
 const YOUTUBE_QUICK_VALIDATE_BATCH_PAUSE_MS: u64 = 250;
 const YOUTUBE_QUICK_VALIDATE_TIMEOUT_SECONDS: u64 = 4;
-const YTDLP_MAX_PARALLEL_PROCESSES: usize = 1;
+const YTDLP_MAX_PARALLEL_PROCESSES: usize = 2;
 const YTDLP_SLOT_WAIT_TIMEOUT_SECONDS: u64 = 20;
+const STARTUP_BOOST_PREPARE_THROUGH_ITEM_INDEX: usize = 2;
+const STARTUP_BOOST_SINGLE_ITEM_READY_SEGMENTS: usize = 3;
 const YTDLP_PLAYLIST_EXTRACT_TIMEOUT_SECONDS: u64 = 30;
 const YTDLP_YOUTUBE_FAST_RESOLVE_TIMEOUT_SECONDS: u64 = 12;
 const YTDLP_YOUTUBE_DASH_RESOLVE_TIMEOUT_SECONDS: u64 = 14;
@@ -250,14 +253,61 @@ fn ytdlp_semaphore() -> &'static Semaphore {
     YTDLP_SEMAPHORE.get_or_init(|| Semaphore::new(YTDLP_MAX_PARALLEL_PROCESSES))
 }
 
-async fn acquire_ytdlp_slot(label: &'static str) -> anyhow::Result<SemaphorePermit<'static>> {
-    timeout(
+fn ytdlp_serial_mutex() -> &'static Mutex<()> {
+    static YTDLP_SERIAL_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+
+    YTDLP_SERIAL_MUTEX.get_or_init(|| Mutex::new(()))
+}
+
+fn ytdlp_startup_boost() -> &'static AtomicBool {
+    static YTDLP_STARTUP_BOOST: AtomicBool = AtomicBool::new(false);
+
+    &YTDLP_STARTUP_BOOST
+}
+
+fn ytdlp_startup_boost_active() -> bool {
+    ytdlp_startup_boost().load(Ordering::Relaxed)
+}
+
+fn set_ytdlp_startup_boost(active: bool, reason: &str) {
+    let previous = ytdlp_startup_boost().swap(active, Ordering::Relaxed);
+
+    if previous != active {
+        eprintln!("TROOZN_LIVE_YTDLP_BOOST active={active} reason={reason}");
+    }
+}
+
+struct YtdlpSlot {
+    _serial_guard: Option<tokio::sync::MutexGuard<'static, ()>>,
+    _permit: SemaphorePermit<'static>,
+}
+
+async fn acquire_ytdlp_slot(label: &'static str) -> anyhow::Result<YtdlpSlot> {
+    let serial_guard = if ytdlp_startup_boost_active() {
+        None
+    } else {
+        Some(
+            timeout(
+                Duration::from_secs(YTDLP_SLOT_WAIT_TIMEOUT_SECONDS),
+                ytdlp_serial_mutex().lock(),
+            )
+            .await
+            .with_context(|| format!("timeout attente série {label}"))?,
+        )
+    };
+
+    let permit = timeout(
         Duration::from_secs(YTDLP_SLOT_WAIT_TIMEOUT_SECONDS),
         ytdlp_semaphore().acquire(),
     )
     .await
     .with_context(|| format!("timeout attente slot {label}"))?
-    .with_context(|| format!("acquisition slot {label}"))
+    .with_context(|| format!("acquisition slot {label}"))?;
+
+    Ok(YtdlpSlot {
+        _serial_guard: serial_guard,
+        _permit: permit,
+    })
 }
 
 async fn run_ytdlp_output(
@@ -1164,6 +1214,7 @@ impl TrooznLive {
         limit: usize,
     ) -> anyhow::Result<TrooznLiveSubmitResponse> {
         self.stop_current_ffmpeg().await;
+        set_ytdlp_startup_boost(true, "session-start");
 
         self.bump_generation().await;
         {
@@ -1782,6 +1833,8 @@ impl TrooznLive {
                     self.rewrite_master_playlist(false).await.ok();
                     self.refresh_buffer_status().await;
                     self.maybe_cleanup_live_files(false).await.ok();
+                    self.maybe_finish_startup_boost(item.index, imported_segments)
+                        .await;
 
                     if !prewarm_started {
                         prewarm_started = true;
@@ -1931,6 +1984,14 @@ impl TrooznLive {
     }
 
     async fn wait_until_future_buffer_needed(&self, next_item_index: usize) {
+        if next_item_index <= STARTUP_BOOST_PREPARE_THROUGH_ITEM_INDEX {
+            eprintln!(
+                "TROOZN_LIVE_PRODUCER_WAIT_SKIP_STARTUP next_item={} prepare_through={}",
+                next_item_index, STARTUP_BOOST_PREPARE_THROUGH_ITEM_INDEX
+            );
+            return;
+        }
+
         let started = unix_timestamp();
 
         loop {
@@ -1976,6 +2037,33 @@ impl TrooznLive {
                 return;
             }
         }
+    }
+
+    async fn maybe_finish_startup_boost(&self, item_index: usize, imported_segments: usize) {
+        if !ytdlp_startup_boost_active() {
+            return;
+        }
+
+        let queue_len = self.queue.lock().await.len();
+        let playlist_ready =
+            queue_len > 1 && item_index >= STARTUP_BOOST_PREPARE_THROUGH_ITEM_INDEX;
+        let single_ready =
+            queue_len <= 1 && imported_segments >= STARTUP_BOOST_SINGLE_ITEM_READY_SEGMENTS;
+
+        if !playlist_ready && !single_ready {
+            return;
+        }
+
+        set_ytdlp_startup_boost(false, "initial-continuity-ready");
+
+        live_audit(
+            &self.root_dir,
+            format!(
+                "BOOST_END item={} imported_segments={} queue_len={} reason=initial-continuity-ready",
+                item_index, imported_segments, queue_len
+            ),
+        )
+        .await;
     }
 
     async fn import_item_manifest_incremental(
