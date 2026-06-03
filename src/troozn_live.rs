@@ -2379,36 +2379,38 @@ impl TrooznLive {
         &self,
         keep_behind_seconds: f64,
     ) -> anyhow::Result<CleanupStats> {
-        let Some((served_item, served_segment)) = *self.last_served_segment.lock().await else {
+        let Some((served_item, _served_segment)) = *self.last_served_segment.lock().await else {
             return Ok(CleanupStats::default());
         };
 
         let (removed, remaining_items) = {
             let mut entries = self.master_entries.lock().await;
 
-            let Some(served_pos) = entries.iter().position(|entry| {
-                parse_item_segment_name(&entry.segment)
-                    .map(|(item, segment)| item == served_item && segment == served_segment)
-                    .unwrap_or(false)
-            }) else {
+            // Important :
+            // Ne jamais supprimer des segments de l'item actuellement servi.
+            // Kodi peut relire/recharger le master HLS pendant la lecture.
+            // Si la fenêtre glisse à l'intérieur du même item, on observe :
+            // - position erronée
+            // - petites séquences qui se répètent
+            //
+            // On ne nettoie donc que les items précédents.
+            let Some(current_item_first_pos) = entries
+                .iter()
+                .position(|entry| entry.item_index == served_item)
+            else {
                 return Ok(CleanupStats::default());
             };
 
-            // Nettoyage intelligent :
-            // garder seulement une fenêtre temporelle derrière le dernier segment
-            // réellement servi par Kodi, même si on est encore dans le même long item.
-            //
-            // Exemple :
-            // - item long de 2h
-            // - Kodi vient de demander item-0001-00400.ts
-            // - on garde ~75s derrière
-            // - on peut supprimer item-0001-00000.ts ... anciens segments déjà servis
-            //
-            // On garde toujours le segment servi et tout ce qui est après.
-            let mut keep_from = served_pos;
+            if current_item_first_pos == 0 {
+                return Ok(CleanupStats::default());
+            }
+
+            // Garder une petite marge temporelle derrière l'item courant,
+            // mais uniquement dans les items précédents.
+            let mut keep_from = current_item_first_pos;
             let mut retained_seconds = 0.0_f64;
 
-            for idx in (0..served_pos).rev() {
+            for idx in (0..current_item_first_pos).rev() {
                 retained_seconds += entry_duration_seconds(&entries[idx]);
                 keep_from = idx;
 
@@ -2469,8 +2471,7 @@ impl TrooznLive {
             }
         }
 
-        // Supprimer le manifest item-XXXX.m3u8 uniquement si l'item entier
-        // n'a plus aucun segment référencé dans le master.
+        // Supprimer item-XXXX.m3u8 seulement si l'item entier n'est plus référencé.
         for item_index in removed_items {
             if remaining_items.contains(&item_index) {
                 continue;
@@ -2674,18 +2675,36 @@ impl TrooznLive {
         let entries = self.master_entries.lock().await.clone();
 
         let mut position_f64 = 0.0_f64;
+        let mut found_segment = false;
 
         for entry in entries
             .iter()
             .filter(|entry| entry.item_index == item_index)
         {
             if entry.segment == relative {
+                found_segment = true;
                 break;
             }
 
             if let Ok(d) = entry.duration.parse::<f64>() {
                 position_f64 += d;
             }
+        }
+
+        if !found_segment {
+            let segment_seconds = HLS_SEGMENT_SECONDS
+                .parse::<f64>()
+                .unwrap_or(2.0)
+                .max(1.0);
+
+            position_f64 = segment_number as f64 * segment_seconds;
+
+            eprintln!(
+                "TROOZN_LIVE_POSITION_FALLBACK item={} segment={} estimated_position={:.1}",
+                item_index,
+                segment_number,
+                position_f64
+            );
         }
 
         let next_title = queue
