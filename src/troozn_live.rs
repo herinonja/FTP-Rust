@@ -66,6 +66,9 @@ const MIN_SELECTED_VIDEO_HEIGHT: u64 = 480;
 const PUBLIC_HLS_BASE_URL: &str = "http://127.0.0.1:8787/troozn-live";
 const DEFAULT_PLAYLIST_NAME: &str = "Playlist_Troozn.m3u8";
 const DEFAULT_PUBLIC_HLS_URL: &str = "http://127.0.0.1:8787/troozn-live/Playlist_Troozn.m3u8";
+const KODI_JSONRPC_URL: &str = "http://127.0.0.1:8080/jsonrpc";
+const TROOZN_LIVE_NOW_URL: &str = "http://127.0.0.1:8787/troozn-live/now";
+
 
 const YTDLP_COOKIES_FILE: &str = "/home/troozn/.config/troozn/youtube-cookies.txt";
 const YTDLP_YOUTUBE_FAST_FORMAT: &str = "96/22/95/94";
@@ -690,6 +693,157 @@ fn playlist_title_from_name(playlist_name: &str) -> String {
         .replace('_', " ");
 
     format!("Playlist {label}")
+}
+
+
+async fn curl_json_post(url: &str, body: &str) -> anyhow::Result<Value> {
+    let output = timeout(
+        Duration::from_secs(4),
+        Command::new("curl")
+            .args([
+                "-fsS",
+                "-H",
+                "Content-Type: application/json",
+                "-d",
+                body,
+                url,
+            ])
+            .output(),
+    )
+    .await
+    .context("timeout curl json post")?
+    .context("spawn curl json post")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("curl json post failed: {}", stderr.trim());
+    }
+
+    serde_json::from_slice(&output.stdout).context("parse curl json post response")
+}
+
+async fn curl_json_get(url: &str) -> anyhow::Result<Value> {
+    let output = timeout(
+        Duration::from_secs(4),
+        Command::new("curl").args(["-fsS", url]).output(),
+    )
+    .await
+    .context("timeout curl json get")?
+    .context("spawn curl json get")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("curl json get failed: {}", stderr.trim());
+    }
+
+    serde_json::from_slice(&output.stdout).context("parse curl json get response")
+}
+
+async fn kodi_active_player_id() -> anyhow::Result<Option<i64>> {
+    let response = curl_json_post(
+        KODI_JSONRPC_URL,
+        r#"{"jsonrpc":"2.0","id":1,"method":"Player.GetActivePlayers"}"#,
+    )
+    .await?;
+
+    Ok(response
+        .get("result")
+        .and_then(Value::as_array)
+        .and_then(|players| players.first())
+        .and_then(|player| player.get("playerid"))
+        .and_then(Value::as_i64))
+}
+
+async fn kodi_player_stop(reason: &str) -> anyhow::Result<()> {
+    let Some(player_id) = kodi_active_player_id().await? else {
+        eprintln!("TROOZN_LIVE_KODI_STOP_SKIP reason={} state=no-active-player", reason);
+        return Ok(());
+    };
+
+    let body = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "Player.Stop",
+        "params": {
+            "playerid": player_id
+        }
+    })
+    .to_string();
+
+    let _ = curl_json_post(KODI_JSONRPC_URL, &body).await?;
+
+    eprintln!(
+        "TROOZN_LIVE_KODI_STOP_DONE reason={} playerid={}",
+        reason,
+        player_id
+    );
+
+    Ok(())
+}
+
+fn now_matches_final_item(now: &Value, item_index: usize) -> bool {
+    let state_ok = now
+        .get("state")
+        .and_then(Value::as_str)
+        .map(|state| state == "playing")
+        .unwrap_or(false);
+
+    let index_ok = now
+        .get("index")
+        .and_then(Value::as_u64)
+        .map(|index| index as usize == item_index)
+        .unwrap_or(false);
+
+    let no_next = now.get("next_title").map(Value::is_null).unwrap_or(true);
+
+    state_ok && index_ok && no_next
+}
+
+fn schedule_kodi_stop_after_final_segment(
+    item_index: usize,
+    segment_number: usize,
+    delay_seconds: u64,
+) {
+    tokio::spawn(async move {
+        eprintln!(
+            "TROOZN_LIVE_KODI_STOP_ARMED item={} segment={} delay={}s",
+            item_index,
+            segment_number,
+            delay_seconds
+        );
+
+        sleep(Duration::from_secs(delay_seconds)).await;
+
+        let now = match curl_json_get(TROOZN_LIVE_NOW_URL).await {
+            Ok(now) => now,
+            Err(err) => {
+                eprintln!(
+                    "TROOZN_LIVE_KODI_STOP_CANCEL item={} segment={} reason=now-error state={err:?}",
+                    item_index,
+                    segment_number
+                );
+                return;
+            }
+        };
+
+        if !now_matches_final_item(&now, item_index) {
+            eprintln!(
+                "TROOZN_LIVE_KODI_STOP_CANCEL item={} segment={} reason=state-changed now={}",
+                item_index,
+                segment_number,
+                now
+            );
+            return;
+        }
+
+        if let Err(err) = kodi_player_stop("last-prepared-item-ended").await {
+            eprintln!(
+                "TROOZN_LIVE_KODI_STOP_ERROR item={} segment={} state={err:?}",
+                item_index,
+                segment_number
+            );
+        }
+    });
 }
 
 impl TrooznLive {
@@ -2240,14 +2394,21 @@ impl TrooznLive {
                 return Ok(CleanupStats::default());
             };
 
-            let current_item_first_pos = entries
-                .iter()
-                .position(|entry| entry.item_index == served_item)
-                .unwrap_or(served_pos);
-            let mut keep_from = current_item_first_pos;
+            // Nettoyage intelligent :
+            // garder seulement une fenêtre temporelle derrière le dernier segment
+            // réellement servi par Kodi, même si on est encore dans le même long item.
+            //
+            // Exemple :
+            // - item long de 2h
+            // - Kodi vient de demander item-0001-00400.ts
+            // - on garde ~75s derrière
+            // - on peut supprimer item-0001-00000.ts ... anciens segments déjà servis
+            //
+            // On garde toujours le segment servi et tout ce qui est après.
+            let mut keep_from = served_pos;
             let mut retained_seconds = 0.0_f64;
 
-            for idx in (0..current_item_first_pos).rev() {
+            for idx in (0..served_pos).rev() {
                 retained_seconds += entry_duration_seconds(&entries[idx]);
                 keep_from = idx;
 
@@ -2261,6 +2422,7 @@ impl TrooznLive {
             }
 
             let removed = entries.drain(0..keep_from).collect::<Vec<_>>();
+
             let remaining_items = entries
                 .iter()
                 .map(|entry| entry.item_index)
@@ -2283,6 +2445,7 @@ impl TrooznLive {
                 .iter()
                 .filter(|entry| entry.discontinuity_before)
                 .count() as u64;
+
             let mut discontinuity_sequence = self.discontinuity_sequence_base.lock().await;
             *discontinuity_sequence =
                 discontinuity_sequence.saturating_add(removed_discontinuities);
@@ -2292,11 +2455,13 @@ impl TrooznLive {
             removed_playlist_entries: removed.len(),
             ..Default::default()
         };
+
         let mut removed_items = HashSet::new();
 
         for entry in removed {
             removed_items.insert(entry.item_index);
-            let path = self.root_dir.join(entry.segment);
+
+            let path = self.root_dir.join(&entry.segment);
 
             if let Some(bytes) = remove_live_file(&path).await {
                 stats.removed_files += 1;
@@ -2304,6 +2469,8 @@ impl TrooznLive {
             }
         }
 
+        // Supprimer le manifest item-XXXX.m3u8 uniquement si l'item entier
+        // n'a plus aucun segment référencé dans le master.
         for item_index in removed_items {
             if remaining_items.contains(&item_index) {
                 continue;
@@ -2559,6 +2726,33 @@ impl TrooznLive {
 
         self.refresh_buffer_status().await;
         self.maybe_cleanup_live_files(false).await.ok();
+
+        let ffmpeg_idle = self.ffmpeg_child.lock().await.is_none();
+
+        let is_last_known_segment = entries
+            .iter()
+            .filter(|entry| entry.item_index == item_index)
+            .last()
+            .map(|entry| entry.segment == relative)
+            .unwrap_or(false);
+
+        let has_no_next_item = queue.iter().all(|candidate| candidate.index <= item.index);
+
+        if ffmpeg_idle && is_last_known_segment && has_no_next_item {
+            let last_segment_duration = entries
+                .iter()
+                .find(|entry| entry.item_index == item_index && entry.segment == relative)
+                .and_then(|entry| entry.duration.parse::<f64>().ok())
+                .unwrap_or_else(|| HLS_SEGMENT_SECONDS.parse::<f64>().unwrap_or(2.0));
+
+            let delay_seconds = last_segment_duration.ceil() as u64 + 2;
+
+            schedule_kodi_stop_after_final_segment(
+                item_index,
+                segment_number,
+                delay_seconds.max(3),
+            );
+        }
 
         eprintln!(
             "TROOZN_LIVE_SEGMENT_SERVED item={} segment={} file={}",
