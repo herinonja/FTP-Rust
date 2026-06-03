@@ -20,7 +20,7 @@ use tokio::time::{sleep, timeout, Duration};
 use crate::HttpGatewayState;
 
 const LIVE_DIR: &str = "/home/troozn/.kodi/userdata/TROOZN/live";
-const TROOZN_LIVE_BUILD_TAG: &str = "v2.6-ytdlp-deno-fallback-2026-06-02";
+const TROOZN_LIVE_BUILD_TAG: &str = "v2.7-ytdlp-process-group-serial-2026-06-02";
 
 const YTDLP_BIN: &str = "/home/troozn/.local/bin/yt-dlp";
 const LIVE_MAX_DIR_BYTES: u64 = 512 * 1024 * 1024;
@@ -42,10 +42,10 @@ const PREWARM_CACHE_WAIT_STEP_MS: u64 = 300;
 const PLAYLIST_ACTIVE_SCAN_EXTRA: usize = 6;
 const PLAYLIST_ACTIVE_SCAN_MAX: usize = 26;
 const PLAYLIST_INITIAL_ACTIVE_TARGET: usize = 2;
-const YOUTUBE_QUICK_VALIDATE_CONCURRENCY: usize = 2;
+const YOUTUBE_QUICK_VALIDATE_CONCURRENCY: usize = 1;
 const YOUTUBE_QUICK_VALIDATE_BATCH_PAUSE_MS: u64 = 250;
 const YOUTUBE_QUICK_VALIDATE_TIMEOUT_SECONDS: u64 = 4;
-const YTDLP_MAX_PARALLEL_PROCESSES: usize = 2;
+const YTDLP_MAX_PARALLEL_PROCESSES: usize = 1;
 const YTDLP_SLOT_WAIT_TIMEOUT_SECONDS: u64 = 20;
 const YTDLP_PLAYLIST_EXTRACT_TIMEOUT_SECONDS: u64 = 30;
 const YTDLP_YOUTUBE_FAST_RESOLVE_TIMEOUT_SECONDS: u64 = 12;
@@ -267,11 +267,54 @@ async fn run_ytdlp_output(
 ) -> anyhow::Result<std::process::Output> {
     let _permit = acquire_ytdlp_slot(label).await?;
     cmd.kill_on_drop(true);
+    cmd.process_group(0);
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
 
-    timeout(Duration::from_secs(timeout_seconds), cmd.output())
+    let child = cmd.spawn().with_context(|| format!("spawn {label}"))?;
+    let process_group_id = child.id();
+
+    match timeout(
+        Duration::from_secs(timeout_seconds),
+        child.wait_with_output(),
+    )
+    .await
+    {
+        Ok(result) => result.with_context(|| format!("wait {label}")),
+        Err(_) => {
+            if let Some(pid) = process_group_id {
+                terminate_process_group(pid, label).await;
+            }
+
+            anyhow::bail!("timeout {label}");
+        }
+    }
+}
+
+async fn terminate_process_group(pid: u32, label: &'static str) {
+    let group = format!("-{pid}");
+
+    eprintln!("TROOZN_LIVE_YTDLP_KILL_GROUP signal=TERM label={label} pgid={pid}");
+
+    Command::new("kill")
+        .args(["-TERM", &group])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
         .await
-        .with_context(|| format!("timeout {label}"))?
-        .with_context(|| format!("spawn {label}"))
+        .ok();
+
+    sleep(Duration::from_millis(350)).await;
+
+    eprintln!("TROOZN_LIVE_YTDLP_KILL_GROUP signal=KILL label={label} pgid={pid}");
+
+    Command::new("kill")
+        .args(["-KILL", &group])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await
+        .ok();
 }
 
 fn parse_item_index_from_live_filename(name: &str) -> Option<usize> {
@@ -1133,6 +1176,15 @@ impl TrooznLive {
         let playlist_name = self.set_playlist_name_for_source(source_url).await;
         let default_title = playlist_title_from_name(&playlist_name);
         let public_hls_url = self.current_public_hls_url().await;
+
+        live_audit(
+            &self.root_dir,
+            format!(
+                "SESSION_START build_tag={} source_url={} playlist_name={}",
+                TROOZN_LIVE_BUILD_TAG, source_url, playlist_name
+            ),
+        )
+        .await;
 
         {
             let mut anchor = self.playback_anchor_item.lock().await;
