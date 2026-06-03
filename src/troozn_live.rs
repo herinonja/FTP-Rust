@@ -21,7 +21,7 @@ use tokio::time::{sleep, timeout, Duration};
 use crate::HttpGatewayState;
 
 const LIVE_DIR: &str = "/home/troozn/.kodi/userdata/TROOZN/live";
-const TROOZN_LIVE_BUILD_TAG: &str = "v2.9-deno-json-resolve-2026-06-03";
+const TROOZN_LIVE_BUILD_TAG: &str = "v3.0-hls-continuity-prewarm-2026-06-03";
 
 const YTDLP_BIN: &str = "/home/troozn/.local/bin/yt-dlp";
 const LIVE_MAX_DIR_BYTES: u64 = 512 * 1024 * 1024;
@@ -159,7 +159,6 @@ pub struct TrooznLiveItem {
 struct MasterEntry {
     item_index: usize,
     duration: String,
-    program_date_time: Option<String>,
     segment: String,
     discontinuity_before: bool,
 }
@@ -1313,6 +1312,15 @@ impl TrooznLive {
             *q = items.clone();
         }
 
+        if items.len() > 1 {
+            live_audit(
+                &self.root_dir,
+                "PREWARM_EARLY_START after_index=1 reason=startup-continuity".to_string(),
+            )
+            .await;
+            self.clone().spawn_prewarm_after(1).await;
+        }
+
         let now = TrooznLiveNow {
             state: "starting".to_string(),
             title: title.unwrap_or(default_title),
@@ -1759,7 +1767,7 @@ impl TrooznLive {
                 "-hls_list_size",
                 "0",
                 "-hls_flags",
-                "omit_endlist+program_date_time+temp_file",
+                "omit_endlist+temp_file",
                 "-hls_segment_filename",
             ]);
 
@@ -1837,7 +1845,7 @@ impl TrooznLive {
                     self.maybe_finish_startup_boost(item.index, imported_segments)
                         .await;
 
-                    if !prewarm_started {
+                    if !prewarm_started && item.index >= STARTUP_BOOST_PREPARE_THROUGH_ITEM_INDEX {
                         prewarm_started = true;
                         self.clone().spawn_prewarm_after(item.index).await;
                     }
@@ -2046,8 +2054,9 @@ impl TrooznLive {
         }
 
         let queue_len = self.queue.lock().await.len();
-        let playlist_ready =
-            queue_len > 1 && item_index >= STARTUP_BOOST_PREPARE_THROUGH_ITEM_INDEX;
+        let playlist_ready = queue_len > 1
+            && item_index >= STARTUP_BOOST_PREPARE_THROUGH_ITEM_INDEX
+            && imported_segments >= STARTUP_BOOST_SINGLE_ITEM_READY_SEGMENTS;
         let single_ready =
             queue_len <= 1 && imported_segments >= STARTUP_BOOST_SINGLE_ITEM_READY_SEGMENTS;
 
@@ -2131,6 +2140,7 @@ impl TrooznLive {
 
         out.push_str("#EXTM3U\n");
         out.push_str("#EXT-X-VERSION:3\n");
+        out.push_str("#EXT-X-PLAYLIST-TYPE:EVENT\n");
         out.push_str(&format!("#EXT-X-TARGETDURATION:{}\n", target_duration));
         out.push_str(&format!("#EXT-X-MEDIA-SEQUENCE:{media_sequence}\n"));
         out.push_str(&format!(
@@ -2449,6 +2459,7 @@ impl TrooznLive {
         let mut out = String::new();
         out.push_str("#EXTM3U\n");
         out.push_str("#EXT-X-VERSION:3\n");
+        out.push_str("#EXT-X-PLAYLIST-TYPE:EVENT\n");
         out.push_str(&format!("#EXT-X-TARGETDURATION:{target_duration}\n"));
         out.push_str(&format!("#EXT-X-MEDIA-SEQUENCE:{media_sequence}\n"));
         out.push_str(&format!(
@@ -2464,10 +2475,6 @@ impl TrooznLive {
             }
 
             out.push_str(&format!("#EXTINF:{},\n", entry.duration));
-
-            if let Some(pdt) = entry.program_date_time {
-                out.push_str(&format!("#EXT-X-PROGRAM-DATE-TIME:{pdt}\n"));
-            }
 
             out.push_str(&entry.segment);
             out.push('\n');
@@ -2587,7 +2594,6 @@ fn parse_item_hls_entries(
     let mut out = Vec::new();
 
     let mut pending_duration: Option<String> = None;
-    let mut pending_program_date_time: Option<String> = None;
 
     for raw in content.lines() {
         let line = raw.trim();
@@ -2595,11 +2601,6 @@ fn parse_item_hls_entries(
         if let Some(rest) = line.strip_prefix("#EXTINF:") {
             let duration = rest.trim_end_matches(',').trim().to_string();
             pending_duration = Some(duration);
-            continue;
-        }
-
-        if let Some(rest) = line.strip_prefix("#EXT-X-PROGRAM-DATE-TIME:") {
-            pending_program_date_time = Some(rest.trim().to_string());
             continue;
         }
 
@@ -2619,12 +2620,10 @@ fn parse_item_hls_entries(
         let duration = pending_duration
             .take()
             .unwrap_or_else(|| "4.000000".to_string());
-        let program_date_time = pending_program_date_time.take();
 
         out.push(MasterEntry {
             item_index,
             duration,
-            program_date_time,
             segment: segment_name,
             discontinuity_before: has_previous_item && out.is_empty(),
         });
@@ -2717,6 +2716,7 @@ async fn write_empty_master_playlist(index_path: &Path) -> anyhow::Result<()> {
         "\
 #EXTM3U
 #EXT-X-VERSION:3
+#EXT-X-PLAYLIST-TYPE:EVENT
 #EXT-X-TARGETDURATION:{target_duration}
 #EXT-X-MEDIA-SEQUENCE:0
 #EXT-X-START:TIME-OFFSET=0,PRECISE=YES
