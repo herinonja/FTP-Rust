@@ -21,7 +21,7 @@ use tokio::time::{sleep, timeout, Duration};
 use crate::HttpGatewayState;
 
 const LIVE_DIR: &str = "/home/troozn/.kodi/userdata/TROOZN/live";
-const TROOZN_LIVE_BUILD_TAG: &str = "v2.8-startup-boost-continuity-2026-06-03";
+const TROOZN_LIVE_BUILD_TAG: &str = "v2.9-deno-json-resolve-2026-06-03";
 
 const YTDLP_BIN: &str = "/home/troozn/.local/bin/yt-dlp";
 const LIVE_MAX_DIR_BYTES: u64 = 512 * 1024 * 1024;
@@ -38,7 +38,7 @@ const PLAYLIST_PAGE_SIZE: usize = 20;
 const PLAYLIST_REFILL_THRESHOLD: usize = 5;
 const MAX_ITEMS: usize = 20;
 const PREWARM_AHEAD_ITEMS: usize = 1;
-const PREWARM_CACHE_WAIT_MAX_MS: u64 = 12_000;
+const PREWARM_CACHE_WAIT_MAX_MS: u64 = 90_000;
 const PREWARM_CACHE_WAIT_STEP_MS: u64 = 300;
 const PLAYLIST_ACTIVE_SCAN_EXTRA: usize = 6;
 const PLAYLIST_ACTIVE_SCAN_MAX: usize = 26;
@@ -54,8 +54,9 @@ const YTDLP_PLAYLIST_EXTRACT_TIMEOUT_SECONDS: u64 = 30;
 const YTDLP_YOUTUBE_FAST_RESOLVE_TIMEOUT_SECONDS: u64 = 12;
 const YTDLP_YOUTUBE_DASH_RESOLVE_TIMEOUT_SECONDS: u64 = 14;
 const YTDLP_YOUTUBE_LIST_FORMATS_TIMEOUT_SECONDS: u64 = 15;
-const YTDLP_YOUTUBE_DENO_RESOLVE_TIMEOUT_SECONDS: u64 = 32;
-const YTDLP_YOUTUBE_DENO_LIST_FORMATS_TIMEOUT_SECONDS: u64 = 35;
+const YTDLP_YOUTUBE_DENO_RESOLVE_TIMEOUT_SECONDS: u64 = 45;
+const YTDLP_YOUTUBE_DENO_JSON_TIMEOUT_SECONDS: u64 = 60;
+const YTDLP_YOUTUBE_DENO_LIST_FORMATS_TIMEOUT_SECONDS: u64 = 45;
 const HLS_SEGMENT_SECONDS: &str = "2";
 const PREFERRED_VIDEO_HEIGHT: u64 = 1080;
 const FALLBACK_VIDEO_HEIGHT: u64 = 720;
@@ -3927,6 +3928,130 @@ fn best_dash_av_format_from_list_formats(text: &str) -> Option<&'static str> {
     None
 }
 
+fn youtube_json_format_url(root: &Value, format_id: &str) -> Option<String> {
+    let formats = root.get("formats").and_then(Value::as_array)?;
+
+    formats.iter().find_map(|format| {
+        let id = format.get("format_id").and_then(Value::as_str)?;
+
+        if id != format_id {
+            return None;
+        }
+
+        format
+            .get("url")
+            .and_then(Value::as_str)
+            .filter(|url| url.starts_with("http://") || url.starts_with("https://"))
+            .map(str::to_string)
+    })
+}
+
+fn best_youtube_json_single_url(root: &Value) -> Option<(&'static str, String)> {
+    for format_id in ["96", "22", "95", "94"] {
+        if let Some(url) = youtube_json_format_url(root, format_id) {
+            return Some((format_id, url));
+        }
+    }
+
+    None
+}
+
+fn best_youtube_json_dash_av(root: &Value) -> Option<(&'static str, String, String)> {
+    for (selector, video_id, audio_id) in [
+        ("137+140", "137", "140"),
+        ("136+140", "136", "140"),
+        ("135+140", "135", "140"),
+    ] {
+        let Some(video_url) = youtube_json_format_url(root, video_id) else {
+            continue;
+        };
+        let Some(audio_url) = youtube_json_format_url(root, audio_id) else {
+            continue;
+        };
+
+        return Some((selector, video_url, audio_url));
+    }
+
+    None
+}
+
+async fn resolve_youtube_from_json_with_deno(
+    source_url: &str,
+) -> anyhow::Result<ResolvedMediaInput> {
+    let mut cmd = Command::new(YTDLP_BIN);
+
+    add_ytdlp_cookies_if_available(&mut cmd);
+    add_ytdlp_deno_args_if_available(&mut cmd, "json-formats")?;
+
+    cmd.args([
+        "--no-playlist",
+        "--no-warnings",
+        "--force-ipv4",
+        "--socket-timeout",
+        "25",
+        "--retries",
+        "1",
+        "--fragment-retries",
+        "1",
+        "--skip-download",
+        "-J",
+        source_url,
+    ]);
+
+    eprintln!(
+        "TROOZN_LIVE_YTDLP_JSON_DENO_CMD bin={} url={}",
+        YTDLP_BIN, source_url
+    );
+
+    let output = run_ytdlp_output(
+        cmd,
+        "yt-dlp json deno",
+        YTDLP_YOUTUBE_DENO_JSON_TIMEOUT_SECONDS,
+    )
+    .await?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    if !output.status.success() {
+        anyhow::bail!(
+            "yt-dlp json deno failed: status={} stderr={} stdout={}",
+            output.status,
+            stderr.trim(),
+            stdout.trim()
+        );
+    }
+
+    let root: Value = serde_json::from_str(&stdout).context("parse yt-dlp json deno")?;
+
+    if let Some((format_id, url)) = best_youtube_json_single_url(&root) {
+        eprintln!(
+            "TROOZN_LIVE_YTDLP_JSON_PICK_SINGLE format={} url={}",
+            format_id, source_url
+        );
+
+        return Ok(ResolvedMediaInput::Single {
+            url,
+            format_selector: format_id.to_string(),
+        });
+    }
+
+    if let Some((selector, video_url, audio_url)) = best_youtube_json_dash_av(&root) {
+        eprintln!(
+            "TROOZN_LIVE_YTDLP_JSON_PICK_DASH format={} url={}",
+            selector, source_url
+        );
+
+        return Ok(ResolvedMediaInput::SeparateAv {
+            video_url,
+            audio_url,
+            format_selector: selector.to_string(),
+        });
+    }
+
+    anyhow::bail!("yt-dlp json deno OK mais aucun format 1080p/720p/480p exploitable")
+}
+
 async fn resolve_youtube_separate_av_with_format(
     source_url: &str,
     format_selector: &str,
@@ -4182,6 +4307,25 @@ async fn try_youtube_deno_resolution(
     }
 
     eprintln!("TROOZN_LIVE_YOUTUBE_DENO_RESOLVE_START url={source_url}");
+
+    match resolve_youtube_from_json_with_deno(source_url).await {
+        Ok(input) => return Ok(Some(input)),
+        Err(err) => {
+            let message = err.to_string();
+            eprintln!(
+                "TROOZN_LIVE_YOUTUBE_DENO_JSON_FAIL url={} state={message}",
+                source_url
+            );
+
+            if is_youtube_terminal_unavailable_error(&message)
+                || is_youtube_auth_or_bot_error(&message)
+            {
+                anyhow::bail!("yt-dlp YouTube indisponible: {}", message);
+            }
+
+            errors.push(format!("deno_json={message}"));
+        }
+    }
 
     match resolve_youtube_url_with_format(source_url, YTDLP_YOUTUBE_FAST_FORMAT, true).await {
         Ok(url) => {
