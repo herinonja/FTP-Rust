@@ -21,7 +21,7 @@ use tokio::time::{sleep, timeout, Duration};
 use crate::HttpGatewayState;
 
 const LIVE_DIR: &str = "/home/troozn/.kodi/userdata/TROOZN/live";
-const TROOZN_LIVE_BUILD_TAG: &str = "v3.0-hls-continuity-prewarm-2026-06-03";
+const TROOZN_LIVE_BUILD_TAG: &str = "v3.1-patient-deno-json-2026-06-03";
 
 const YTDLP_BIN: &str = "/home/troozn/.local/bin/yt-dlp";
 const LIVE_MAX_DIR_BYTES: u64 = 512 * 1024 * 1024;
@@ -55,7 +55,8 @@ const YTDLP_YOUTUBE_FAST_RESOLVE_TIMEOUT_SECONDS: u64 = 12;
 const YTDLP_YOUTUBE_DASH_RESOLVE_TIMEOUT_SECONDS: u64 = 14;
 const YTDLP_YOUTUBE_LIST_FORMATS_TIMEOUT_SECONDS: u64 = 15;
 const YTDLP_YOUTUBE_DENO_RESOLVE_TIMEOUT_SECONDS: u64 = 45;
-const YTDLP_YOUTUBE_DENO_JSON_TIMEOUT_SECONDS: u64 = 60;
+const YTDLP_YOUTUBE_DENO_JSON_TIMEOUT_SECONDS: u64 = 90;
+const YTDLP_YOUTUBE_DENO_JSON_RETRY_TIMEOUT_SECONDS: u64 = 140;
 const YTDLP_YOUTUBE_DENO_LIST_FORMATS_TIMEOUT_SECONDS: u64 = 45;
 const HLS_SEGMENT_SECONDS: &str = "2";
 const PREFERRED_VIDEO_HEIGHT: u64 = 1080;
@@ -3634,6 +3635,12 @@ fn is_ytdlp_timeout_error(text: &str) -> bool {
         || lower.contains("timeout attente slot")
 }
 
+fn has_deno_json_timeout(errors: &[String]) -> bool {
+    errors
+        .iter()
+        .any(|error| error.contains("deno_json") && is_ytdlp_timeout_error(error))
+}
+
 fn add_ytdlp_cookies_if_available(_cmd: &mut Command) {
     // TROOZN Live v1: cookies désactivés par défaut.
     // Un fichier cookies invalide peut provoquer des erreurs YouTube difficiles à diagnostiquer.
@@ -3978,6 +3985,30 @@ fn best_youtube_json_dash_av(root: &Value) -> Option<(&'static str, String, Stri
 async fn resolve_youtube_from_json_with_deno(
     source_url: &str,
 ) -> anyhow::Result<ResolvedMediaInput> {
+    resolve_youtube_from_json_with_deno_timeout(
+        source_url,
+        "yt-dlp json deno",
+        YTDLP_YOUTUBE_DENO_JSON_TIMEOUT_SECONDS,
+    )
+    .await
+}
+
+async fn resolve_youtube_from_json_with_deno_retry(
+    source_url: &str,
+) -> anyhow::Result<ResolvedMediaInput> {
+    resolve_youtube_from_json_with_deno_timeout(
+        source_url,
+        "yt-dlp json deno retry",
+        YTDLP_YOUTUBE_DENO_JSON_RETRY_TIMEOUT_SECONDS,
+    )
+    .await
+}
+
+async fn resolve_youtube_from_json_with_deno_timeout(
+    source_url: &str,
+    label: &'static str,
+    timeout_seconds: u64,
+) -> anyhow::Result<ResolvedMediaInput> {
     let mut cmd = Command::new(YTDLP_BIN);
 
     add_ytdlp_cookies_if_available(&mut cmd);
@@ -3999,16 +4030,11 @@ async fn resolve_youtube_from_json_with_deno(
     ]);
 
     eprintln!(
-        "TROOZN_LIVE_YTDLP_JSON_DENO_CMD bin={} url={}",
-        YTDLP_BIN, source_url
+        "TROOZN_LIVE_YTDLP_JSON_DENO_CMD bin={} label={} timeout_s={} url={}",
+        YTDLP_BIN, label, timeout_seconds, source_url
     );
 
-    let output = run_ytdlp_output(
-        cmd,
-        "yt-dlp json deno",
-        YTDLP_YOUTUBE_DENO_JSON_TIMEOUT_SECONDS,
-    )
-    .await?;
+    let output = run_ytdlp_output(cmd, label, timeout_seconds).await?;
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -4225,7 +4251,7 @@ async fn resolve_youtube_media_input(source_url: &str) -> anyhow::Result<Resolve
         }
     }
 
-    let list_with_deno = ytdlp_deno_available();
+    let list_with_deno = ytdlp_deno_available() && !has_deno_json_timeout(&errors);
 
     match ytdlp_list_formats_text(source_url, list_with_deno).await {
         Ok(list_text) => {
@@ -4321,6 +4347,37 @@ async fn try_youtube_deno_resolution(
                 || is_youtube_auth_or_bot_error(&message)
             {
                 anyhow::bail!("yt-dlp YouTube indisponible: {}", message);
+            }
+
+            if is_ytdlp_timeout_error(&message) {
+                eprintln!(
+                    "TROOZN_LIVE_YOUTUBE_DENO_JSON_RETRY_WAIT url={} wait_ms=1500",
+                    source_url
+                );
+                sleep(Duration::from_millis(1500)).await;
+
+                match resolve_youtube_from_json_with_deno_retry(source_url).await {
+                    Ok(input) => return Ok(Some(input)),
+                    Err(retry_err) => {
+                        let retry_message = retry_err.to_string();
+                        eprintln!(
+                            "TROOZN_LIVE_YOUTUBE_DENO_JSON_RETRY_FAIL url={} state={retry_message}",
+                            source_url
+                        );
+
+                        if is_youtube_terminal_unavailable_error(&retry_message)
+                            || is_youtube_auth_or_bot_error(&retry_message)
+                        {
+                            anyhow::bail!("yt-dlp YouTube indisponible: {}", retry_message);
+                        }
+
+                        errors.push(format!("deno_json_retry={retry_message}"));
+
+                        if is_ytdlp_timeout_error(&retry_message) {
+                            return Ok(None);
+                        }
+                    }
+                }
             }
 
             errors.push(format!("deno_json={message}"));
